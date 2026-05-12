@@ -34,7 +34,7 @@ jobs:
           - platform: macosarm64
             runner: macos-14
           - platform: macosx64
-            runner: macos-13
+            runner: macos-15
           - platform: linux64
             runner: ubuntu-latest
           - platform: linuxarm64
@@ -64,7 +64,13 @@ jobs:
           curl --fail --location --output "zig-out/cef-download/${archive}" "${base}/${archive}"
           curl --fail --location --output "zig-out/cef-download/${archive}.sha256" "${base}/${archive}.sha256"
           expected="$(tr -d '[:space:]' < "zig-out/cef-download/${archive}.sha256")"
-          actual="$(shasum -a 256 "zig-out/cef-download/${archive}" | awk '{print $1}')"
+          if command -v sha256sum &>/dev/null; then
+            actual="$(sha256sum "zig-out/cef-download/${archive}" | awk '{print $1}')"
+          elif command -v shasum &>/dev/null; then
+            actual="$(shasum -a 256 "zig-out/cef-download/${archive}" | awk '{print $1}')"
+          else
+            echo "::error::No SHA-256 hashing utility found"; exit 1
+          fi
           test "$expected" = "$actual"
           tar -xjf "zig-out/cef-download/${archive}" -C zig-out/cef-download
           echo "CEF_ROOT=zig-out/cef-download/${archive%.tar.bz2}" >> "$GITHUB_ENV"
@@ -74,7 +80,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cmake -S "$CEF_ROOT" -B "$CEF_ROOT/build/libcef_dll_wrapper"
+          cmake_args=(-S "$CEF_ROOT" -B "$CEF_ROOT/build/libcef_dll_wrapper")
+          case "${{ matrix.platform }}" in
+            *arm64) cmake_args+=(-DPROJECT_ARCH=arm64) ;;
+            macosx64) cmake_args+=(-DCMAKE_OSX_ARCHITECTURES=x86_64 -DPROJECT_ARCH=x86_64) ;;
+          esac
+          cmake "${cmake_args[@]}"
           cmake --build "$CEF_ROOT/build/libcef_dll_wrapper" --target libcef_dll_wrapper --config Release
           mkdir -p "$CEF_ROOT/libcef_dll_wrapper"
           case "${{ matrix.platform }}" in
