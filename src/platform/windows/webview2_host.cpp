@@ -304,17 +304,22 @@ static void applyChildWebViewLayer(Host *host, uint64_t window_id, const std::st
     auto found = host->webviews.find(webViewKey(window_id, label));
     if (found == host->webviews.end() || !found->second.hwnd) return;
     HWND insert_after = HWND_TOP;
-    int best_layer = INT_MIN;
-    uint64_t best_order = 0;
+    bool found_above = false;
+    int best_layer = INT_MAX;
+    uint64_t best_order = UINT64_MAX;
     for (auto &entry : host->webviews) {
         const ChildWebView &candidate = entry.second;
         if (candidate.window_id != window_id || candidate.label == label || !candidate.hwnd) continue;
-        if (candidate.layer < found->second.layer or (candidate.layer == found->second.layer and candidate.creation_order < found->second.creation_order)) {
-            if (candidate.layer > best_layer or (candidate.layer == best_layer and candidate.creation_order > best_order)) {
-                insert_after = candidate.hwnd;
-                best_layer = candidate.layer;
-                best_order = candidate.creation_order;
-            }
+        const bool candidate_above = candidate.layer > found->second.layer ||
+            (candidate.layer == found->second.layer && candidate.creation_order > found->second.creation_order);
+        if (!candidate_above) continue;
+        if (!found_above ||
+            candidate.layer < best_layer ||
+            (candidate.layer == best_layer && candidate.creation_order < best_order)) {
+            insert_after = candidate.hwnd;
+            found_above = true;
+            best_layer = candidate.layer;
+            best_order = candidate.creation_order;
         }
     }
     SetWindowPos(found->second.hwnd, insert_after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);

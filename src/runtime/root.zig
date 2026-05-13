@@ -9,6 +9,9 @@ const platform = @import("../platform/root.zig");
 const security = @import("../security/root.zig");
 const window_state = @import("../window_state/root.zig");
 
+const max_async_bridge_responses: usize = 64;
+const max_bridge_origin_bytes: usize = 512;
+
 pub const LifecycleEvent = enum {
     start,
     frame,
@@ -108,6 +111,7 @@ pub const Runtime = struct {
     last_invalidation_reason: InvalidationReason = .startup,
     last_diagnostics: FrameDiagnostics = .{},
     loaded_source: ?platform.WebViewSource = null,
+    async_bridge_responses: [max_async_bridge_responses]AsyncBridgeResponseSlot = [_]AsyncBridgeResponseSlot{.{}} ** max_async_bridge_responses,
     automation_windows: [automation.snapshot.max_windows]automation.snapshot.Window = undefined,
 
     pub fn init(options: Options) Runtime {
@@ -421,20 +425,41 @@ pub const Runtime = struct {
             try self.completeBridgeResponse(message.window_id, message.webview_label, response);
             return true;
         }
+        const source_slot = self.reserveAsyncBridgeResponse(.{
+            .origin = message.origin,
+            .window_id = message.window_id,
+            .webview_label = message.webview_label,
+        }) catch |err| {
+            var response_buffer: [bridge.max_response_bytes]u8 = undefined;
+            const response = bridge.writeErrorResponse(&response_buffer, request.id, .internal_error, @errorName(err));
+            try self.completeBridgeResponse(message.window_id, message.webview_label, response);
+            return true;
+        };
+        errdefer source_slot.release();
         try handler.invoke_fn(handler.context, .{
             .request = request,
-            .source = .{ .origin = message.origin, .window_id = message.window_id, .webview_label = message.webview_label },
+            .source = source_slot.source,
         }, .{
-            .context = self,
-            .source = .{ .origin = message.origin, .window_id = message.window_id, .webview_label = message.webview_label },
+            .context = source_slot,
+            .source = source_slot.source,
             .respond_fn = asyncBridgeRespond,
         });
         return true;
     }
 
     fn asyncBridgeRespond(context: *anyopaque, source: bridge.Source, response: []const u8) anyerror!void {
-        const self: *Runtime = @ptrCast(@alignCast(context));
-        try self.respondToBridge(source, response);
+        _ = source;
+        const slot: *AsyncBridgeResponseSlot = @ptrCast(@alignCast(context));
+        try slot.respond(response);
+    }
+
+    fn reserveAsyncBridgeResponse(self: *Runtime, source: bridge.Source) !*AsyncBridgeResponseSlot {
+        for (&self.async_bridge_responses) |*slot| {
+            if (slot.in_use) continue;
+            try slot.init(self, source);
+            return slot;
+        }
+        return error.AsyncBridgeResponseLimitReached;
     }
 
     fn publishAutomation(self: *Runtime) anyerror!void {
@@ -1081,6 +1106,40 @@ const RuntimeWebView = struct {
     url_storage: [platform.max_webview_url_bytes]u8 = undefined,
 };
 
+const AsyncBridgeResponseSlot = struct {
+    in_use: bool = false,
+    runtime: ?*Runtime = null,
+    source: bridge.Source = .{},
+    origin_storage: [max_bridge_origin_bytes]u8 = undefined,
+    webview_label_storage: [platform.max_webview_label_bytes]u8 = undefined,
+
+    fn init(self: *AsyncBridgeResponseSlot, runtime: *Runtime, source: bridge.Source) !void {
+        if (source.origin.len > self.origin_storage.len) return error.BridgeOriginTooLarge;
+        if (source.webview_label.len > self.webview_label_storage.len) return error.WebViewLabelTooLarge;
+        self.runtime = runtime;
+        self.source = .{
+            .origin = try copyInto(&self.origin_storage, source.origin),
+            .window_id = source.window_id,
+            .webview_label = try copyInto(&self.webview_label_storage, source.webview_label),
+        };
+        self.in_use = true;
+    }
+
+    fn release(self: *AsyncBridgeResponseSlot) void {
+        self.in_use = false;
+        self.runtime = null;
+        self.source = .{};
+    }
+
+    fn respond(self: *AsyncBridgeResponseSlot, response: []const u8) anyerror!void {
+        if (!self.in_use) return error.AsyncBridgeResponseAlreadyCompleted;
+        const runtime = self.runtime orelse return error.AsyncBridgeResponseAlreadyCompleted;
+        const source = self.source;
+        defer self.release();
+        try runtime.respondToBridge(source, response);
+    }
+};
+
 fn copyInto(buffer: []u8, value: []const u8) ![]const u8 {
     if (value.len > buffer.len) return error.NoSpaceLeft;
     @memcpy(buffer[0..value.len], value);
@@ -1238,10 +1297,12 @@ fn webViewFrameFromJson(payload: []const u8) !geometry.RectF {
 
 fn webViewLayerFromJson(payload: []const u8) !i32 {
     if (json.fieldValue(payload, "layer") == null) return 0;
-    const layer_value = jsonNumberField(payload, "layer") orelse return error.InvalidWebViewOptions;
+    const layer_bytes = json.fieldValue(payload, "layer") orelse return error.InvalidWebViewOptions;
+    const layer_value = std.fmt.parseFloat(f64, layer_bytes) catch return error.InvalidWebViewOptions;
     if (!std.math.isFinite(layer_value)) return error.InvalidWebViewOptions;
-    const max_layer: f32 = @floatFromInt(std.math.maxInt(i32));
-    const min_layer: f32 = @floatFromInt(std.math.minInt(i32));
+    if (@trunc(layer_value) != layer_value) return error.InvalidWebViewOptions;
+    const max_layer: f64 = @floatFromInt(std.math.maxInt(i32));
+    const min_layer: f64 = @floatFromInt(std.math.minInt(i32));
     if (layer_value > max_layer or layer_value < min_layer) return error.InvalidWebViewOptions;
     return @as(i32, @intFromFloat(layer_value));
 }
@@ -1430,6 +1491,45 @@ test "runtime dispatches bridge messages through policy and handler registry" {
     try std.testing.expectEqual(@as(u32, 1), bridge_state.calls);
     try std.testing.expectEqual(@as(platform.WindowId, 4), harness.null_platform.lastBridgeResponseWindowId());
     try std.testing.expectEqualStrings("{\"id\":\"1\",\"ok\":true,\"result\":{\"pong\":true,\"calls\":1}}", harness.null_platform.lastBridgeResponse());
+}
+
+test "runtime keeps async bridge response source labels stable" {
+    const AsyncState = struct {
+        responder: ?bridge.AsyncResponder = null,
+
+        fn later(context: *anyopaque, invocation: bridge.Invocation, responder: bridge.AsyncResponder) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try std.testing.expectEqualStrings("native.later", invocation.request.command);
+            try std.testing.expectEqualStrings("preview", invocation.source.webview_label);
+            try std.testing.expectEqualStrings("https://example.com", invocation.source.origin);
+            self.responder = responder;
+        }
+    };
+
+    var async_state: AsyncState = .{};
+    const policies = [_]bridge.CommandPolicy{.{ .name = "native.later", .origins = &.{"https://example.com"} }};
+    const handlers = [_]bridge.AsyncHandler{.{ .name = "native.later", .context = &async_state, .invoke_fn = AsyncState.later }};
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    harness.runtime.options.bridge = .{
+        .policy = .{ .enabled = true, .commands = &policies },
+        .async_registry = .{ .handlers = &handlers },
+    };
+
+    var label_buffer = [_]u8{ 'p', 'r', 'e', 'v', 'i', 'e', 'w' };
+    const app = App{ .context = &async_state, .name = "async-bridge", .source = platform.WebViewSource.html("<p>Bridge</p>") };
+    try harness.runtime.dispatchPlatformEvent(app, .{ .bridge_message = .{
+        .bytes = "{\"id\":\"async\",\"command\":\"native.later\",\"payload\":null}",
+        .origin = "https://example.com",
+        .window_id = 1,
+        .webview_label = label_buffer[0..],
+    } });
+
+    @memcpy(label_buffer[0..], "changed");
+    try async_state.responder.?.success("async", "{\"delayed\":true}");
+    try std.testing.expectEqualStrings("preview", harness.null_platform.lastBridgeResponseWebViewLabel());
+    try std.testing.expectEqualStrings("{\"id\":\"async\",\"ok\":true,\"result\":{\"delayed\":true}}", harness.null_platform.lastBridgeResponse());
 }
 
 test "runtime maps bridge dispatch failures to response errors" {
@@ -1791,7 +1891,47 @@ test "runtime validates webview bridge commands" {
     try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
 
     try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"max-layer\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"max-layer\",\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200},\"layer\":2147483647}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"layer\":2147483647") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
         .bytes = "{\"id\":\"out-of-range-layer\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"bad-layer-range\",\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200},\"layer\":100000000000000000000}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "WebView options are invalid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"i32-overflow-layer\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"i32-overflow-layer\",\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200},\"layer\":2147483648}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "WebView options are invalid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"min-layer\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"min-layer\",\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200},\"layer\":-2147483648}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"layer\":-2147483648") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"i32-underflow-layer\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"i32-underflow-layer\",\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200},\"layer\":-2147483649}}",
+        .origin = "zero://inline",
+        .window_id = 1,
+    } });
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "WebView options are invalid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .bridge_message = .{
+        .bytes = "{\"id\":\"fractional-layer\",\"command\":\"zero-native.webview.create\",\"payload\":{\"label\":\"fractional-layer\",\"url\":\"https://example.com\",\"frame\":{\"width\":300,\"height\":200},\"layer\":1.5}}",
         .origin = "zero://inline",
         .window_id = 1,
     } });
