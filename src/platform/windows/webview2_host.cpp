@@ -386,16 +386,73 @@ static void destroyAllWindows(Host *host) {
 #if ZERO_NATIVE_HAS_WEBVIEW2
 using CreateEnvironmentFn = HRESULT (STDAPICALLTYPE *)(PCWSTR, PCWSTR, ICoreWebView2EnvironmentOptions *, ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *);
 
-static const wchar_t *zeroNativeEventBridgeScript() {
+static const wchar_t *zeroNativeBridgeScript() {
     return LR"ZN((function(){
-if(window.zero&&window.zero.on&&window.zero._emit){return;}
-var listeners=new Map();
-function on(name,callback){if(typeof callback!=='function'){throw new TypeError('callback must be a function');}var set=listeners.get(name);if(!set){set=new Set();listeners.set(name,set);}set.add(callback);return function(){off(name,callback);};}
-function off(name,callback){var set=listeners.get(name);if(set){set.delete(callback);if(set.size===0){listeners.delete(name);}}}
-function emit(name,detail){var set=listeners.get(name);if(set){Array.from(set).forEach(function(callback){callback(detail);});}window.dispatchEvent(new CustomEvent('zero-native:'+name,{detail:detail}));}
-try{Object.defineProperty(window,'zero',{value:Object.freeze({on:on,off:off,_emit:emit}),configurable:false});}catch(error){}
-})();
-)ZN";
+	if(window.zero&&window.zero.invoke&&window.zero.on&&window.zero._emit){return;}
+	var pending=new Map();
+	var listeners=new Map();
+	var nextId=1;
+	function post(message){
+	if(window.chrome&&window.chrome.webview&&window.chrome.webview.postMessage){window.chrome.webview.postMessage(message);return;}
+	throw new Error('zero-native bridge transport is unavailable');
+	}
+	function complete(response){
+	var id=response&&response.id!=null?String(response.id):'';
+	var entry=pending.get(id);
+	if(!entry){return;}
+	pending.delete(id);
+	if(response.ok){entry.resolve(response.result===undefined?null:response.result);return;}
+	var errorInfo=response.error||{};
+	var error=new Error(errorInfo.message||'Native command failed');
+	error.code=errorInfo.code||'internal_error';
+	entry.reject(error);
+	}
+	function invoke(command,payload){
+	if(typeof command!=='string'||command.length===0){return Promise.reject(new TypeError('command must be a non-empty string'));}
+	var id=String(nextId++);
+	var envelope=JSON.stringify({id:id,command:command,payload:payload===undefined?null:payload});
+	return new Promise(function(resolve,reject){
+	pending.set(id,{resolve:resolve,reject:reject});
+	try{post(envelope);}catch(error){pending.delete(id);reject(error);}
+	});
+	}
+	function selector(value){return typeof value==='number'?{id:value}:{label:String(value)};}
+	function ensureString(value,name){if(typeof value!=='string'||value.length===0){throw new TypeError(name+' must be a non-empty string');}return value;}
+	function ensureNumber(value,name){if(typeof value!=='number'||!isFinite(value)){throw new TypeError(name+' must be a finite number');}return value;}
+	function validateWebViewSelector(options){if(options.label!=null){ensureString(options.label,'label');}if(options.windowId!=null&&(typeof options.windowId!=='number'||!isFinite(options.windowId)||options.windowId<0||Math.floor(options.windowId)!==options.windowId)){throw new TypeError('windowId must be a non-negative integer');}}
+	function framePayload(options){options=options||{};validateWebViewSelector(options);var frame=options.frame||options;return {label:options.label,windowId:options.windowId,url:options.url,frame:{x:frame.x==null?0:ensureNumber(frame.x,'frame.x'),y:frame.y==null?0:ensureNumber(frame.y,'frame.y'),width:ensureNumber(frame.width,'frame.width'),height:ensureNumber(frame.height,'frame.height')}};}
+	function createPayload(options){options=options||{};ensureString(options.url,'url');var payload=framePayload(options);if(options.layer!=null){payload.layer=ensureNumber(options.layer,'layer');}if(options.transparent!=null){payload.transparent=!!options.transparent;}if(options.bridge!=null){payload.bridge=!!options.bridge;}return payload;}
+	function navigatePayload(options){options=options||{};validateWebViewSelector(options);ensureString(options.url,'url');return {label:options.label,windowId:options.windowId,url:options.url};}
+	function closePayload(options){options=options||{};validateWebViewSelector(options);return {label:options.label,windowId:options.windowId};}
+	function webviewHandle(info){return Object.freeze(Object.assign({},info,{setFrame:function(frame){return webviews.setFrame({label:info.label,windowId:info.windowId,frame:frame});},navigate:function(url){return webviews.navigate({label:info.label,windowId:info.windowId,url:url});},setZoom:function(zoom){return webviews.setZoom({label:info.label,windowId:info.windowId,zoom:zoom});},setLayer:function(layer){return webviews.setLayer({label:info.label,windowId:info.windowId,layer:layer});},close:function(){return webviews.close({label:info.label,windowId:info.windowId});}}));}
+	function on(name,callback){if(typeof callback!=='function'){throw new TypeError('callback must be a function');}var set=listeners.get(name);if(!set){set=new Set();listeners.set(name,set);}set.add(callback);return function(){off(name,callback);};}
+	function off(name,callback){var set=listeners.get(name);if(set){set.delete(callback);if(set.size===0){listeners.delete(name);}}}
+	function emit(name,detail){var set=listeners.get(name);if(set){Array.from(set).forEach(function(callback){callback(detail);});}window.dispatchEvent(new CustomEvent('zero-native:'+name,{detail:detail}));}
+	var windows=Object.freeze({
+	create:function(options){return invoke('zero-native.window.create',options||{});},
+	list:function(){return invoke('zero-native.window.list',{});},
+	focus:function(value){return invoke('zero-native.window.focus',selector(value));},
+	close:function(value){return invoke('zero-native.window.close',selector(value));}
+	});
+	var dialogs=Object.freeze({
+	openFile:function(options){return invoke('zero-native.dialog.openFile',options||{});},
+	saveFile:function(options){return invoke('zero-native.dialog.saveFile',options||{});},
+	showMessage:function(options){return invoke('zero-native.dialog.showMessage',options||{});}
+	});
+	function zoomPayload(options){options=options||{};validateWebViewSelector(options);return {label:options.label,windowId:options.windowId,zoom:ensureNumber(options.zoom,'zoom')};}
+	function layerPayload(options){options=options||{};validateWebViewSelector(options);return {label:options.label,windowId:options.windowId,layer:ensureNumber(options.layer,'layer')};}
+	var webviews=Object.freeze({
+	create:function(options){return invoke('zero-native.webview.create',createPayload(options)).then(webviewHandle);},
+	list:function(){return invoke('zero-native.webview.list',{});},
+	setFrame:function(options){return invoke('zero-native.webview.setFrame',framePayload(options));},
+	navigate:function(options){return invoke('zero-native.webview.navigate',navigatePayload(options));},
+	setZoom:function(options){return invoke('zero-native.webview.setZoom',zoomPayload(options));},
+	setLayer:function(options){return invoke('zero-native.webview.setLayer',layerPayload(options));},
+	close:function(options){return invoke('zero-native.webview.close',closePayload(options));}
+	});
+	try{Object.defineProperty(window,'zero',{value:Object.freeze({invoke:invoke,on:on,off:off,windows:windows,dialogs:dialogs,webviews:webviews,_complete:complete,_emit:emit}),configurable:false});}catch(error){}
+	})();
+	)ZN";
 }
 
 static RECT webViewRect(const ChildWebView &webview) {
@@ -470,7 +527,42 @@ static bool createChildWebView(Host *host, const std::string &key) {
                     controller->put_IsVisible(TRUE);
                     if (found->second.webview) {
                         if (found->second.bridge_enabled) {
-                            found->second.webview->AddScriptToExecuteOnDocumentCreated(zeroNativeEventBridgeScript(), nullptr);
+                            found->second.webview->AddScriptToExecuteOnDocumentCreated(zeroNativeBridgeScript(), nullptr);
+                            EventRegistrationToken bridge_token = {};
+                            uint64_t bridge_window_id = found->second.window_id;
+                            std::string bridge_label = found->second.label;
+                            found->second.webview->add_WebMessageReceived(Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+                                [host, bridge_window_id, bridge_label, lifetime](ICoreWebView2 *, ICoreWebView2WebMessageReceivedEventArgs *args) -> HRESULT {
+                                    auto token = lifetime.lock();
+                                    if (!token) return S_OK;
+                                    std::lock_guard<std::recursive_mutex> guard(token->mutex);
+                                    if (!token->alive || !args || !host->bridge_callback) return S_OK;
+
+                                    LPWSTR message_bytes = nullptr;
+                                    if (FAILED(args->TryGetWebMessageAsString(&message_bytes)) || !message_bytes) return S_OK;
+                                    std::wstring message_wide(message_bytes);
+                                    CoTaskMemFree(message_bytes);
+                                    std::string message = narrow(message_wide);
+
+                                    std::string origin = "zero://inline";
+                                    LPWSTR source_bytes = nullptr;
+                                    if (SUCCEEDED(args->get_Source(&source_bytes)) && source_bytes) {
+                                        std::wstring source_wide(source_bytes);
+                                        CoTaskMemFree(source_bytes);
+                                        origin = originForUrl(narrow(source_wide));
+                                    }
+
+                                    host->bridge_callback(
+                                        host->bridge_context,
+                                        bridge_window_id,
+                                        bridge_label.c_str(),
+                                        bridge_label.size(),
+                                        message.c_str(),
+                                        message.size(),
+                                        origin.c_str(),
+                                        origin.size());
+                                    return S_OK;
+                                }).Get(), &bridge_token);
                         }
                         EventRegistrationToken accelerator_token = {};
                         uint64_t accelerator_window_id = found->second.window_id;
@@ -743,12 +835,23 @@ void zero_native_windows_bridge_respond_window(Host *host, uint64_t window_id, c
 }
 
 void zero_native_windows_bridge_respond_webview(Host *host, uint64_t window_id, const char *webview_label, size_t webview_label_len, const char *response, size_t response_len) {
+#if ZERO_NATIVE_HAS_WEBVIEW2
+    if (!host) return;
+    std::string label = slice(webview_label, webview_label_len);
+    auto found = host->webviews.find(webViewKey(window_id, label));
+    if (found == host->webviews.end() || !found->second.webview) return;
+    std::string response_string = response && response_len > 0 ? slice(response, response_len) : std::string("{}");
+    std::string script = "window.zero&&window.zero._complete(" + response_string + ");";
+    std::wstring script_wide = widen(script);
+    found->second.webview->ExecuteScript(script_wide.c_str(), nullptr);
+#else
     (void)host;
     (void)window_id;
     (void)webview_label;
     (void)webview_label_len;
     (void)response;
     (void)response_len;
+#endif
 }
 
 void zero_native_windows_emit_window_event(Host *host, uint64_t window_id, const char *name, size_t name_len, const char *detail_json, size_t detail_json_len) {

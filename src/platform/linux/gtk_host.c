@@ -832,6 +832,7 @@ static zero_native_gtk_window_t *zero_native_create_window_internal(zero_native_
     g_signal_connect(win->gtk_window, "close-request", G_CALLBACK(on_close_request), win);
     g_signal_connect(win->web_view, "decide-policy", G_CALLBACK(on_decide_policy), win);
     GtkEventController *shortcut_controller = gtk_event_controller_key_new();
+    gtk_event_controller_set_propagation_phase(shortcut_controller, GTK_PHASE_CAPTURE);
     g_signal_connect(shortcut_controller, "key-pressed", G_CALLBACK(on_shortcut_key_pressed), win);
     gtk_widget_add_controller(GTK_WIDGET(win->gtk_window), shortcut_controller);
 

@@ -283,7 +283,8 @@ fn completeWindowBridge(context: ?*anyopaque, window_id: platform_mod.WindowId, 
 
 fn completeWebViewBridge(context: ?*anyopaque, window_id: platform_mod.WindowId, webview_label: []const u8, response: []const u8) anyerror!void {
     if (std.mem.eql(u8, webview_label, "main")) return completeWindowBridge(context, window_id, response);
-    return error.UnsupportedWebViewBridge;
+    const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
+    zero_native_windows_bridge_respond_webview(self.host, window_id, webview_label.ptr, webview_label.len, response.ptr, response.len);
 }
 
 fn emitWindowEvent(context: ?*anyopaque, window_id: platform_mod.WindowId, name: []const u8, detail_json: []const u8) anyerror!void {
@@ -319,7 +320,6 @@ fn closeWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!
 
 fn createWebView(context: ?*anyopaque, options: platform_mod.WebViewOptions) anyerror!void {
     const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
-    if (options.bridge_enabled) return error.UnsupportedWebViewBridge;
     const frame = options.frame;
     if (zero_native_windows_create_webview(self.host, options.window_id, options.label.ptr, options.label.len, options.url.ptr, options.url.len, frame.x, frame.y, frame.width, frame.height, options.layer, if (options.transparent) 1 else 0, if (options.bridge_enabled) 1 else 0) == 0) return error.CreateFailed;
 }
