@@ -171,6 +171,7 @@ pub fn createIosSkeleton(io: std.Io, output_path: []const u8) !PackageStats {
     try cwd.createDirPath(io, output_path);
     var dir = try cwd.openDir(io, output_path, .{});
     defer dir.close(io);
+    try dir.createDirPath(io, "Libraries");
     try dir.createDirPath(io, "zero-nativeHost");
     try writeFile(dir, io, "README.md", iosReadme());
     try writeFile(dir, io, "Info.plist", iosInfoPlist());
@@ -185,7 +186,7 @@ pub fn createAndroidSkeleton(io: std.Io, output_path: []const u8) !PackageStats 
     var dir = try cwd.openDir(io, output_path, .{});
     defer dir.close(io);
     try dir.createDirPath(io, "app/src/main/java/dev/zero_native");
-    try dir.createDirPath(io, "app/src/main/cpp");
+    try dir.createDirPath(io, "app/src/main/cpp/lib");
     try writeFile(dir, io, "README.md", androidReadme());
     try writeFile(dir, io, "settings.gradle", "pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }\ndependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }\nrootProject.name = 'zero-nativeHost'\ninclude ':app'\n");
     try writeFile(dir, io, "app/build.gradle", androidBuildGradle());
@@ -1554,6 +1555,25 @@ test "mobile package templates include native command shells" {
 
     const android_jni = androidJni();
     try std.testing.expect(std.mem.indexOf(u8, android_jni, "#include <stdint.h>") != null);
+}
+
+test "mobile skeletons create native library drop-in directories" {
+    var cwd = std.Io.Dir.cwd();
+    try cwd.deleteTree(std.testing.io, ".zig-cache/test-package-mobile-skeletons");
+    defer cwd.deleteTree(std.testing.io, ".zig-cache/test-package-mobile-skeletons") catch {};
+
+    try cwd.createDirPath(std.testing.io, ".zig-cache/test-package-mobile-skeletons");
+    _ = try createIosSkeleton(std.testing.io, ".zig-cache/test-package-mobile-skeletons/ios");
+    _ = try createAndroidSkeleton(std.testing.io, ".zig-cache/test-package-mobile-skeletons/android");
+
+    var ios_libs = try cwd.openDir(std.testing.io, ".zig-cache/test-package-mobile-skeletons/ios/Libraries", .{});
+    ios_libs.close(std.testing.io);
+
+    var android_libs = try cwd.openDir(std.testing.io, ".zig-cache/test-package-mobile-skeletons/android/app/src/main/cpp/lib", .{});
+    android_libs.close(std.testing.io);
+
+    var cmake = try cwd.openFile(std.testing.io, ".zig-cache/test-package-mobile-skeletons/android/app/src/main/cpp/CMakeLists.txt", .{});
+    cmake.close(std.testing.io);
 }
 
 test "linux desktop entry contains app name" {
