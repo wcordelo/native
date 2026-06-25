@@ -2167,11 +2167,14 @@ pub const Runtime = struct {
 
     fn commandSourceForNativeView(self: *const Runtime, window_id: platform.WindowId, label: []const u8) CommandSource {
         const index = self.findViewIndex(window_id, label) orelse return .native_view;
-        const view = self.views[index];
-        if (view.kind == .toolbar) return .toolbar;
-        const parent_label = view.parent orelse return .native_view;
-        const parent_index = self.findViewIndex(window_id, parent_label) orelse return .native_view;
-        if (self.views[parent_index].kind == .toolbar) return .toolbar;
+        var view = self.views[index];
+        var depth: usize = 0;
+        while (depth < platform.max_views) : (depth += 1) {
+            if (view.kind == .toolbar) return .toolbar;
+            const parent_label = view.parent orelse return .native_view;
+            const parent_index = self.findViewIndex(window_id, parent_label) orelse return .native_view;
+            view = self.views[parent_index];
+        }
         return .native_view;
     }
 
@@ -4977,6 +4980,59 @@ test "runtime dispatches native view command events" {
     try std.testing.expectEqual(@as(u32, 2), app_state.command_count);
     try std.testing.expectEqual(CommandSource.toolbar, app_state.last_source);
     try std.testing.expectEqualStrings("toolbar-refresh", app_state.last_view_label);
+
+    _ = try harness.runtime.createView(.{
+        .label = "toolbar-stack",
+        .kind = .stack,
+        .parent = "toolbar",
+        .frame = geometry.RectF.init(112, 8, 160, 32),
+    });
+    _ = try harness.runtime.createView(.{
+        .label = "toolbar-nested-refresh",
+        .kind = .button,
+        .parent = "toolbar-stack",
+        .frame = geometry.RectF.init(0, 0, 120, 28),
+        .command = "app.refresh",
+    });
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .native_command = .{
+        .name = "app.refresh",
+        .window_id = 1,
+        .view_label = "toolbar-nested-refresh",
+    } });
+
+    try std.testing.expectEqual(@as(u32, 3), app_state.command_count);
+    try std.testing.expectEqual(CommandSource.toolbar, app_state.last_source);
+    try std.testing.expectEqualStrings("toolbar-nested-refresh", app_state.last_view_label);
+
+    _ = try harness.runtime.createView(.{
+        .label = "sidebar",
+        .kind = .sidebar,
+        .frame = geometry.RectF.init(0, 48, 220, 400),
+    });
+    _ = try harness.runtime.createView(.{
+        .label = "filters",
+        .kind = .stack,
+        .parent = "sidebar",
+        .frame = geometry.RectF.init(16, 16, 160, 120),
+    });
+    _ = try harness.runtime.createView(.{
+        .label = "filter-toggle",
+        .kind = .toggle,
+        .parent = "filters",
+        .frame = geometry.RectF.init(0, 0, 120, 28),
+        .command = "app.filter.toggle",
+    });
+
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .{ .native_command = .{
+        .name = "app.filter.toggle",
+        .window_id = 1,
+        .view_label = "filter-toggle",
+    } });
+
+    try std.testing.expectEqual(@as(u32, 4), app_state.command_count);
+    try std.testing.expectEqual(CommandSource.native_view, app_state.last_source);
+    try std.testing.expectEqualStrings("filter-toggle", app_state.last_view_label);
 }
 
 test "runtime exposes configured command catalog" {
