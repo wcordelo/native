@@ -89,6 +89,9 @@ extern fn zero_native_windows_open_external_url(host: *WindowsHost, url: [*]cons
 extern fn zero_native_windows_reveal_path(host: *WindowsHost, path: [*]const u8, path_len: usize) c_int;
 extern fn zero_native_windows_add_recent_document(host: *WindowsHost, path: [*]const u8, path_len: usize) c_int;
 extern fn zero_native_windows_clear_recent_documents(host: *WindowsHost) c_int;
+extern fn zero_native_windows_set_credential(host: *WindowsHost, service: [*]const u8, service_len: usize, account: [*]const u8, account_len: usize, secret: [*]const u8, secret_len: usize) c_int;
+extern fn zero_native_windows_get_credential(host: *WindowsHost, service: [*]const u8, service_len: usize, account: [*]const u8, account_len: usize, buffer: [*]u8, buffer_len: usize) usize;
+extern fn zero_native_windows_delete_credential(host: *WindowsHost, service: [*]const u8, service_len: usize, account: [*]const u8, account_len: usize) c_int;
 extern fn zero_native_windows_clipboard_read(host: *WindowsHost, buffer: [*]u8, buffer_len: usize) usize;
 extern fn zero_native_windows_clipboard_write(host: *WindowsHost, text: [*]const u8, text_len: usize) void;
 
@@ -162,6 +165,9 @@ pub const WindowsPlatform = struct {
                 .reveal_path_fn = revealPath,
                 .add_recent_document_fn = addRecentDocument,
                 .clear_recent_documents_fn = clearRecentDocuments,
+                .set_credential_fn = setCredential,
+                .get_credential_fn = getCredential,
+                .delete_credential_fn = deleteCredential,
                 .configure_security_policy_fn = configureSecurityPolicy,
                 .configure_shortcuts_fn = configureShortcuts,
                 .emit_window_event_fn = emitWindowEvent,
@@ -497,6 +503,49 @@ fn clearRecentDocuments(context: ?*anyopaque) anyerror!void {
     const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
     if (self.web_engine != .system) return error.UnsupportedService;
     if (zero_native_windows_clear_recent_documents(self.host) == 0) return error.UnsupportedService;
+}
+
+fn setCredential(context: ?*anyopaque, credential: platform_mod.Credential) anyerror!void {
+    const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
+    if (self.web_engine != .system) return error.UnsupportedService;
+    if (zero_native_windows_set_credential(
+        self.host,
+        credential.service.ptr,
+        credential.service.len,
+        credential.account.ptr,
+        credential.account.len,
+        credential.secret.ptr,
+        credential.secret.len,
+    ) == 0) return error.UnsupportedService;
+}
+
+fn getCredential(context: ?*anyopaque, key: platform_mod.CredentialKey, buffer: []u8) anyerror![]const u8 {
+    const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
+    if (self.web_engine != .system) return error.UnsupportedService;
+    const len = zero_native_windows_get_credential(
+        self.host,
+        key.service.ptr,
+        key.service.len,
+        key.account.ptr,
+        key.account.len,
+        buffer.ptr,
+        buffer.len,
+    );
+    if (len == 0) return error.CredentialNotFound;
+    if (len > buffer.len) return error.NoSpaceLeft;
+    return buffer[0..len];
+}
+
+fn deleteCredential(context: ?*anyopaque, key: platform_mod.CredentialKey) anyerror!void {
+    const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
+    if (self.web_engine != .system) return error.UnsupportedService;
+    if (zero_native_windows_delete_credential(
+        self.host,
+        key.service.ptr,
+        key.service.len,
+        key.account.ptr,
+        key.account.len,
+    ) == 0) return error.CredentialNotFound;
 }
 
 fn configureSecurityPolicy(context: ?*anyopaque, policy: security.Policy) anyerror!void {

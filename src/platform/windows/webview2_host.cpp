@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <wincred.h>
 #include <objbase.h>
 #include <commctrl.h>
 
@@ -213,6 +214,12 @@ static std::wstring widen(const std::string &value) {
     std::wstring out((size_t)count, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, value.data(), (int)value.size(), out.data(), count);
     return out;
+}
+
+static std::wstring credentialTarget(const std::string &service, const std::string &account) {
+    std::wstring service_wide = widen(service);
+    std::wstring account_wide = widen(account);
+    return L"zero-native:" + std::to_wstring(service_wide.size()) + L":" + service_wide + account_wide;
 }
 
 static std::string narrow(const std::wstring &value) {
@@ -1399,6 +1406,83 @@ int zero_native_windows_clear_recent_documents(Host *host) {
     (void)host;
     SHAddToRecentDocs(SHARD_PIDL, nullptr);
     return 1;
+}
+
+int zero_native_windows_set_credential(Host *host, const char *service, size_t service_len, const char *account, size_t account_len, const char *secret, size_t secret_len) {
+    (void)host;
+    if (!service || service_len == 0 || !account || account_len == 0 || !secret || secret_len == 0 || secret_len > UINT32_MAX) return 0;
+    HMODULE advapi = LoadLibraryW(L"advapi32.dll");
+    if (!advapi) return 0;
+    auto cred_write = reinterpret_cast<BOOL (WINAPI *)(PCREDENTIALW, DWORD)>(GetProcAddress(advapi, "CredWriteW"));
+    if (!cred_write) {
+        FreeLibrary(advapi);
+        return 0;
+    }
+
+    std::string service_string = slice(service, service_len);
+    std::string account_string = slice(account, account_len);
+    std::wstring target = credentialTarget(service_string, account_string);
+    std::wstring user_name = widen(account_string);
+    CREDENTIALW credential = {};
+    credential.Type = CRED_TYPE_GENERIC;
+    credential.TargetName = const_cast<LPWSTR>(target.c_str());
+    credential.CredentialBlobSize = static_cast<DWORD>(secret_len);
+    credential.CredentialBlob = reinterpret_cast<LPBYTE>(const_cast<char *>(secret));
+    credential.Persist = CRED_PERSIST_LOCAL_MACHINE;
+    credential.UserName = const_cast<LPWSTR>(user_name.c_str());
+
+    BOOL ok = cred_write(&credential, 0);
+    FreeLibrary(advapi);
+    return ok ? 1 : 0;
+}
+
+size_t zero_native_windows_get_credential(Host *host, const char *service, size_t service_len, const char *account, size_t account_len, char *buffer, size_t buffer_len) {
+    (void)host;
+    if (!service || service_len == 0 || !account || account_len == 0 || !buffer) return 0;
+    HMODULE advapi = LoadLibraryW(L"advapi32.dll");
+    if (!advapi) return 0;
+    auto cred_read = reinterpret_cast<BOOL (WINAPI *)(LPCWSTR, DWORD, DWORD, PCREDENTIALW *)>(GetProcAddress(advapi, "CredReadW"));
+    auto cred_free = reinterpret_cast<void (WINAPI *)(PVOID)>(GetProcAddress(advapi, "CredFree"));
+    if (!cred_read || !cred_free) {
+        FreeLibrary(advapi);
+        return 0;
+    }
+
+    std::wstring target = credentialTarget(slice(service, service_len), slice(account, account_len));
+    PCREDENTIALW credential = nullptr;
+    BOOL ok = cred_read(target.c_str(), CRED_TYPE_GENERIC, 0, &credential);
+    if (!ok || !credential) {
+        FreeLibrary(advapi);
+        return 0;
+    }
+
+    size_t secret_len = credential->CredentialBlobSize;
+    if (secret_len > buffer_len) {
+        cred_free(credential);
+        FreeLibrary(advapi);
+        return secret_len;
+    }
+    if (secret_len > 0) memcpy(buffer, credential->CredentialBlob, secret_len);
+    cred_free(credential);
+    FreeLibrary(advapi);
+    return secret_len;
+}
+
+int zero_native_windows_delete_credential(Host *host, const char *service, size_t service_len, const char *account, size_t account_len) {
+    (void)host;
+    if (!service || service_len == 0 || !account || account_len == 0) return 0;
+    HMODULE advapi = LoadLibraryW(L"advapi32.dll");
+    if (!advapi) return 0;
+    auto cred_delete = reinterpret_cast<BOOL (WINAPI *)(LPCWSTR, DWORD, DWORD)>(GetProcAddress(advapi, "CredDeleteW"));
+    if (!cred_delete) {
+        FreeLibrary(advapi);
+        return 0;
+    }
+
+    std::wstring target = credentialTarget(slice(service, service_len), slice(account, account_len));
+    BOOL ok = cred_delete(target.c_str(), CRED_TYPE_GENERIC, 0);
+    FreeLibrary(advapi);
+    return ok ? 1 : 0;
 }
 
 int zero_native_windows_create_webview(Host *host, uint64_t window_id, const char *label, size_t label_len, const char *url, size_t url_len, double x, double y, double width, double height, int layer, int transparent, int bridge_enabled) {

@@ -262,7 +262,7 @@ OS commands are **always default-deny** and require an explicit `builtin_bridge`
   </tbody>
 </table>
 
-Credential commands are **always default-deny** and require an explicit `builtin_bridge` policy. The macOS system WebView and macOS Chromium hosts store secrets in Keychain. Other platform hosts return `invalid_request` with the standard unsupported-service message until implemented.
+Credential commands are **always default-deny** and require an explicit `builtin_bridge` policy. The macOS system WebView and macOS Chromium hosts store secrets in Keychain. The Windows system WebView host stores secrets in Credential Manager. Other platform hosts return `invalid_request` with the standard unsupported-service message until implemented.
 
 ## Clipboard Commands
 
