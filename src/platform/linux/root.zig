@@ -94,6 +94,8 @@ extern fn zero_native_gtk_reveal_path(host: *GtkHost, path: [*]const u8, path_le
 extern fn zero_native_gtk_show_notification(host: *GtkHost, title: [*]const u8, title_len: usize, subtitle: [*]const u8, subtitle_len: usize, body: [*]const u8, body_len: usize) c_int;
 extern fn zero_native_gtk_clipboard_read(host: *GtkHost, buffer: [*]u8, buffer_len: usize) usize;
 extern fn zero_native_gtk_clipboard_write(host: *GtkHost, text: [*]const u8, text_len: usize) void;
+extern fn zero_native_gtk_clipboard_read_data(host: *GtkHost, mime_type: [*]const u8, mime_type_len: usize, buffer: [*]u8, buffer_len: usize) usize;
+extern fn zero_native_gtk_clipboard_write_data(host: *GtkHost, mime_type: [*]const u8, mime_type_len: usize, bytes: [*]const u8, bytes_len: usize) c_int;
 
 const GtkOpenDialogOpts = extern struct {
     title: [*]const u8,
@@ -188,6 +190,8 @@ pub const LinuxPlatform = struct {
                 .context = self,
                 .read_clipboard_fn = readClipboard,
                 .write_clipboard_fn = writeClipboard,
+                .read_clipboard_data_fn = readClipboardData,
+                .write_clipboard_data_fn = writeClipboardData,
                 .load_webview_fn = loadWebView,
                 .load_window_webview_fn = loadWindowWebView,
                 .complete_bridge_fn = completeBridge,
@@ -334,6 +338,17 @@ fn readClipboard(context: ?*anyopaque, buffer: []u8) anyerror![]const u8 {
 fn writeClipboard(context: ?*anyopaque, text: []const u8) anyerror!void {
     const self: *LinuxPlatform = @ptrCast(@alignCast(context.?));
     zero_native_gtk_clipboard_write(self.host, text.ptr, text.len);
+}
+
+fn readClipboardData(context: ?*anyopaque, mime_type: []const u8, buffer: []u8) anyerror![]const u8 {
+    const self: *LinuxPlatform = @ptrCast(@alignCast(context.?));
+    const len = zero_native_gtk_clipboard_read_data(self.host, mime_type.ptr, mime_type.len, buffer.ptr, buffer.len);
+    return buffer[0..len];
+}
+
+fn writeClipboardData(context: ?*anyopaque, data: platform_mod.ClipboardData) anyerror!void {
+    const self: *LinuxPlatform = @ptrCast(@alignCast(context.?));
+    if (zero_native_gtk_clipboard_write_data(self.host, data.mime_type.ptr, data.mime_type.len, data.bytes.ptr, data.bytes.len) == 0) return error.UnsupportedService;
 }
 
 fn loadWebView(context: ?*anyopaque, source: platform_mod.WebViewSource) anyerror!void {

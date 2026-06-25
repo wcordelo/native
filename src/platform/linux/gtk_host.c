@@ -2046,6 +2046,23 @@ typedef struct zero_native_clipboard_read_state {
     char *text;
 } zero_native_clipboard_read_state_t;
 
+typedef struct zero_native_clipboard_data_read_state {
+    GMainLoop *loop;
+    GBytes *bytes;
+} zero_native_clipboard_data_read_state_t;
+
+static gboolean zero_native_clipboard_is_plain_text(const char *mime_type, size_t mime_type_len) {
+    return (mime_type_len == 4 && g_ascii_strncasecmp(mime_type, "text", 4) == 0) ||
+        (mime_type_len == 10 && g_ascii_strncasecmp(mime_type, "text/plain", 10) == 0);
+}
+
+static size_t zero_native_copy_bytes(char *buffer, size_t buffer_len, const void *bytes, size_t bytes_len) {
+    if (!buffer || buffer_len == 0 || !bytes) return 0;
+    size_t count = bytes_len < buffer_len ? bytes_len : buffer_len;
+    if (count > 0) memcpy(buffer, bytes, count);
+    return count;
+}
+
 static void zero_native_clipboard_read_done(GObject *source, GAsyncResult *result, gpointer data) {
     zero_native_clipboard_read_state_t *state = data;
     GError *error = NULL;
@@ -2054,12 +2071,68 @@ static void zero_native_clipboard_read_done(GObject *source, GAsyncResult *resul
     g_main_loop_quit(state->loop);
 }
 
+static void zero_native_clipboard_data_read_done(GObject *source, GAsyncResult *result, gpointer data) {
+    zero_native_clipboard_data_read_state_t *state = data;
+    GError *error = NULL;
+    const char *out_mime_type = NULL;
+    GInputStream *stream = gdk_clipboard_read_finish(GDK_CLIPBOARD(source), result, &out_mime_type, &error);
+    (void)out_mime_type;
+    if (stream) {
+        GByteArray *array = g_byte_array_new();
+        char chunk[4096];
+        while (!error) {
+            gssize count = g_input_stream_read(stream, chunk, sizeof(chunk), NULL, &error);
+            if (count <= 0) break;
+            g_byte_array_append(array, (const guint8 *)chunk, (guint)count);
+        }
+        if (!error) {
+            state->bytes = g_byte_array_free_to_bytes(array);
+        } else {
+            g_byte_array_unref(array);
+        }
+        g_object_unref(stream);
+    }
+    if (error) g_error_free(error);
+    g_main_loop_quit(state->loop);
+}
+
 size_t zero_native_gtk_clipboard_read(zero_native_gtk_host_t *host, char *buffer, size_t buffer_len) {
+    return zero_native_gtk_clipboard_read_data(host, "text/plain", strlen("text/plain"), buffer, buffer_len);
+}
+
+void zero_native_gtk_clipboard_write(zero_native_gtk_host_t *host, const char *text, size_t text_len) {
+    (void)zero_native_gtk_clipboard_write_data(host, "text/plain", strlen("text/plain"), text, text_len);
+}
+
+size_t zero_native_gtk_clipboard_read_data(zero_native_gtk_host_t *host, const char *mime_type, size_t mime_type_len, char *buffer, size_t buffer_len) {
     (void)host;
+    if (!mime_type || mime_type_len == 0 || !buffer || buffer_len == 0) return 0;
     GdkDisplay *display = gdk_display_get_default();
     if (!display) return 0;
     GdkClipboard *clipboard = gdk_display_get_clipboard(display);
     if (!clipboard) return 0;
+    if (!zero_native_clipboard_is_plain_text(mime_type, mime_type_len)) {
+        char *mime = zero_native_strndup(mime_type, mime_type_len);
+        if (!mime) return 0;
+        const char *mime_types[] = { mime, NULL };
+        zero_native_clipboard_data_read_state_t data_state = {0};
+        data_state.loop = g_main_loop_new(NULL, FALSE);
+        if (!data_state.loop) {
+            free(mime);
+            return 0;
+        }
+        gdk_clipboard_read_async(clipboard, mime_types, G_PRIORITY_DEFAULT, NULL, zero_native_clipboard_data_read_done, &data_state);
+        g_main_loop_run(data_state.loop);
+        g_main_loop_unref(data_state.loop);
+        free(mime);
+        if (!data_state.bytes) return 0;
+        gsize len = 0;
+        const void *data = g_bytes_get_data(data_state.bytes, &len);
+        size_t count = zero_native_copy_bytes(buffer, buffer_len, data, len);
+        g_bytes_unref(data_state.bytes);
+        return count;
+    }
+
     zero_native_clipboard_read_state_t state = {0};
     state.loop = g_main_loop_new(NULL, FALSE);
     if (!state.loop) return 0;
@@ -2068,22 +2141,36 @@ size_t zero_native_gtk_clipboard_read(zero_native_gtk_host_t *host, char *buffer
     g_main_loop_unref(state.loop);
     if (!state.text) return 0;
     size_t len = strlen(state.text);
-    size_t count = len < buffer_len ? len : buffer_len;
-    memcpy(buffer, state.text, count);
+    size_t count = zero_native_copy_bytes(buffer, buffer_len, state.text, len);
     g_free(state.text);
     return count;
 }
 
-void zero_native_gtk_clipboard_write(zero_native_gtk_host_t *host, const char *text, size_t text_len) {
+int zero_native_gtk_clipboard_write_data(zero_native_gtk_host_t *host, const char *mime_type, size_t mime_type_len, const char *bytes, size_t bytes_len) {
     (void)host;
+    if (!mime_type || mime_type_len == 0 || (!bytes && bytes_len > 0)) return 0;
     GdkDisplay *display = gdk_display_get_default();
-    if (!display) return;
+    if (!display) return 0;
     GdkClipboard *clipboard = gdk_display_get_clipboard(display);
-    if (!clipboard) return;
-    char *copy = zero_native_strndup(text, text_len);
-    if (!copy) return;
-    gdk_clipboard_set_text(clipboard, copy);
-    free(copy);
+    if (!clipboard) return 0;
+    if (zero_native_clipboard_is_plain_text(mime_type, mime_type_len)) {
+        char *copy = zero_native_strndup(bytes, bytes_len);
+        if (!copy) return 0;
+        gdk_clipboard_set_text(clipboard, copy);
+        free(copy);
+        return 1;
+    }
+    char *mime = zero_native_strndup(mime_type, mime_type_len);
+    if (!mime) {
+        return 0;
+    }
+    GBytes *data = g_bytes_new(bytes, bytes_len);
+    GdkContentProvider *provider = gdk_content_provider_new_for_bytes(mime, data);
+    gboolean ok = provider ? gdk_clipboard_set_content(clipboard, provider) : FALSE;
+    if (provider) g_object_unref(provider);
+    g_bytes_unref(data);
+    free(mime);
+    return ok ? 1 : 0;
 }
 
 typedef struct zero_native_file_dialog_state {

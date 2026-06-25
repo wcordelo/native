@@ -474,6 +474,24 @@ void zero_native_gtk_clipboard_write(Host *host, const char *text, size_t text_l
     (void)text_len;
 }
 
+size_t zero_native_gtk_clipboard_read_data(Host *host, const char *mime_type, size_t mime_type_len, char *buffer, size_t buffer_len) {
+    (void)host;
+    (void)mime_type;
+    (void)mime_type_len;
+    (void)buffer;
+    (void)buffer_len;
+    return 0;
+}
+
+int zero_native_gtk_clipboard_write_data(Host *host, const char *mime_type, size_t mime_type_len, const char *bytes, size_t bytes_len) {
+    (void)host;
+    (void)mime_type;
+    (void)mime_type_len;
+    (void)bytes;
+    (void)bytes_len;
+    return 0;
+}
+
 OpenDialogResult zero_native_gtk_show_open_dialog(Host *host, const void *opts, char *buffer, size_t buffer_len) {
     (void)host;
     (void)opts;
