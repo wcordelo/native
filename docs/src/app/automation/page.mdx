@@ -120,7 +120,7 @@ The `test-webview-smoke` build step demonstrates a full automation test flow:
 
 1. Build and start the app with `-Dautomation=true`
 2. Run `zero-native automate wait` to block until the app is ready
-3. Run `zero-native automate snapshot` to verify window metadata and source kind
+3. Run `zero-native automate snapshot` to verify window, source, and native/WebView metadata
 4. Run `zero-native automate bridge '...'` to test the native bridge round-trip
 5. Verify the response in `bridge-response.txt`
 
