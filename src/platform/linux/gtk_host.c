@@ -1784,6 +1784,43 @@ int zero_native_gtk_reveal_path(zero_native_gtk_host_t *host, const char *path, 
     return 1;
 }
 
+int zero_native_gtk_show_notification(zero_native_gtk_host_t *host, const char *title, size_t title_len, const char *subtitle, size_t subtitle_len, const char *body, size_t body_len) {
+    if (!host || !host->app || !title || title_len == 0) return 0;
+    if ((subtitle_len > 0 && !subtitle) || (body_len > 0 && !body)) return 0;
+    char *title_copy = zero_native_strndup(title, title_len);
+    if (!title_copy) return 0;
+
+    GNotification *notification = g_notification_new(title_copy);
+    free(title_copy);
+    if (!notification) return 0;
+
+    size_t message_len = subtitle_len + body_len + ((subtitle_len > 0 && body_len > 0) ? 1 : 0);
+    if (message_len > 0) {
+        char *message = malloc(message_len + 1);
+        if (!message) {
+            g_object_unref(notification);
+            return 0;
+        }
+        size_t offset = 0;
+        if (subtitle && subtitle_len > 0) {
+            memcpy(message + offset, subtitle, subtitle_len);
+            offset += subtitle_len;
+        }
+        if (subtitle_len > 0 && body_len > 0) message[offset++] = '\n';
+        if (body && body_len > 0) {
+            memcpy(message + offset, body, body_len);
+            offset += body_len;
+        }
+        message[offset] = '\0';
+        g_notification_set_body(notification, message);
+        free(message);
+    }
+
+    g_application_send_notification(G_APPLICATION(host->app), NULL, notification);
+    g_object_unref(notification);
+    return 1;
+}
+
 typedef struct zero_native_clipboard_read_state {
     GMainLoop *loop;
     char *text;

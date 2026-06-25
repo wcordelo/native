@@ -231,7 +231,7 @@ Dialog commands are **always default-deny** and require an explicit `builtin_bri
   </tbody>
 </table>
 
-OS commands are **always default-deny** and require an explicit `builtin_bridge` policy. `zero-native.os.openUrl` also checks `security.navigation.external_links`; the URL must match the external link allowlist before the platform service is called. macOS, Linux, and Windows system WebView hosts implement `openUrl` and `revealPath`; macOS and Windows system WebView hosts implement recent-document commands; macOS Chromium also implements the current OS command set. Other platform hosts return `invalid_request` with the standard unsupported-service message until implemented.
+OS commands are **always default-deny** and require an explicit `builtin_bridge` policy. `zero-native.os.openUrl` also checks `security.navigation.external_links`; the URL must match the external link allowlist before the platform service is called. macOS, Linux, and Windows system WebView hosts implement `openUrl` and `revealPath`; macOS and Linux system WebView hosts implement notifications; macOS and Windows system WebView hosts implement recent-document commands; macOS Chromium also implements the current OS command set. Other platform hosts return `invalid_request` with the standard unsupported-service message until implemented.
 
 ## Credential Commands
 

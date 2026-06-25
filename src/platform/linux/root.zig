@@ -87,6 +87,7 @@ extern fn zero_native_gtk_set_webview_layer(host: *GtkHost, window_id: u64, labe
 extern fn zero_native_gtk_close_webview(host: *GtkHost, window_id: u64, label: [*]const u8, label_len: usize) c_int;
 extern fn zero_native_gtk_open_external_url(host: *GtkHost, url: [*]const u8, url_len: usize) c_int;
 extern fn zero_native_gtk_reveal_path(host: *GtkHost, path: [*]const u8, path_len: usize) c_int;
+extern fn zero_native_gtk_show_notification(host: *GtkHost, title: [*]const u8, title_len: usize, subtitle: [*]const u8, subtitle_len: usize, body: [*]const u8, body_len: usize) c_int;
 extern fn zero_native_gtk_clipboard_read(host: *GtkHost, buffer: [*]u8, buffer_len: usize) usize;
 extern fn zero_native_gtk_clipboard_write(host: *GtkHost, text: [*]const u8, text_len: usize) void;
 
@@ -208,6 +209,7 @@ pub const LinuxPlatform = struct {
                 .show_message_dialog_fn = showMessageDialog,
                 .open_external_url_fn = openExternalUrl,
                 .reveal_path_fn = revealPath,
+                .show_notification_fn = showNotification,
                 .create_tray_fn = createTray,
                 .update_tray_menu_fn = updateTrayMenu,
                 .remove_tray_fn = removeTray,
@@ -604,6 +606,20 @@ fn revealPath(context: ?*anyopaque, path: []const u8) anyerror!void {
     const self: *LinuxPlatform = @ptrCast(@alignCast(context.?));
     if (self.web_engine != .system) return error.UnsupportedService;
     if (zero_native_gtk_reveal_path(self.host, path.ptr, path.len) == 0) return error.UnsupportedService;
+}
+
+fn showNotification(context: ?*anyopaque, options: platform_mod.NotificationOptions) anyerror!void {
+    const self: *LinuxPlatform = @ptrCast(@alignCast(context.?));
+    if (self.web_engine != .system) return error.UnsupportedService;
+    if (zero_native_gtk_show_notification(
+        self.host,
+        options.title.ptr,
+        options.title.len,
+        options.subtitle.ptr,
+        options.subtitle.len,
+        options.body.ptr,
+        options.body.len,
+    ) == 0) return error.UnsupportedService;
 }
 
 fn createTray(context: ?*anyopaque, options: platform_mod.TrayOptions) anyerror!void {
