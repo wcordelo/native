@@ -923,6 +923,10 @@ static NSMutableDictionary *ZeroNativeCredentialQuery(NSString *service, NSStrin
     if (existing) return NO;
 
     WKWebViewConfiguration *configuration = [[WKWebViewConfiguration alloc] init];
+    ZeroNativeAssetSchemeHandler *assetSchemeHandler = [self assetHandlerForWindowId:windowId];
+    if (assetSchemeHandler) {
+        [configuration setURLSchemeHandler:assetSchemeHandler forURLScheme:@"zero"];
+    }
     if (bridgeEnabled) {
         WKUserContentController *controller = [[WKUserContentController alloc] init];
         ZeroNativeBridgeScriptHandler *handler = [[ZeroNativeBridgeScriptHandler alloc] init];

@@ -839,7 +839,13 @@ static char *zero_native_asset_relative_path(const char *uri, const char *entry)
     path = path ? strchr(path + 3, '/') : NULL;
     if (!path || !path[1]) return g_strdup(entry && entry[0] ? entry : "index.html");
     while (*path == '/') path++;
-    char *unescaped = g_uri_unescape_string(path, NULL);
+    const char *path_end = path;
+    while (*path_end && *path_end != '?' && *path_end != '#') path_end++;
+    if (path_end == path) return g_strdup(entry && entry[0] ? entry : "index.html");
+    char *raw = g_strndup(path, (gsize)(path_end - path));
+    if (!raw) return NULL;
+    char *unescaped = g_uri_unescape_string(raw, NULL);
+    g_free(raw);
     if (!unescaped) return NULL;
     if (!zero_native_path_is_safe(unescaped)) {
         g_free(unescaped);

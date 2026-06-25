@@ -274,6 +274,8 @@ struct Host {
     std::shared_ptr<HostLifetime> lifetime = std::make_shared<HostLifetime>();
 };
 
+static std::string webViewKey(uint64_t window_id, const std::string &label);
+
 static std::string slice(const char *bytes, size_t len) {
     return bytes && len > 0 ? std::string(bytes, len) : std::string();
 }
@@ -603,8 +605,34 @@ static std::string virtualAssetEntryUrl(const std::string &entry) {
     return originAssetEntryUrl(entry, kAssetVirtualOrigin);
 }
 
+static std::string urlQueryOrFragmentSuffix(const std::string &url) {
+    size_t scheme_end = url.find("://");
+    size_t search_start = scheme_end == std::string::npos ? 0 : scheme_end + 3;
+    size_t suffix_start = url.find_first_of("?#", search_start);
+    return suffix_start == std::string::npos ? std::string() : url.substr(suffix_start);
+}
+
 static std::string assetEntryUrl(const ChildWebView &webview) {
+    if (!webview.url.empty() && originForUrl(webview.url) == assetOrigin(webview)) {
+        std::string relative;
+        if (assetRelativePathFromUrl(webview.url, webview.asset_entry, &relative)) {
+            return virtualAssetEntryUrl(relative) + urlQueryOrFragmentSuffix(webview.url);
+        }
+    }
     return virtualAssetEntryUrl(webview.asset_entry);
+}
+
+static bool inheritAssetSourceForUrl(Host *host, uint64_t window_id, ChildWebView &webview, const std::string &url) {
+    if (!host) return false;
+    auto main = host->webviews.find(webViewKey(window_id, "main"));
+    if (main == host->webviews.end() || main->second.source_kind != 2) return false;
+    if (originForUrl(url) != assetOrigin(main->second)) return false;
+    webview.source_kind = 2;
+    webview.asset_root = main->second.asset_root;
+    webview.asset_entry = main->second.asset_entry;
+    webview.asset_origin = main->second.asset_origin;
+    webview.spa_fallback = main->second.spa_fallback;
+    return true;
 }
 
 static bool isInternalAssetUrl(const ChildWebView &webview, const std::string &url) {
@@ -2765,6 +2793,7 @@ int zero_native_windows_create_webview(Host *host, uint64_t window_id, const cha
     webview.creation_order = host->next_child_order++;
     webview.transparent = transparent != 0;
     webview.bridge_enabled = bridge_enabled != 0;
+    inheritAssetSourceForUrl(host, window_id, webview, url_string);
     host->webviews[key] = webview;
     applyChildWebViewLayer(host, window_id, label_string);
     if (!createChildWebView(host, key)) {
@@ -2809,11 +2838,15 @@ int zero_native_windows_navigate_webview(Host *host, uint64_t window_id, const c
     if (!host || label_len == 0 || url_len == 0) return 0;
     auto found = host->webviews.find(webViewKey(window_id, slice(label, label_len)));
     if (found == host->webviews.end() || !found->second.hwnd) return 0;
-    found->second.source_kind = 1;
     found->second.url = slice(url, url_len);
+    if (!inheritAssetSourceForUrl(host, window_id, found->second, found->second.url)) {
+        found->second.source_kind = 1;
+    }
     if (found->second.webview) {
-        std::wstring target = widen(found->second.url);
-        found->second.webview->Navigate(target.c_str());
+        std::string target = found->second.source_kind == 2 ? assetEntryUrl(found->second) : found->second.url;
+        if (target.empty()) target = "about:blank";
+        std::wstring wide_target = widen(target);
+        found->second.webview->Navigate(wide_target.c_str());
         return 1;
     }
     // WebView2 initializes asynchronously; keep the newest URL and apply it in the creation callback.
