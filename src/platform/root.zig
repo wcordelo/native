@@ -53,6 +53,8 @@ pub const Error = error{
     InvalidCredentialOptions,
     CredentialFieldTooLarge,
     CredentialNotFound,
+    InvalidTrayOptions,
+    TrayFieldTooLarge,
 };
 
 pub const WebEngine = enum {
@@ -110,6 +112,10 @@ pub const max_clipboard_data_bytes: usize = 65536;
 pub const max_credential_service_bytes: usize = 128;
 pub const max_credential_account_bytes: usize = 256;
 pub const max_credential_secret_bytes: usize = 4096;
+pub const max_tray_items: usize = 32;
+pub const max_tray_icon_path_bytes: usize = 4096;
+pub const max_tray_tooltip_bytes: usize = 256;
+pub const max_tray_item_label_bytes: usize = 256;
 pub const max_drop_paths_bytes: usize = 8192;
 pub const max_window_event_name_bytes: usize = 64;
 pub const max_window_event_detail_bytes: usize = 8192;
@@ -950,6 +956,15 @@ pub const NullPlatform = struct {
     credential_secret_len: usize = 0,
     credential_set_count: usize = 0,
     credential_delete_count: usize = 0,
+    tray_icon_path: [max_tray_icon_path_bytes]u8 = undefined,
+    tray_icon_path_len: usize = 0,
+    tray_tooltip: [max_tray_tooltip_bytes]u8 = undefined,
+    tray_tooltip_len: usize = 0,
+    tray_items: [max_tray_items]TrayMenuItem = undefined,
+    tray_item_count: usize = 0,
+    tray_create_count: usize = 0,
+    tray_update_count: usize = 0,
+    tray_remove_count: usize = 0,
     window_event_window_id: WindowId = 0,
     window_event_name: [max_window_event_name_bytes]u8 = undefined,
     window_event_name_len: usize = 0,
@@ -1005,6 +1020,9 @@ pub const NullPlatform = struct {
                 .set_credential_fn = setCredential,
                 .get_credential_fn = getCredential,
                 .delete_credential_fn = deleteCredential,
+                .create_tray_fn = createTray,
+                .update_tray_menu_fn = updateTrayMenu,
+                .remove_tray_fn = removeTray,
                 .open_external_url_fn = openExternalUrl,
                 .reveal_path_fn = revealPath,
                 .add_recent_document_fn = addRecentDocument,
@@ -1343,6 +1361,30 @@ pub const NullPlatform = struct {
         self.credential_delete_count += 1;
     }
 
+    fn createTray(context: ?*anyopaque, options: TrayOptions) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        self.tray_icon_path = undefined;
+        self.tray_tooltip = undefined;
+        self.tray_icon_path_len = (try copyInto(&self.tray_icon_path, options.icon_path)).len;
+        self.tray_tooltip_len = (try copyInto(&self.tray_tooltip, options.tooltip)).len;
+        try updateTrayMenu(context, options.items);
+        self.tray_create_count += 1;
+    }
+
+    fn updateTrayMenu(context: ?*anyopaque, items: []const TrayMenuItem) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        if (items.len > self.tray_items.len) return error.InvalidTrayOptions;
+        for (items, 0..) |item, index| self.tray_items[index] = item;
+        self.tray_item_count = items.len;
+        self.tray_update_count += 1;
+    }
+
+    fn removeTray(context: ?*anyopaque) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        self.tray_item_count = 0;
+        self.tray_remove_count += 1;
+    }
+
     fn openExternalUrl(context: ?*anyopaque, url: []const u8) anyerror!void {
         const self: *NullPlatform = @ptrCast(@alignCast(context.?));
         self.external_url = undefined;
@@ -1601,6 +1643,30 @@ pub const NullPlatform = struct {
         return self.credential_delete_count;
     }
 
+    pub fn lastTrayIconPath(self: *const NullPlatform) []const u8 {
+        return self.tray_icon_path[0..self.tray_icon_path_len];
+    }
+
+    pub fn lastTrayTooltip(self: *const NullPlatform) []const u8 {
+        return self.tray_tooltip[0..self.tray_tooltip_len];
+    }
+
+    pub fn trayItems(self: *const NullPlatform) []const TrayMenuItem {
+        return self.tray_items[0..self.tray_item_count];
+    }
+
+    pub fn trayCreateCount(self: *const NullPlatform) usize {
+        return self.tray_create_count;
+    }
+
+    pub fn trayUpdateCount(self: *const NullPlatform) usize {
+        return self.tray_update_count;
+    }
+
+    pub fn trayRemoveCount(self: *const NullPlatform) usize {
+        return self.tray_remove_count;
+    }
+
     pub fn lastWindowEventWindowId(self: *const NullPlatform) WindowId {
         return self.window_event_window_id;
     }
@@ -1738,6 +1804,15 @@ test "null platform records OS actions" {
     try services.addRecentDocument("/tmp/recent.txt");
     try services.writeClipboard("plain text");
     try services.setCredential(.{ .service = "dev.zero-native.test", .account = "alice", .secret = "secret-token" });
+    try services.createTray(.{
+        .icon_path = "/tmp/tray.png",
+        .tooltip = "zero-native",
+        .items = &.{
+            .{ .id = 1, .label = "Open" },
+            .{ .separator = true },
+            .{ .id = 2, .label = "Quit", .enabled = false },
+        },
+    });
 
     try std.testing.expectEqual(@as(usize, 1), null_platform.notificationCount());
     try std.testing.expectEqualStrings("Build finished", null_platform.lastNotificationTitle());
@@ -1762,6 +1837,15 @@ test "null platform records OS actions" {
     try std.testing.expectEqualStrings("dev.zero-native.test", null_platform.lastCredentialService());
     try std.testing.expectEqualStrings("alice", null_platform.lastCredentialAccount());
     try std.testing.expectEqualStrings("secret-token", null_platform.lastCredentialSecret());
+    try std.testing.expectEqual(@as(usize, 1), null_platform.trayCreateCount());
+    try std.testing.expectEqualStrings("/tmp/tray.png", null_platform.lastTrayIconPath());
+    try std.testing.expectEqualStrings("zero-native", null_platform.lastTrayTooltip());
+    try std.testing.expectEqual(@as(usize, 3), null_platform.trayItems().len);
+    try std.testing.expectEqual(@as(TrayItemId, 1), null_platform.trayItems()[0].id);
+    try std.testing.expectEqualStrings("Open", null_platform.trayItems()[0].label);
+    try std.testing.expect(null_platform.trayItems()[1].separator);
+    try std.testing.expectEqual(@as(TrayItemId, 2), null_platform.trayItems()[2].id);
+    try std.testing.expect(!null_platform.trayItems()[2].enabled);
 
     var credential_buffer: [64]u8 = undefined;
     const secret = try services.getCredential(.{ .service = "dev.zero-native.test", .account = "alice" }, &credential_buffer);
@@ -1774,6 +1858,14 @@ test "null platform records OS actions" {
     try services.clearRecentDocuments();
     try std.testing.expectEqual(@as(usize, 1), null_platform.recentDocumentsClearedCount());
     try std.testing.expectEqualStrings("", null_platform.lastRecentDocumentPath());
+
+    try services.updateTrayMenu(&.{.{ .id = 3, .label = "Settings" }});
+    try std.testing.expectEqual(@as(usize, 2), null_platform.trayUpdateCount());
+    try std.testing.expectEqual(@as(usize, 1), null_platform.trayItems().len);
+    try std.testing.expectEqualStrings("Settings", null_platform.trayItems()[0].label);
+    try services.removeTray();
+    try std.testing.expectEqual(@as(usize, 1), null_platform.trayRemoveCount());
+    try std.testing.expectEqual(@as(usize, 0), null_platform.trayItems().len);
 }
 
 test "null platform records configured shortcuts" {

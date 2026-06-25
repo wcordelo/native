@@ -500,6 +500,20 @@ pub const Runtime = struct {
         return true;
     }
 
+    pub fn createTray(self: *Runtime, options: platform.TrayOptions) anyerror!void {
+        try validateTrayOptions(options);
+        try self.options.platform.services.createTray(options);
+    }
+
+    pub fn updateTrayMenu(self: *Runtime, items: []const platform.TrayMenuItem) anyerror!void {
+        try validateTrayMenuItems(items);
+        try self.options.platform.services.updateTrayMenu(items);
+    }
+
+    pub fn removeTray(self: *Runtime) anyerror!void {
+        try self.options.platform.services.removeTray();
+    }
+
     pub fn emitWindowEvent(self: *Runtime, window_id: platform.WindowId, name: []const u8, detail_json: []const u8) anyerror!void {
         if (!json.isValidValue(detail_json)) return error.InvalidJsonEventDetail;
         try self.options.platform.services.emitWindowEvent(window_id, name, detail_json);
@@ -2579,6 +2593,8 @@ fn builtinBridgeErrorMessage(err: anyerror) []const u8 {
         error.InvalidCredentialOptions => "Credential options are invalid",
         error.CredentialFieldTooLarge => "Credential field is too large",
         error.CredentialNotFound => "Credential was not found",
+        error.InvalidTrayOptions => "Tray options are invalid",
+        error.TrayFieldTooLarge => "Tray field is too large",
         error.InvalidWindowOptions => "Window options are invalid",
         error.InvalidCommand => "Command name is invalid",
         error.DuplicateWindowId => "Window id already exists",
@@ -2641,6 +2657,8 @@ fn builtinBridgeErrorCode(err: anyerror) bridge.ErrorCode {
         error.ClipboardFieldTooLarge,
         error.InvalidCredentialOptions,
         error.CredentialFieldTooLarge,
+        error.InvalidTrayOptions,
+        error.TrayFieldTooLarge,
         => .invalid_request,
         error.NavigationDenied => .invalid_request,
         else => .internal_error,
@@ -2713,6 +2731,27 @@ fn validateCredentialField(value: []const u8, max_len: usize) !void {
     if (value.len > max_len) return error.CredentialFieldTooLarge;
     for (value) |ch| {
         if (ch == 0) return error.InvalidCredentialOptions;
+    }
+}
+
+fn validateTrayOptions(options: platform.TrayOptions) !void {
+    try validateTrayField(options.icon_path, platform.max_tray_icon_path_bytes);
+    try validateTrayField(options.tooltip, platform.max_tray_tooltip_bytes);
+    try validateTrayMenuItems(options.items);
+}
+
+fn validateTrayMenuItems(items: []const platform.TrayMenuItem) !void {
+    if (items.len > platform.max_tray_items) return error.InvalidTrayOptions;
+    for (items) |item| {
+        try validateTrayField(item.label, platform.max_tray_item_label_bytes);
+        if (!item.separator and item.label.len == 0) return error.InvalidTrayOptions;
+    }
+}
+
+fn validateTrayField(value: []const u8, max_len: usize) !void {
+    if (value.len > max_len) return error.TrayFieldTooLarge;
+    for (value) |ch| {
+        if (ch == 0) return error.InvalidTrayOptions;
     }
 }
 
@@ -4553,6 +4592,30 @@ test "runtime validates native OS actions before platform dispatch" {
     try std.testing.expectEqual(@as(?[]const u8, null), try harness.runtime.getCredential(.{ .service = "dev.zero-native.test", .account = "bob" }, &credential_buffer));
     try std.testing.expect(try harness.runtime.deleteCredential(.{ .service = "dev.zero-native.test", .account = "alice" }));
     try std.testing.expect(!try harness.runtime.deleteCredential(.{ .service = "dev.zero-native.test", .account = "alice" }));
+
+    try std.testing.expectError(error.InvalidTrayOptions, harness.runtime.createTray(.{ .items = &.{.{ .label = "" }} }));
+    try std.testing.expectError(error.InvalidTrayOptions, harness.runtime.updateTrayMenu(&.{.{ .label = "" }}));
+    try harness.runtime.createTray(.{
+        .icon_path = "/tmp/tray.png",
+        .tooltip = "zero-native",
+        .items = &.{
+            .{ .id = 1, .label = "Open" },
+            .{ .separator = true },
+            .{ .id = 2, .label = "Quit", .enabled = false },
+        },
+    });
+    try std.testing.expectEqual(@as(usize, 1), harness.null_platform.trayCreateCount());
+    try std.testing.expectEqualStrings("/tmp/tray.png", harness.null_platform.lastTrayIconPath());
+    try std.testing.expectEqualStrings("zero-native", harness.null_platform.lastTrayTooltip());
+    try std.testing.expectEqual(@as(usize, 3), harness.null_platform.trayItems().len);
+    try std.testing.expectEqualStrings("Open", harness.null_platform.trayItems()[0].label);
+    try std.testing.expect(harness.null_platform.trayItems()[1].separator);
+    try std.testing.expect(!harness.null_platform.trayItems()[2].enabled);
+    try harness.runtime.updateTrayMenu(&.{.{ .id = 3, .label = "Settings" }});
+    try std.testing.expectEqual(@as(usize, 2), harness.null_platform.trayUpdateCount());
+    try std.testing.expectEqualStrings("Settings", harness.null_platform.trayItems()[0].label);
+    try harness.runtime.removeTray();
+    try std.testing.expectEqual(@as(usize, 1), harness.null_platform.trayRemoveCount());
 }
 
 test "runtime gates built-in OS bridge commands through explicit policy" {
