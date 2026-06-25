@@ -181,12 +181,12 @@ export interface ZeroNativeViewInfo {
   open: boolean;
 }
 
-export interface ZeroNativeCreateViewOptions {
+export type ZeroNativeNativeViewKind = Exclude<ZeroNativeViewKind, "webview">;
+
+export interface ZeroNativeCreateViewBaseOptions {
   label: string;
-  kind: ZeroNativeViewKind;
   windowId?: number;
   parent?: string;
-  frame?: ZeroNativeRect;
   layer?: number;
   visible?: boolean;
   enabled?: boolean;
@@ -197,11 +197,25 @@ export interface ZeroNativeCreateViewOptions {
   /** Visible native control label, button title, or text/search placeholder. */
   text?: string;
   command?: string;
-  /** Required when kind is "webview". Ignored for native view kinds. */
-  url?: string;
   transparent?: boolean;
   bridge?: boolean;
 }
+
+export interface ZeroNativeCreateNativeViewOptions extends ZeroNativeCreateViewBaseOptions {
+  kind: ZeroNativeNativeViewKind;
+  frame?: ZeroNativeRect;
+  url?: never;
+}
+
+export interface ZeroNativeCreateWebViewViewOptions extends ZeroNativeCreateViewBaseOptions {
+  kind: "webview";
+  frame: ZeroNativeRect;
+  url: string;
+}
+
+export type ZeroNativeCreateViewOptions =
+  | ZeroNativeCreateNativeViewOptions
+  | ZeroNativeCreateWebViewViewOptions;
 
 export interface ZeroNativeUpdateViewOptions {
   label: string;

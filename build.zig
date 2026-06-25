@@ -177,6 +177,9 @@ pub fn build(b: *std.Build) void {
     addFileContainsCheckStep(b, test_step, "test-package-types", "Verify package TypeScript platform feature names", &.{
         .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "ZeroNativeCommandInfo" },
         .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "list(): Promise<ZeroNativeCommandInfo[]>" },
+        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "ZeroNativeCreateWebViewViewOptions" },
+        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "kind: \"webview\"" },
+        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "url: string" },
         .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "ZeroNativePlatformFeatureSelector" },
         .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "supports(value: ZeroNativePlatformFeature | ZeroNativePlatformFeatureSelector)" },
         .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"native_control_commands\"" },
