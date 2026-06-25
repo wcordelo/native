@@ -118,6 +118,14 @@ Framework-specific starter examples live in `examples/`:
 
 Each example is a complete zero-native app with `app.zon`, a Zig shell, and a minimal frontend project. Run one with `zig build run` from its directory.
 
+Native-first examples are available too:
+
+- `examples/command-app` - shared command routing across native controls, menus, shortcuts, tray, and bridge calls
+- `examples/native-shell` - native toolbar/sidebar/statusbar chrome around WebView content
+- `examples/native-panels` - split/stack native panel composition with WebView content
+- `examples/capabilities` - guarded OS services such as notifications, clipboard, dialogs, credentials, file drops, and recent documents
+- `examples/mobile-shell` - shared metadata for the iOS and Android native shell hosts
+
 Mobile embedding examples are available too:
 
 - `examples/ios`
