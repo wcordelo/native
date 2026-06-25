@@ -268,9 +268,12 @@ fn createIosArtifact(allocator: std.mem.Allocator, io: std.Io, options: PackageO
     const info_plist = try iosInfoPlistForMetadata(allocator, options.metadata);
     defer allocator.free(info_plist);
     try writeFile(dir, io, "Info.plist", info_plist);
+    const assets_output = try assetOutputPath(allocator, options.output_path, "Resources", options);
+    defer allocator.free(assets_output);
+    const bundle_stats = try assets_tool.bundle(allocator, io, options.assets_dir, assets_output);
     if (options.binary_path) |binary_path| try copyFileToDir(allocator, io, dir, binary_path, "Libraries/libzero-native.a");
-    try writeReport(allocator, dir, io, "package-manifest.zon", options, "libzero-native.a", 0);
-    return .{ .path = options.output_path, .artifact_name = std.fs.path.basename(options.output_path), .target = .ios, .web_engine = options.web_engine };
+    try writeReport(allocator, dir, io, "package-manifest.zon", options, "libzero-native.a", bundle_stats.asset_count);
+    return .{ .path = options.output_path, .artifact_name = std.fs.path.basename(options.output_path), .target = .ios, .asset_count = bundle_stats.asset_count, .web_engine = options.web_engine };
 }
 
 fn createAndroidArtifact(allocator: std.mem.Allocator, io: std.Io, options: PackageOptions) !PackageStats {
@@ -284,9 +287,12 @@ fn createAndroidArtifact(allocator: std.mem.Allocator, io: std.Io, options: Pack
     const manifest = try androidManifestForMetadata(allocator, options.metadata);
     defer allocator.free(manifest);
     try writeFile(dir, io, "app/src/main/AndroidManifest.xml", manifest);
+    const assets_output = try assetOutputPath(allocator, options.output_path, "app/src/main/assets/zero-native", options);
+    defer allocator.free(assets_output);
+    const bundle_stats = try assets_tool.bundle(allocator, io, options.assets_dir, assets_output);
     if (options.binary_path) |binary_path| try copyFileToDir(allocator, io, dir, binary_path, "app/src/main/cpp/lib/libzero-native.a");
-    try writeReport(allocator, dir, io, "package-manifest.zon", options, "libzero-native.a", 0);
-    return .{ .path = options.output_path, .artifact_name = std.fs.path.basename(options.output_path), .target = .android, .web_engine = options.web_engine };
+    try writeReport(allocator, dir, io, "package-manifest.zon", options, "libzero-native.a", bundle_stats.asset_count);
+    return .{ .path = options.output_path, .artifact_name = std.fs.path.basename(options.output_path), .target = .android, .asset_count = bundle_stats.asset_count, .web_engine = options.web_engine };
 }
 
 fn writeFile(dir: std.Io.Dir, io: std.Io, path: []const u8, bytes: []const u8) !void {
@@ -455,6 +461,11 @@ fn iosViewController() []const u8 {
     \\
     \\        nativeApp = zero_native_app_create()
     \\        if let nativeApp {
+    \\            if let resourcePath = Bundle.main.resourcePath {
+    \\                resourcePath.withCString { pointer in
+    \\                    zero_native_app_set_asset_root(nativeApp, pointer, UInt(resourcePath.utf8.count))
+    \\                }
+    \\            }
     \\            zero_native_app_start(nativeApp)
     \\        }
     \\        webView.loadHTMLString(Self.html, baseURL: nil)
@@ -792,6 +803,7 @@ fn androidActivity() []const u8 {
     \\        setContentView(root)
     \\
     \\        nativeApp = nativeCreate()
+    \\        nativeSetAssetRoot(nativeApp, "android_asset/zero-native")
     \\        nativeStart(nativeApp)
     \\    }
     \\
@@ -861,6 +873,7 @@ fn androidActivity() []const u8 {
     \\    external fun nativeActivate(app: Long)
     \\    external fun nativeDeactivate(app: Long)
     \\    external fun nativeStop(app: Long)
+    \\    external fun nativeSetAssetRoot(app: Long, path: String)
     \\    external fun nativeResize(app: Long, width: Float, height: Float, scale: Float, surface: Any)
     \\    external fun nativeTouch(app: Long, id: Long, phase: Int, x: Float, y: Float, pressure: Float)
     \\    external fun nativeCommand(app: Long, command: String): Int
@@ -895,6 +908,7 @@ fn androidJni() []const u8 {
     \\JNIEXPORT void JNICALL Java_dev_zero_1native_MainActivity_nativeActivate(JNIEnv *env, jobject self, jlong app) { (void)env; (void)self; zero_native_app_activate((void*)app); }
     \\JNIEXPORT void JNICALL Java_dev_zero_1native_MainActivity_nativeDeactivate(JNIEnv *env, jobject self, jlong app) { (void)env; (void)self; zero_native_app_deactivate((void*)app); }
     \\JNIEXPORT void JNICALL Java_dev_zero_1native_MainActivity_nativeStop(JNIEnv *env, jobject self, jlong app) { (void)env; (void)self; zero_native_app_stop((void*)app); }
+    \\JNIEXPORT void JNICALL Java_dev_zero_1native_MainActivity_nativeSetAssetRoot(JNIEnv *env, jobject self, jlong app, jstring path) { (void)self; const char *chars = (*env)->GetStringUTFChars(env, path, NULL); if (!chars) return; zero_native_app_set_asset_root((void*)app, chars, strlen(chars)); (*env)->ReleaseStringUTFChars(env, path, chars); }
     \\JNIEXPORT void JNICALL Java_dev_zero_1native_MainActivity_nativeResize(JNIEnv *env, jobject self, jlong app, jfloat w, jfloat h, jfloat scale, jobject surface) { (void)env; (void)self; zero_native_app_resize((void*)app, w, h, scale, surface); }
     \\JNIEXPORT void JNICALL Java_dev_zero_1native_MainActivity_nativeTouch(JNIEnv *env, jobject self, jlong app, jlong id, jint phase, jfloat x, jfloat y, jfloat pressure) { (void)env; (void)self; zero_native_app_touch((void*)app, (uint64_t)id, phase, x, y, pressure); }
     \\JNIEXPORT jint JNICALL Java_dev_zero_1native_MainActivity_nativeCommand(JNIEnv *env, jobject self, jlong app, jstring command) { (void)self; const char *chars = (*env)->GetStringUTFChars(env, command, NULL); if (!chars) return 0; zero_native_app_command((void*)app, chars, strlen(chars)); (*env)->ReleaseStringUTFChars(env, command, chars); return (jint)zero_native_app_last_command_count((void*)app); }
@@ -1670,6 +1684,7 @@ test "mobile package templates include native command shells" {
     const ios_controller = iosViewController();
     try std.testing.expect(std.mem.indexOf(u8, ios_controller, "UIButton(type: .system)") != null);
     try std.testing.expect(std.mem.indexOf(u8, ios_controller, "zero_native_app_command") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ios_controller, "zero_native_app_set_asset_root") != null);
     try std.testing.expect(std.mem.indexOf(u8, ios_controller, "keyboardWillChangeFrameNotification") != null);
 
     const android_gradle = androidBuildGradle();
@@ -1678,6 +1693,7 @@ test "mobile package templates include native command shells" {
 
     const android_activity = androidActivity();
     try std.testing.expect(std.mem.indexOf(u8, android_activity, "System.loadLibrary(\"zero_native_host\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, android_activity, "nativeSetAssetRoot(nativeApp, \"android_asset/zero-native\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, android_activity, "dispatchNativeCommand(\"mobile.refresh\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, android_activity, "WebView(this)") != null);
 
@@ -1686,6 +1702,7 @@ test "mobile package templates include native command shells" {
 
     const android_jni = androidJni();
     try std.testing.expect(std.mem.indexOf(u8, android_jni, "#include <stdint.h>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, android_jni, "zero_native_app_set_asset_root") != null);
 }
 
 test "mobile skeletons create native library drop-in directories" {
@@ -1714,6 +1731,8 @@ test "mobile package artifacts use manifest identity metadata" {
     var cwd = std.Io.Dir.cwd();
     try cwd.deleteTree(std.testing.io, ".zig-cache/test-package-mobile-identity");
     defer cwd.deleteTree(std.testing.io, ".zig-cache/test-package-mobile-identity") catch {};
+    try cwd.createDirPath(std.testing.io, ".zig-cache/test-package-mobile-identity/assets");
+    try cwd.writeFile(std.testing.io, .{ .sub_path = ".zig-cache/test-package-mobile-identity/assets/index.html", .data = "<h1>Mobile</h1>" });
 
     const metadata: manifest_tool.Metadata = .{
         .id = "dev.zero-native.mobile-app",
@@ -1722,14 +1741,18 @@ test "mobile package artifacts use manifest identity metadata" {
         .version = "2.3.4",
     };
 
-    _ = try createIosArtifact(std.testing.allocator, std.testing.io, .{
+    const ios_stats = try createIosArtifact(std.testing.allocator, std.testing.io, .{
         .metadata = metadata,
         .output_path = ".zig-cache/test-package-mobile-identity/ios",
+        .assets_dir = ".zig-cache/test-package-mobile-identity/assets",
     });
-    _ = try createAndroidArtifact(std.testing.allocator, std.testing.io, .{
+    const android_stats = try createAndroidArtifact(std.testing.allocator, std.testing.io, .{
         .metadata = metadata,
         .output_path = ".zig-cache/test-package-mobile-identity/android",
+        .assets_dir = ".zig-cache/test-package-mobile-identity/assets",
     });
+    try std.testing.expectEqual(@as(usize, 1), ios_stats.asset_count);
+    try std.testing.expectEqual(@as(usize, 1), android_stats.asset_count);
 
     const plist = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/ios/Info.plist");
     defer std.testing.allocator.free(plist);
@@ -1746,6 +1769,14 @@ test "mobile package artifacts use manifest identity metadata" {
     const manifest = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/android/app/src/main/AndroidManifest.xml");
     defer std.testing.allocator.free(manifest);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "android:label=\"Mobile Demo\"") != null);
+
+    const ios_asset = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/ios/Resources/index.html");
+    defer std.testing.allocator.free(ios_asset);
+    try std.testing.expectEqualStrings("<h1>Mobile</h1>", ios_asset);
+
+    const android_asset = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/android/app/src/main/assets/zero-native/index.html");
+    defer std.testing.allocator.free(android_asset);
+    try std.testing.expectEqualStrings("<h1>Mobile</h1>", android_asset);
 }
 
 test "linux desktop entry contains app name" {
