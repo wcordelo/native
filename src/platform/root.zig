@@ -384,6 +384,7 @@ pub const ViewKind = enum {
     stack,
     button,
     icon_button,
+    list_item,
     checkbox,
     toggle,
     segmented_control,

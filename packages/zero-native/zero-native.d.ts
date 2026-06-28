@@ -143,6 +143,8 @@ export type ZeroNativeViewKind =
   | "button"
   | "icon_button"
   | "iconButton"
+  | "list_item"
+  | "listItem"
   | "checkbox"
   | "toggle"
   | "segmented_control"

@@ -3068,6 +3068,7 @@ fn shellViewKind(kind: app_manifest.ViewKind) platform.ViewKind {
         .stack => .stack,
         .button => .button,
         .icon_button => .icon_button,
+        .list_item => .list_item,
         .checkbox => .checkbox,
         .toggle => .toggle,
         .segmented_control => .segmented_control,
@@ -3167,6 +3168,7 @@ fn defaultShellViewWidth(kind: app_manifest.ViewKind) f32 {
     return switch (kind) {
         .button, .checkbox, .toggle => 96,
         .icon_button => 32,
+        .list_item => 220,
         .segmented_control => 168,
         .label => 160,
         .spacer => 12,
@@ -3179,7 +3181,7 @@ fn defaultShellViewWidth(kind: app_manifest.ViewKind) f32 {
 
 fn defaultShellViewHeight(kind: app_manifest.ViewKind, parent_height: f32) f32 {
     return switch (kind) {
-        .button, .icon_button, .checkbox, .toggle, .segmented_control => 32,
+        .button, .icon_button, .checkbox, .toggle, .segmented_control, .list_item => 32,
         .label => 24,
         .spacer => @max(parent_height, 1),
         .progress_indicator => 24,
@@ -3771,6 +3773,7 @@ fn viewKindFromString(value: []const u8) ?platform.ViewKind {
     }
     if (std.mem.eql(u8, value, "titlebarAccessory")) return .titlebar_accessory;
     if (std.mem.eql(u8, value, "iconButton")) return .icon_button;
+    if (std.mem.eql(u8, value, "listItem")) return .list_item;
     if (std.mem.eql(u8, value, "segmentedControl")) return .segmented_control;
     if (std.mem.eql(u8, value, "textField")) return .text_field;
     if (std.mem.eql(u8, value, "searchField")) return .search_field;
@@ -4520,6 +4523,7 @@ test "runtime materializes manifest shell windows into laid out views" {
         .{ .label = "toolbar", .kind = .toolbar, .edge = .top, .height = 52, .role = "Toolbar" },
         .{ .label = "sidebar-live", .kind = .checkbox, .parent = "sidebar", .x = 18, .y = 92, .text = "Live" },
         .{ .label = "sidebar-mode", .kind = .toggle, .parent = "sidebar", .x = 18, .y = 128, .text = "Mode" },
+        .{ .label = "sidebar-row", .kind = .list_item, .parent = "sidebar", .x = 18, .y = 170, .width = 180, .text = "Inbox", .command = "app.open.inbox" },
         .{ .label = "sidebar", .kind = .sidebar, .edge = .left, .width = 240, .role = "Sidebar" },
         .{ .label = "content", .kind = .webview, .url = "zero://app/content.html", .fill = true },
         .{ .label = "statusbar", .kind = .statusbar, .edge = .bottom, .height = 28, .text = "Ready" },
@@ -4542,7 +4546,7 @@ test "runtime materializes manifest shell windows into laid out views" {
     try std.testing.expectEqual(@as(platform.WindowId, 2), window.id);
     try std.testing.expectEqualStrings("shell", window.label);
 
-    var views_buffer: [12]platform.ViewInfo = undefined;
+    var views_buffer: [13]platform.ViewInfo = undefined;
     const views = harness.runtime.listViews(window.id, &views_buffer);
     const toolbar = testViewByLabel(views, "toolbar").?;
     const refresh = testViewByLabel(views, "refresh-button").?;
@@ -4553,6 +4557,7 @@ test "runtime materializes manifest shell windows into laid out views" {
     const sidebar = testViewByLabel(views, "sidebar").?;
     const checkbox = testViewByLabel(views, "sidebar-live").?;
     const toggle = testViewByLabel(views, "sidebar-mode").?;
+    const row = testViewByLabel(views, "sidebar-row").?;
     const content = testViewByLabel(views, "content").?;
     const statusbar = testViewByLabel(views, "statusbar").?;
 
@@ -4625,6 +4630,14 @@ test "runtime materializes manifest shell windows into laid out views" {
     try std.testing.expectEqual(@as(f32, 128), toggle.frame.y);
     try std.testing.expectEqual(@as(f32, 96), toggle.frame.width);
     try std.testing.expectEqual(@as(f32, 32), toggle.frame.height);
+
+    try std.testing.expectEqual(platform.ViewKind.list_item, row.kind);
+    try std.testing.expectEqualStrings("Inbox", row.text);
+    try std.testing.expectEqualStrings("app.open.inbox", row.command);
+    try std.testing.expectEqual(@as(f32, 18), row.frame.x);
+    try std.testing.expectEqual(@as(f32, 170), row.frame.y);
+    try std.testing.expectEqual(@as(f32, 180), row.frame.width);
+    try std.testing.expectEqual(@as(f32, 32), row.frame.height);
 
     try std.testing.expectEqual(platform.ViewKind.statusbar, statusbar.kind);
     try std.testing.expectEqualStrings("Ready", statusbar.text);

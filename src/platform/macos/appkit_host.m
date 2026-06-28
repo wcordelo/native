@@ -59,6 +59,7 @@ static NSAccessibilityRole ZeroNativeAccessibilityRoleForNativeViewKind(NSIntege
             return NSAccessibilitySplitterRole;
         case ZERO_NATIVE_APPKIT_VIEW_BUTTON:
         case ZERO_NATIVE_APPKIT_VIEW_ICON_BUTTON:
+        case ZERO_NATIVE_APPKIT_VIEW_LIST_ITEM:
         case ZERO_NATIVE_APPKIT_VIEW_TOGGLE:
             return NSAccessibilityButtonRole;
         case ZERO_NATIVE_APPKIT_VIEW_CHECKBOX:
@@ -611,6 +612,15 @@ static NSMutableDictionary *ZeroNativeCredentialQuery(NSString *service, NSStrin
         case ZERO_NATIVE_APPKIT_VIEW_ICON_BUTTON: {
             NSButton *button = [NSButton buttonWithTitle:(displayText.length > 0 ? displayText : @"...") target:nil action:nil];
             button.bezelStyle = NSBezelStyleTexturedRounded;
+            view = button;
+            break;
+        }
+        case ZERO_NATIVE_APPKIT_VIEW_LIST_ITEM: {
+            NSButton *button = [NSButton buttonWithTitle:(displayText.length > 0 ? displayText : @"Item") target:nil action:nil];
+            button.bezelStyle = NSBezelStyleRegularSquare;
+            button.bordered = NO;
+            button.alignment = NSTextAlignmentLeft;
+            button.imagePosition = NSNoImage;
             view = button;
             break;
         }

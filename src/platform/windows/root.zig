@@ -915,6 +915,7 @@ fn isSupportedNativeViewKind(kind: platform_mod.ViewKind) bool {
         .stack,
         .button,
         .icon_button,
+        .list_item,
         .checkbox,
         .toggle,
         .segmented_control,
@@ -934,6 +935,7 @@ test "windows supports native container and control kinds" {
     try std.testing.expect(isSupportedNativeViewKind(.split));
     try std.testing.expect(isSupportedNativeViewKind(.stack));
     try std.testing.expect(isSupportedNativeViewKind(.icon_button));
+    try std.testing.expect(isSupportedNativeViewKind(.list_item));
     try std.testing.expect(!isSupportedNativeViewKind(.gpu_surface));
 }
 
@@ -974,6 +976,7 @@ fn viewKindInt(kind: platform_mod.ViewKind) c_int {
         .stack => 6,
         .button => 7,
         .icon_button => 17,
+        .list_item => 18,
         .text_field => 8,
         .search_field => 9,
         .label => 10,

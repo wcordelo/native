@@ -15,6 +15,7 @@ const shell_views = [_]zero_native.ShellView{
     .{ .label = "sidebar", .kind = .sidebar, .parent = "body", .width = 240 },
     .{ .label = "filters", .kind = .stack, .parent = "sidebar", .x = 16, .y = 16, .width = 180, .height = 120, .axis = .column },
     .{ .label = "filter-title", .kind = .label, .parent = "filters", .text = "Filters" },
+    .{ .label = "inbox", .kind = .list_item, .parent = "filters", .text = "Inbox", .command = "app.open.inbox" },
     .{ .label = "filter-live", .kind = .checkbox, .parent = "filters", .text = "Live" },
     .{ .label = "main", .kind = .webview, .parent = "body", .url = "zero://inline", .fill = true },
 };
@@ -74,6 +75,10 @@ fn scene(context: *anyopaque) anyerror!zero_native.ShellConfig {
     <tr>
       <td><code>icon_button</code></td>
       <td>Compact command button for toolbar-style actions</td>
+    </tr>
+    <tr>
+      <td><code>list_item</code></td>
+      <td>Row-like native command item for sidebars, navigators, and simple lists</td>
     </tr>
     <tr>
       <td><code>checkbox</code></td>

@@ -77,6 +77,7 @@ constexpr int kViewToggle = 14;
 constexpr int kViewProgressIndicator = 15;
 constexpr int kViewSegmentedControl = 16;
 constexpr int kViewIconButton = 17;
+constexpr int kViewListItem = 18;
 
 struct WindowsEvent {
     int kind;
@@ -1163,6 +1164,7 @@ static bool isSupportedNativeViewKind(int kind) {
     return isNativeContainerKind(kind) ||
         kind == kViewButton ||
         kind == kViewIconButton ||
+        kind == kViewListItem ||
         kind == kViewCheckbox ||
         kind == kViewToggle ||
         kind == kViewSegmentedControl ||
@@ -1316,7 +1318,7 @@ static bool emitNativeCommandForHwnd(Host *host, HWND hwnd, UINT notification_co
     for (auto &entry : host->native_views) {
         NativeView &view = entry.second;
         if (view.hwnd != hwnd || view.command.empty()) continue;
-        const bool button_like = view.kind == kViewButton || view.kind == kViewIconButton || view.kind == kViewCheckbox || view.kind == kViewToggle;
+        const bool button_like = view.kind == kViewButton || view.kind == kViewIconButton || view.kind == kViewListItem || view.kind == kViewCheckbox || view.kind == kViewToggle;
         const bool segmented = view.kind == kViewSegmentedControl;
         if ((button_like && notification_code != BN_CLICKED) || (segmented && notification_code != TCN_SELCHANGE) || (!button_like && !segmented)) return false;
         WindowsEvent event = {};
@@ -2332,6 +2334,10 @@ int zero_native_windows_create_view(Host *host, uint64_t window_id, const char *
         case kViewIconButton:
             class_name = L"BUTTON";
             style |= BS_PUSHBUTTON | WS_TABSTOP | BS_CENTER | BS_VCENTER;
+            break;
+        case kViewListItem:
+            class_name = L"BUTTON";
+            style |= BS_PUSHBUTTON | BS_LEFT | BS_VCENTER | WS_TABSTOP;
             break;
         case kViewCheckbox:
             class_name = L"BUTTON";

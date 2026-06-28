@@ -43,6 +43,7 @@ static size_t zero_native_overflow_size(size_t buffer_len) {
 #define ZERO_NATIVE_GTK_VIEW_PROGRESS_INDICATOR 15
 #define ZERO_NATIVE_GTK_VIEW_SEGMENTED_CONTROL 16
 #define ZERO_NATIVE_GTK_VIEW_ICON_BUTTON 17
+#define ZERO_NATIVE_GTK_VIEW_LIST_ITEM 18
 
 typedef struct zero_native_gtk_shortcut {
     char *id;
@@ -347,6 +348,7 @@ static int zero_native_is_supported_native_view_kind(int kind) {
     return zero_native_is_native_container_kind(kind) ||
         kind == ZERO_NATIVE_GTK_VIEW_BUTTON ||
         kind == ZERO_NATIVE_GTK_VIEW_ICON_BUTTON ||
+        kind == ZERO_NATIVE_GTK_VIEW_LIST_ITEM ||
         kind == ZERO_NATIVE_GTK_VIEW_CHECKBOX ||
         kind == ZERO_NATIVE_GTK_VIEW_TOGGLE ||
         kind == ZERO_NATIVE_GTK_VIEW_SEGMENTED_CONTROL ||
@@ -436,6 +438,14 @@ static GtkWidget *zero_native_make_native_widget(int kind, const char *label, co
             GtkWidget *button = gtk_button_new_with_label(display_text[0] ? display_text : "...");
             gtk_widget_add_css_class(button, "flat");
             gtk_widget_add_css_class(button, "circular");
+            return button;
+        }
+        case ZERO_NATIVE_GTK_VIEW_LIST_ITEM: {
+            GtkWidget *button = gtk_button_new_with_label(display_text[0] ? display_text : "Item");
+            gtk_widget_add_css_class(button, "flat");
+            gtk_widget_set_halign(button, GTK_ALIGN_FILL);
+            GtkWidget *child = gtk_widget_get_first_child(button);
+            if (GTK_IS_LABEL(child)) gtk_label_set_xalign(GTK_LABEL(child), 0.0f);
             return button;
         }
         case ZERO_NATIVE_GTK_VIEW_CHECKBOX:

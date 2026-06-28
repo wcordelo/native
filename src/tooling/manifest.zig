@@ -993,6 +993,7 @@ fn parseViewKind(value: []const u8) !app_manifest.ViewKind {
     if (std.mem.eql(u8, value, "stack")) return .stack;
     if (std.mem.eql(u8, value, "button")) return .button;
     if (std.mem.eql(u8, value, "icon_button")) return .icon_button;
+    if (std.mem.eql(u8, value, "list_item")) return .list_item;
     if (std.mem.eql(u8, value, "checkbox")) return .checkbox;
     if (std.mem.eql(u8, value, "toggle")) return .toggle;
     if (std.mem.eql(u8, value, "segmented_control")) return .segmented_control;
@@ -1217,6 +1218,7 @@ test "manifest metadata parser reads shell windows and views" {
         \\          .{ .label = "save", .kind = "button", .parent = "toolbar", .accessibility_label = "Save document", .text = "Save", .command = "app.save" },
         \\          .{ .label = "mode", .kind = "segmented_control", .parent = "toolbar", .text = "List|Grid", .command = "app.view.mode" },
         \\          .{ .label = "syncing", .kind = "progress_indicator", .parent = "toolbar", .role = "Syncing" },
+        \\          .{ .label = "nav-row", .kind = "list_item", .parent = "toolbar-stack", .text = "Inbox", .command = "app.open.inbox" },
         \\        },
         \\      },
         \\    },
@@ -1241,6 +1243,7 @@ test "manifest metadata parser reads shell windows and views" {
     try std.testing.expectEqualStrings("Save document", metadata.shell.windows[0].views[5].accessibility_label.?);
     try std.testing.expectEqualStrings("segmented_control", metadata.shell.windows[0].views[6].kind);
     try std.testing.expectEqualStrings("progress_indicator", metadata.shell.windows[0].views[7].kind);
+    try std.testing.expectEqualStrings("list_item", metadata.shell.windows[0].views[8].kind);
 
     const shell = try parseShell(std.testing.allocator, metadata.shell);
     defer deinitParsedShell(std.testing.allocator, shell);
@@ -1255,6 +1258,7 @@ test "manifest metadata parser reads shell windows and views" {
     try std.testing.expectEqualStrings("Save document", shell.windows[0].views[5].accessibility_label.?);
     try std.testing.expectEqual(app_manifest.ViewKind.segmented_control, shell.windows[0].views[6].kind);
     try std.testing.expectEqual(app_manifest.ViewKind.progress_indicator, shell.windows[0].views[7].kind);
+    try std.testing.expectEqual(app_manifest.ViewKind.list_item, shell.windows[0].views[8].kind);
     try std.testing.expectEqual(app_manifest.ShellEdge.top, shell.windows[0].views[0].edge.?);
     try app_manifest.validateManifest(.{
         .identity = .{ .id = metadata.id, .name = metadata.name },
