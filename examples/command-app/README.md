@@ -1,4 +1,4 @@
-# zero-native command-app example
+# Native SDK command-app example
 
 This example shows one `app.sync` command handled from each user-facing entry point:
 

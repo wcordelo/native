@@ -1,0 +1,304 @@
+//! One-line documentation tables for the closed Native markup grammar,
+//! sourced from skill-data/native-ui/SKILL.md (Elements / Attributes /
+//! Expressions / Structure tags tables). Standalone on purpose: the
+//! markup LSP serves these as hover/completion docs, and the docs-site
+//! component-preview generator (tools/docs_component_previews.zig)
+//! dumps them into docs/src/lib/component-vocab.json so the published
+//! attribute tables can never drift from the strings editors show.
+
+const std = @import("std");
+
+// ---------------------------------------------------------- documentation
+// One-line docs sourced from skill-data/native-ui/SKILL.md (Elements /
+// Attributes / Expressions / Structure tags tables).
+
+pub const Doc = struct {
+    name: []const u8,
+    doc: []const u8,
+};
+
+pub const element_docs = [_]Doc{
+    .{ .name = "row", .doc = "Flex container; children flow along the horizontal main axis." },
+    .{ .name = "column", .doc = "Flex container; children flow along the vertical main axis." },
+    .{ .name = "stack", .doc = "Overlay container; children stack on top of each other." },
+    .{ .name = "panel", .doc = "Overlay container panel; children stack on top of each other." },
+    .{ .name = "card", .doc = "Overlay container card; children stack on top of each other." },
+    .{ .name = "scroll", .doc = "Scroll view; wrap multiple children in a single column inside it." },
+    .{ .name = "list", .doc = "Vertical stack of items; supports virtualized and virtual-item-extent." },
+    .{ .name = "grid", .doc = "Cell grid container." },
+    .{ .name = "split", .doc = "Two-pane horizontal splitter with a draggable divider between exactly two element children. value binds the model-owned first-pane fraction (0 lays out at 0.5), on-resize dispatches the applied fraction (echo it back into value), min-width on the panes bounds the drag; gap sets the divider band thickness. Nest splits for more panes." },
+    .{ .name = "tree", .doc = "Disclosure-tree container (vertical flow): descendant rows carrying role=\"treeitem\" form one roving keyboard focus set — Up/Down walk visible rows (selection follows focus via each row's on-press), Left collapses or moves to the parent row, Right expands or moves to the first child row, Home/End jump to the edges. Expandable rows bind expanded and on-toggle; the model owns both states." },
+    .{ .name = "text", .doc = "Text leaf; content supports {} interpolation. Line policy via wrap: wrap=\"true\" word-wraps, wrap=\"false\" clips to one honest line. size takes the typography rungs heading|display for section headings and hero stats." },
+    .{ .name = "badge", .doc = "Text leaf badge; content supports {} interpolation." },
+    .{ .name = "button", .doc = "Text-bearing control; the label is the text content. Dispatch with on-press. icon draws a vector icon inline before the label (icon-only when the content is empty; give it a label) — one hit target, one enabled/disabled tint." },
+    .{ .name = "checkbox", .doc = "Value control; bind checked, dispatch with on-toggle." },
+    .{ .name = "radio", .doc = "Value control; bind checked or selected, dispatch with on-toggle." },
+    .{ .name = "toggle", .doc = "Text-bearing toggle control; the label is the text content." },
+    .{ .name = "slider", .doc = "Value control; bind value, dispatch with on-change." },
+    .{ .name = "progress", .doc = "Value control; bind value." },
+    .{ .name = "text-field", .doc = "Text entry; placeholder and text binding, edits via on-input, enter via on-submit." },
+    .{ .name = "search-field", .doc = "Text entry styled for search; edits via on-input." },
+    .{ .name = "textarea", .doc = "Multi-line text entry; edits via on-input, enter inserts a newline, submit via primary+enter with on-submit." },
+    .{ .name = "list-item", .doc = "Text-bearing item control; the label is the text content." },
+    .{ .name = "menu-item", .doc = "Text-bearing menu control; the label is the text content." },
+    .{ .name = "status-bar", .doc = "Status bar text leaf: content only, no children." },
+    .{ .name = "separator", .doc = "Separator line: a horizontal rule in a column, a thin vertical divider in a row." },
+    .{ .name = "spacer", .doc = "Flexible space; give it a grow." },
+    .{ .name = "breadcrumb", .doc = "Row container for a breadcrumb trail; children flow horizontally." },
+    .{ .name = "button-group", .doc = "Row container grouping buttons; children flow horizontally." },
+    .{ .name = "pagination", .doc = "Row container for pagination controls; children flow horizontally." },
+    .{ .name = "radio-group", .doc = "Row container grouping radio controls; children flow horizontally." },
+    .{ .name = "tabs", .doc = "Row container for a tab strip; children (buttons with selected) flow horizontally." },
+    .{ .name = "toggle-group", .doc = "Row container grouping toggle-buttons; children flow horizontally." },
+    .{ .name = "table", .doc = "Vertical table container; children are table-row elements." },
+    .{ .name = "table-row", .doc = "Horizontal table row; only allowed inside a table, children are table-cells." },
+    .{ .name = "table-cell", .doc = "Table cell text leaf; only allowed inside a table-row, dispatch with on-press." },
+    .{ .name = "dropdown-menu", .doc = "Vertical menu surface; children are menu-item elements. anchor=\"below|above\" floats it against its parent (put it beside its trigger in a stack): late z-pass above the whole tree, window-clipped, auto-flipping at the edges. Pair with on-dismiss so Escape/click-outside close model-side." },
+    .{ .name = "accordion", .doc = "Surface with a header (text attribute); children show when selected, dispatch with on-toggle." },
+    .{ .name = "alert", .doc = "Alert surface; title via the text attribute, children stack inside." },
+    .{ .name = "bubble", .doc = "Bubble surface (chat message); children stack inside. Hugs its message up to 80% of the thread's width (ghost is exempt; an explicit width wins). A <reactions> child docks the reaction pill on its bottom edge; text does nothing here (that channel belongs to the pill — use label for an accessible name)." },
+    .{ .name = "dialog", .doc = "Modal dialog surface rendered in place; title via text, wrap in an if to show conditionally." },
+    .{ .name = "drawer", .doc = "Drawer surface rendered in place; title via text, wrap in an if to show conditionally." },
+    .{ .name = "sheet", .doc = "Sheet surface rendered in place; title via text, wrap in an if to show conditionally." },
+    .{ .name = "resizable", .doc = "Resizable panel with an engine-managed drag handle; width sets the initial width." },
+    .{ .name = "avatar", .doc = "Avatar leaf; the text content renders as initials, image takes one {binding} to a runtime-registered ImageId (0 keeps the initials)." },
+    .{ .name = "select", .doc = "Select trigger only (no options attribute): content is the current value, placeholder while empty, on-press opens. Compose the options as an ANCHORED dropdown-menu of menu-items under an if, beside the trigger in a stack (anchor=\"below\" + on-dismiss; model-owned open state)." },
+    .{ .name = "switch", .doc = "Switch control; label is the text content, bind checked, dispatch with on-toggle." },
+    .{ .name = "toggle-button", .doc = "Pressed-state toggle button; label is the text content, dispatch with on-toggle." },
+    .{ .name = "tooltip", .doc = "Tooltip text leaf; content supports {} interpolation." },
+    .{ .name = "input", .doc = "Single-line text entry; text and placeholder bindings, edits via on-input, enter via on-submit." },
+    .{ .name = "combobox", .doc = "Text entry with menu affordance (no options attribute); edits via on-input, open via on-press — compose the options like select's anchored dropdown-menu pattern (filter the for-each source from the model as the user types)." },
+    .{ .name = "skeleton", .doc = "Loading placeholder block; size with width and height." },
+    .{ .name = "spinner", .doc = "Indeterminate progress spinner leaf." },
+    .{ .name = "icon", .doc = "Vector icon leaf: name selects a curated built-in stroke icon (comptime-validated), an app-registered app:<name> (canvas.icons.registerAppIcons; native check verifies the name against the model contract), or one {binding} resolving to such a name. Tint via foreground, size with width/height or size." },
+    .{ .name = "markdown", .doc = "Renders a markdown string (GFM subset, pipe tables included) as widgets; source is one {binding}, links dispatch on-link (bare URLs autolink), <details> blocks toggle via on-details + details-expanded, #123 refs linkify via issue-link-base." },
+    .{ .name = "stepper", .doc = "Stage stepper: step children joined by connectors; active names the current step index (earlier steps render completed, later ones pending)." },
+    .{ .name = "step", .doc = "One stepper stage; only allowed inside a stepper, the label is the text content (supports {} interpolation), state derives from the stepper's active index." },
+    .{ .name = "timeline", .doc = "Ledger/timeline list container; children are timeline-item elements (for/if work). Takes gap, grow, key, global-key, label." },
+    .{ .name = "timeline-item", .doc = "One timeline/ledger item: title (required), description, meta, indicator + variant color the leading badge, connector=\"false\" ends the rail; on-press makes the whole item pressable with a trailing chevron." },
+    .{ .name = "chart", .doc = "Data chart: series children bind model f32 iterables and draw as token-colored line/area/bar plots (lowered through Ui.chart — same downsampling, theming, and semantics summary). Takes y-min, y-max, grid-lines, baseline, x-labels, y-labels, hover-details, stroke-width, width, height, grow, padding, key, global-key, label. Display-only (presses fall through); hover-details makes it a hover target; the series set is static." },
+    .{ .name = "series", .doc = "One chart series (chart children only): values is one {binding} naming a []const f32 iterable (the same sources for each accepts; NaN samples draw nothing), kind is line, area, or bar, color a token name, label the semantics name." },
+    .{ .name = "context-menu", .doc = "Right-click menu on its DIRECT parent (a pressable element): menu-item children (on-press required, disabled optional) and bare separators, with if/else/for around them. Presents through the platform's native menu; hosts without one mount the same items as an anchored surface automatically. Attribute-less; drive in tests with widget-context-menu." },
+    .{ .name = "input-group", .doc = "Composer-grade grouped input: ONE bordered field wrapping exactly one textarea (first) plus an optional input-group-actions row inside the same border. The group wears the focus ring for its focused descendant and the textarea's own chrome dissolves, so the whole group reads as one field. Takes label, width, height, min-width, grow, key, global-key." },
+    .{ .name = "input-group-actions", .doc = "The input-group's accessory row (only inside input-group, after its textarea): leading/trailing controls on one bottom row inside the group's border — put a <spacer grow=\"1\"/> between the leading controls and the trailing send. Children are ordinary elements (if/else/for work). Takes gap, key, global-key." },
+    .{ .name = "span", .doc = "Inline styled run inside a <text> paragraph: mixed-weight, mono, italic, scaled, underlined, and token-colored runs word-wrap as ONE paragraph and announce as one text run. Takes weight (regular|medium|bold), mono, italic, scale (a positive multiplier on the paragraph's base size), underline, foreground; content is one run of text ({bindings} work). Whitespace between runs collapses to a single space; runs written with no whitespace between them abut. Spans do not nest; layout, events, and identity stay on the enclosing text." },
+    .{ .name = "reactions", .doc = "The bubble's reaction pill (only inside bubble, at most one): a small muted capsule straddling the bubble's bottom edge, holding one run of text ({bindings} work). Takes text-alignment naming the dock — start, center, or end (the default trailing dock). Consumes no layout space (it overlaps like the reference); give the next turn breathing room with the thread's own spacing. Draws on the page plane, so a primary bubble's knockout ink never applies." },
+};
+
+pub const structure_docs = [_]Doc{
+    .{ .name = "for", .doc = "Structure tag: repeats its element children over each (elements, use, if/else, nested for); requires each and as, key names an item field. A directly following else renders when the iterable is empty." },
+    .{ .name = "if", .doc = "Structure tag: renders children when test={binding} or {a == b} is true." },
+    .{ .name = "else", .doc = "Structure tag: must directly follow an if (renders when the test is false) or a for (renders when the iterable is empty)." },
+    .{ .name = "template", .doc = "Top-level template definition (before the view root): name, optional args (name or name=default; defaults are literals), exactly one element child, at most one <slot/>." },
+    .{ .name = "use", .doc = "Expands a template in place: template names an earlier definition, other attributes must match its args exactly (defaulted args may be omitted). Children are slot content: built in the consumer's scope and inserted at the template's <slot/>." },
+    .{ .name = "import", .doc = "Top of the file, before templates: <import src=\"components/cards.native\"/> splices a component file's templates (transitively) before this file's own. Paths resolve relative to this file, under the markup root." },
+    .{ .name = "slot", .doc = "Template bodies only, at most one: marks where use-site children are inserted. Attribute-less leaf; a use with no children renders it empty." },
+};
+
+pub const attribute_docs = [_]Doc{
+    .{ .name = "text", .doc = "Text value for text-bearing elements; a literal or one {binding}." },
+    .{ .name = "placeholder", .doc = "Hint text shown while a text entry is empty." },
+    .{ .name = "value", .doc = "Value for slider/progress/text entry; a literal or one {binding}." },
+    .{ .name = "checked", .doc = "Checked state for checkbox/toggle; true/false or a {binding}." },
+    .{ .name = "selected", .doc = "Selected state; often a {a == b} equality." },
+    .{ .name = "disabled", .doc = "Disables the control; true/false or a {binding}." },
+    .{ .name = "variant", .doc = "Visual variant: default|primary|secondary|outline|ghost|destructive." },
+    .{ .name = "size", .doc = "Control size: default|sm|lg|icon. On text, also the typography rungs heading|display (themable token steps above title - a section heading, a hero stat); numeric sizes are not accepted - retheme the typography tokens instead." },
+    .{ .name = "width", .doc = "Definite width (plain number): the element is exactly this wide; content neither shrinks nor overflows it. On resizable it is the initial width." },
+    .{ .name = "height", .doc = "Definite height (plain number): the element is exactly this tall; content neither shrinks nor overflows it." },
+    .{ .name = "grow", .doc = "Flex grow factor; give spacer one." },
+    .{ .name = "gap", .doc = "Spacing between children (plain number). Rejected on stacking containers (stack, panel, card, the modal surfaces) — they layer children; put a column (or row) inside for flow." },
+    .{ .name = "padding", .doc = "Uniform padding (plain number)." },
+    .{ .name = "main", .doc = "Main-axis alignment: start|center|end|space_between." },
+    .{ .name = "cross", .doc = "Cross-axis alignment: stretch|start|center|end." },
+    .{ .name = "wrap", .doc = "text only: true word-wraps the content at the width the element receives (reserving wrapped height in columns); false and unset are honest single-line - one line whose overflow follows the overflow attribute (trailing ellipsis by default), so a width-constrained title never paints over the row below." },
+    .{ .name = "overflow", .doc = "text only: what a single line does with content that does not fit - ellipsis (the default) elides behind a trailing \u{2026}; clip hard-cuts at the frame for fixed-format content (a duration column) where a partial glyph beats losing the format. Wrapped paragraphs (wrap=\"true\") ignore it." },
+    .{ .name = "text-alignment", .doc = "Horizontal alignment of text content: start|center|end. Consumed by text (plain and wrapped), status-bar, and surface titles; controls that own their label placement (button, badge) ignore it. On a bubble's reactions child it names the pill's dock (end is the default trailing dock)." },
+    .{ .name = "columns", .doc = "grid only: fixed column count (plain number or one {binding}); omit for the derived near-square grid." },
+    .{ .name = "virtualized", .doc = "Enable list virtualization (true/false)." },
+    .{ .name = "virtual-item-extent", .doc = "Fixed item extent for virtualized lists (plain number)." },
+    .{ .name = "key", .doc = "Sibling-scoped identity key; on for, names an item field." },
+    .{ .name = "global-key", .doc = "Parent-independent identity: ids survive reparenting between containers." },
+    .{ .name = "role", .doc = "Accessibility role (listitem, treeitem, button, ...). treeitem also makes the row part of its tree's roving keyboard focus set." },
+    .{ .name = "min-width", .doc = "Width floor (plain number) without width's definite max: the element may grow past it but never shrink below. On split panes it bounds the divider drag." },
+    .{ .name = "expanded", .doc = "Tree rows (role=\"treeitem\"): disclosure state (true/false or a {binding}). Omit on leaves; expanded rows collapse on Left, collapsed ones expand on Right, both through on-toggle - the model owns the state." },
+    .{ .name = "label", .doc = "Accessible name; when set it REPLACES the element's text as the announced name - screen readers and automation snapshots see the label, never the text it shadows." },
+    .{ .name = "autofocus", .doc = "Focusable controls only: moves keyboard focus to the element when it mounts or when the value turns on (edge-triggered - holding it true never re-steals focus). The TEA way to focus an editor on create." },
+    .{ .name = "icon", .doc = "button, toggle-button, list-item, menu-item: vector icon drawn inline (buttons/toggle-buttons before the label, list/menu items as a leading slot): a built-in name (comptime-validated against canvas.icons.known_icon_names, e.g. save, plus, refresh-cw), an app-registered app:<name>, or one {binding} resolving to such a name. Icon-only buttons when the content is empty — add a label. One hit target, one enabled/disabled tint." },
+    .{ .name = "icon-placement", .doc = "Icon slot side on label-bearing buttons/toggle-buttons: leading (default) draws the icon before the label, trailing after it — the next-page chevron. Icon-only buttons center the glyph regardless." },
+    .{ .name = "window-drag", .doc = "Marks the element as a window-drag surface (the hidden-titlebar pattern): pressing its background - or plain text/icons inside - moves the window; double-click zooms per the OS convention. Buttons and other press-claiming children inside stay clickable. macOS-only; elsewhere the press is dead space." },
+    .{ .name = "overscroll", .doc = "scroll only: edge behavior of the region. none pins scrolling at the content edges (the shipped default via the ScrollPhysics.overscroll token), rubber_band lets this region bounce past them, default follows the token. Honored by the engine's scroll physics and the native OS scroller alike." },
+    .{ .name = "resize-duration", .doc = "split only: layout-tween duration in milliseconds (a plain number or one {binding}). Nonzero makes the bound value a TARGET - a rebuild that moves it lays both panes out at the target ONCE, then the runtime slides the rendered boundary there one presented frame at a time under the panes' clips (content never re-wraps mid-flight), dispatching ONE on-resize echo at settle with the applied fraction. 0 (and absent) snaps, today's behavior. A divider DRAG keeps live per-step reflow and echoes. Reduced-motion appearances snap automatically - apps declare nothing extra." },
+    .{ .name = "resize-easing", .doc = "split only, beside a nonzero resize-duration: easing curve of the layout tween - linear, standard (the default), emphasized, or spring. Easing without a duration is a teaching error (it would be silently inert)." },
+    .{ .name = "resize-origin", .doc = "split only, beside a nonzero resize-duration: the fraction a freshly MOUNTED split's pane boundary slides in from toward its declared value (children keep the value's layout; the pane clips reveal them) - a pane expanding out of an unmounted collapsed state slides in instead of popping. An origin without a duration is a teaching error (it would be silently inert)." },
+    .{ .name = "background", .doc = "Background color token (literal ColorTokens field name: background, surface, surface_subtle, ...)." },
+    .{ .name = "foreground", .doc = "Foreground/text color token (literal ColorTokens field name, e.g. text, text_muted, success, warning, info)." },
+    .{ .name = "accent", .doc = "Accent color token (literal ColorTokens field name, e.g. accent, destructive, success, warning, info)." },
+    .{ .name = "accent-foreground", .doc = "Accent foreground color token (literal ColorTokens field name, e.g. accent_text)." },
+    .{ .name = "border-color", .doc = "Border color token (literal ColorTokens field name, e.g. border)." },
+    .{ .name = "focus-ring", .doc = "Focus ring color token (literal ColorTokens field name, e.g. focus_ring)." },
+    .{ .name = "radius", .doc = "Corner radius token (literal RadiusTokens field name: sm, md, lg, xl)." },
+};
+
+pub const template_attr_docs = [_]Doc{
+    .{ .name = "name", .doc = "template: the definition's name, referenced by use. icon: the vector icon to draw (a comptime-validated built-in name, app:<name>, or one {binding})." },
+    .{ .name = "args", .doc = "template: space-separated arg names use sites must pass (slice bindings iterate, scalars bind as values); name=default declares a literal default the use site may omit." },
+    .{ .name = "template", .doc = "use: names an earlier top-level template to expand in place." },
+    .{ .name = "src", .doc = "import: a .native component file (templates only), relative to the importing file, under the markup root." },
+};
+
+pub const for_attr_docs = [_]Doc{
+    .{ .name = "each", .doc = "for: Model field, pub decl, or model fn producing the slice to iterate." },
+    .{ .name = "as", .doc = "for: name of the loop variable bindings use." },
+    .{ .name = "key", .doc = "for: item field that keys identity across reorders." },
+};
+
+pub const if_attr_docs = [_]Doc{
+    .{ .name = "test", .doc = "if: one {expression} - a binding, a comparison (count > 0, a == b), or boolean logic (and/or/not)." },
+};
+
+pub const markdown_attr_docs = [_]Doc{
+    .{ .name = "source", .doc = "markdown: one {binding} producing the markdown text (a []const u8 field or fn; arena fns work). Required." },
+    .{ .name = "on-link", .doc = "markdown: bare Msg tag dispatched on link press; its payload is the URL ([]const u8 variant)." },
+    .{ .name = "on-details", .doc = "markdown: bare Msg tag dispatched on a <details> summary press; its payload is the block index (usize variant)." },
+    .{ .name = "details-expanded", .doc = "markdown: {binding} naming a []const bool iterable of expanded flags, in details-block document order." },
+    .{ .name = "issue-link-base", .doc = "markdown: literal URL prefix or one {binding}; '#123' refs become links to base ++ number (ghissue:// or https://github.com/owner/repo/issues/)." },
+};
+
+pub const stepper_attr_docs = [_]Doc{
+    .{ .name = "active", .doc = "stepper: the active step index (a number or one {binding}); earlier steps render completed, later ones pending. Required." },
+    .{ .name = "key", .doc = "Sibling-scoped identity key." },
+    .{ .name = "global-key", .doc = "Parent-independent identity: ids survive reparenting between containers." },
+    .{ .name = "label", .doc = "Accessible name; when set it REPLACES the element's text as the announced name - screen readers and automation snapshots see the label, never the text it shadows." },
+    .{ .name = "autofocus", .doc = "Focusable controls only: moves keyboard focus to the element when it mounts or when the value turns on (edge-triggered - holding it true never re-steals focus). The TEA way to focus an editor on create." },
+};
+
+pub const timeline_attr_docs = [_]Doc{
+    .{ .name = "gap", .doc = "Spacing between items (plain number)." },
+    .{ .name = "grow", .doc = "Flex grow factor." },
+    .{ .name = "key", .doc = "Sibling-scoped identity key." },
+    .{ .name = "global-key", .doc = "Parent-independent identity: ids survive reparenting between containers." },
+    .{ .name = "label", .doc = "Accessible name; when set it REPLACES the element's text as the announced name - screen readers and automation snapshots see the label, never the text it shadows." },
+    .{ .name = "autofocus", .doc = "Focusable controls only: moves keyboard focus to the element when it mounts or when the value turns on (edge-triggered - holding it true never re-steals focus). The TEA way to focus an editor on create." },
+};
+
+pub const timeline_item_attr_docs = [_]Doc{
+    .{ .name = "title", .doc = "timeline-item: bold first line (a literal or one {binding}). Required." },
+    .{ .name = "description", .doc = "timeline-item: wrapped muted preview under the title (a literal or one {binding})." },
+    .{ .name = "meta", .doc = "timeline-item: muted trailing meta line, e.g. \"claude · sonnet · 1m 12s\" (a literal or one {binding})." },
+    .{ .name = "indicator", .doc = "timeline-item: leading badge text (\"✓\", a number); empty renders a small dot." },
+    .{ .name = "variant", .doc = "timeline-item: indicator color variant (default|primary|secondary|outline|ghost|destructive) - map run outcomes here." },
+    .{ .name = "connector", .doc = "timeline-item: false ends the connector rail (set on the last item)." },
+    .{ .name = "selected", .doc = "timeline-item: selected state (true/false or a {binding})." },
+    .{ .name = "on-press", .doc = "timeline-item: Msg dispatched from anywhere on the item (tag or tag:{payload}); adds a trailing chevron." },
+    .{ .name = "key", .doc = "Sibling-scoped identity key; on for, names an item field." },
+    .{ .name = "global-key", .doc = "Parent-independent identity: ids survive reparenting between containers." },
+};
+
+pub const avatar_attr_docs = [_]Doc{
+    .{ .name = "image", .doc = "avatar: one {binding} to a u64 ImageId the app registered at runtime (fx.registerImageBytes); 0 renders the initials fallback." },
+};
+
+pub const chart_attr_docs = [_]Doc{
+    .{ .name = "y-min", .doc = "chart: explicit y-domain floor (a number or one {binding}); omit to derive from the data. Bars always force 0 into a derived domain." },
+    .{ .name = "y-max", .doc = "chart: explicit y-domain ceiling (a number or one {binding}); omit to derive from the data." },
+    .{ .name = "grid-lines", .doc = "chart: horizontal token-hairline gridlines at even divisions (whole number; 0/omitted = none — gridlines are opt-in)." },
+    .{ .name = "baseline", .doc = "chart: draw a hairline at the baseline (zero clamped into the domain); true/false or a {binding}." },
+    .{ .name = "x-labels", .doc = "chart: one {binding} naming a model iterable of strings — one category label per sample, oldest first (label i names sample i). Drawn muted below the plot, deterministically thinned to fit; dropped when a series downsamples (bucketed indices no longer name the labeled samples)." },
+    .{ .name = "y-labels", .doc = "chart: numeric y tick labels (true/false or a {binding}). Ticks ride a nice-step lattice (1/2/5 x 10^k, exact at their precision); with grid-lines set, gridlines share the lattice so grid and labels never disagree." },
+    .{ .name = "hover-details", .doc = "chart: pointer-hover point details (true/false or a {binding}) — hovering snaps to the nearest sample and floats a card with its label and every series' value. Interaction-only chrome (static renders never show it); presses still fall through." },
+    .{ .name = "stroke-width", .doc = "chart: line stroke width override (plain number; default 1.5)." },
+    .{ .name = "width", .doc = "Definite width (plain number); 0/omitted keeps the intrinsic sparkline-sized default (160x48)." },
+    .{ .name = "height", .doc = "Definite height (plain number); 0/omitted keeps the intrinsic sparkline-sized default (160x48)." },
+    .{ .name = "grow", .doc = "Flex grow factor." },
+    .{ .name = "padding", .doc = "Uniform padding (plain number)." },
+    .{ .name = "key", .doc = "Sibling-scoped identity key." },
+    .{ .name = "global-key", .doc = "Parent-independent identity: ids survive reparenting between containers." },
+    .{ .name = "label", .doc = "Accessible name; omitted charts get a generated series summary (\"chart: line cpu 60 pts last 0.42\") so automation reads the data without pixels." },
+};
+
+pub const series_attr_docs = [_]Doc{
+    .{ .name = "kind", .doc = "series: line, area, or bar (literal; default line). Area is a line filled to the baseline; band envelopes stay with the Zig builder (ui.chart)." },
+    .{ .name = "values", .doc = "series: one {binding} naming a []const f32 iterable (a model field, pub decl, or fn - the same sources for each accepts). Required. Pad a short history's leading gap with NaN samples - they draw nothing." },
+    .{ .name = "color", .doc = "series: literal color token name (a canvas ColorTokens field, e.g. accent, info, success, text_muted); default accent. Series retheme with the palette." },
+    .{ .name = "label", .doc = "series: name for the chart's semantics summary (\"cpu\", \"stars\"); the kind tag stands in when empty." },
+};
+
+pub const input_group_attr_docs = [_]Doc{
+    .{ .name = "label", .doc = "Accessible name; the group announces as ONE named field (role group) while the entry and accessory controls stay individually reachable." },
+    .{ .name = "width", .doc = "Definite group width (plain number); 0/omitted sizes from the entry plus the actions row." },
+    .{ .name = "height", .doc = "Definite group height (plain number); the entry grow-stretches to absorb it." },
+    .{ .name = "min-width", .doc = "Width floor (plain number) without width's definite max." },
+    .{ .name = "grow", .doc = "Flex grow factor." },
+    .{ .name = "key", .doc = "Sibling-scoped identity key." },
+    .{ .name = "global-key", .doc = "Parent-independent identity: ids survive reparenting between containers." },
+};
+
+pub const input_group_actions_attr_docs = [_]Doc{
+    .{ .name = "gap", .doc = "input-group-actions: spacing between the accessory controls (plain number; default 6)." },
+    .{ .name = "key", .doc = "Sibling-scoped identity key." },
+    .{ .name = "global-key", .doc = "Parent-independent identity: ids survive reparenting between containers." },
+};
+
+pub const span_attr_docs = [_]Doc{
+    .{ .name = "weight", .doc = "span: the run's weight — regular, medium (the semibold rung), or bold (a literal or one {binding} producing one of those names)." },
+    .{ .name = "mono", .doc = "span: renders the run in the mono face (true/false or a {binding}) — inline code, file names, keyboard keys. Mono ignores weight and italic (one mono face ships)." },
+    .{ .name = "italic", .doc = "span: slants the run (true/false or a {binding})." },
+    .{ .name = "scale", .doc = "span: the run's size as a POSITIVE multiplier on the paragraph's base size — the text element's size rung included, so scale=\"1.5\" inside a heading paragraph draws at heading x 1.5 (a literal number or one {binding} producing one). The paragraph reserves ONE line height sized by its largest scale, and every run shares that line's baseline. Inline headings, hero stats, fine print." },
+    .{ .name = "underline", .doc = "span: underlines the run (true/false or a {binding}) — purely visual, like every span channel; it is not a link (link spans stay Zig-builder territory)." },
+    .{ .name = "foreground", .doc = "span: the run's color as a literal ColorTokens field name (e.g. text_muted, success, warning) — unset inherits the paragraph's foreground." },
+};
+
+pub const reactions_attr_docs = [_]Doc{
+    .{ .name = "text-alignment", .doc = "reactions: where the pill docks along the bubble's bottom edge — start, center, or end (the default trailing dock). A literal name: the dock is a static design choice, like anchor placement." },
+};
+
+pub const anchor_attr_docs = [_]Doc{
+    .{ .name = "anchor", .doc = "dropdown-menu: floats the surface against its PARENT's frame instead of the flow (literal below or above; either side auto-flips at the window edges). Late z-pass above the whole tree, window-clipped — never cropped by a scroll pane, never reflows siblings. Put the dropdown beside its trigger inside a stack." },
+    .{ .name = "anchor-alignment", .doc = "dropdown-menu (with anchor): horizontal alignment against the anchor - start, end, or stretch (stretch also widens the surface to at least the anchor's width, the select-menu look)." },
+    .{ .name = "anchor-offset", .doc = "dropdown-menu (with anchor): literal gap in points between the anchor edge and the surface (default 4)." },
+};
+
+pub const event_docs = [_]Doc{
+    .{ .name = "on-press", .doc = "Dispatch a Msg on press: tag or tag:{payload}. Legal on any element — a bound press handler makes it pressable, and presses on plain text/icons inside it fall through to it (dragging still selects text)." },
+    .{ .name = "on-toggle", .doc = "Dispatch a Msg on toggle: tag or tag:{payload}. Hit-target elements only (checkbox, toggle, toggle-button, switch, accordion, ...)." },
+    .{ .name = "on-change", .doc = "Dispatch a Msg on change: tag or tag:{payload}. Hit-target elements only (slider, ...)." },
+    .{ .name = "on-submit", .doc = "Dispatch a Msg on submit: tag or tag:{payload}. Enter in a text field, primary+enter in a textarea; on a list-item, plain Enter dispatches it as the row's primary action while Space keeps the row's select (on-press)." },
+    .{ .name = "on-input", .doc = "Names a Msg variant with canvas.TextInputEvent payload; delivers each text edit." },
+    .{ .name = "on-scroll", .doc = "scroll element only: names a Msg variant with canvas.ScrollState payload; delivers the post-scroll offset/viewport/content extents after wheel, kinetic, keyboard, and accessibility scrolls." },
+    .{ .name = "on-dismiss", .doc = "Dismissible surfaces only (dialog, drawer, sheet, dropdown-menu): Msg dispatched when Escape or a click outside dismisses the surface, so the MODEL owns the close (clear the open flag in update). The engine hides the surface immediately as an optimistic echo; the source tree wins on the next rebuild." },
+    .{ .name = "on-hold", .doc = "Press-and-hold Msg: a pointer held ~350 ms dispatches it and the release then presses nothing; a quick click dispatches on-press as usual. A right/ctrl-click with no context menu on the route dispatches it immediately. Like on-press, binding it makes any element pressable." },
+    .{ .name = "on-resize", .doc = "split element only: names a Msg variant with f32 payload; delivers the applied first-pane fraction after every divider drag, keyboard adjustment, and assistive increment/decrement. Echo it back into value - the delivered fraction never fights the reconcile." },
+    .{ .name = "on-reach-end", .doc = "scroll element only: Msg (tag or tag:{payload}) dispatched when a user scroll comes within one viewport of the content end - the infinite-scroll fetch signal. Fires once per approach with hysteresis: it re-arms only after the offset retreats past 1.5 viewports, which appending a batch causes on its own by growing the extent." },
+};
+
+pub fn elementDoc(name: []const u8) ?[]const u8 {
+    if (findDoc(&element_docs, name)) |doc| return doc;
+    return findDoc(&structure_docs, name);
+}
+
+pub fn attributeDoc(name: []const u8) ?[]const u8 {
+    if (findDoc(&attribute_docs, name)) |doc| return doc;
+    if (findDoc(&event_docs, name)) |doc| return doc;
+    if (findDoc(&for_attr_docs, name)) |doc| return doc;
+    if (findDoc(&template_attr_docs, name)) |doc| return doc;
+    if (findDoc(&markdown_attr_docs, name)) |doc| return doc;
+    if (findDoc(&stepper_attr_docs, name)) |doc| return doc;
+    if (findDoc(&timeline_attr_docs, name)) |doc| return doc;
+    if (findDoc(&timeline_item_attr_docs, name)) |doc| return doc;
+    if (findDoc(&avatar_attr_docs, name)) |doc| return doc;
+    if (findDoc(&anchor_attr_docs, name)) |doc| return doc;
+    if (findDoc(&chart_attr_docs, name)) |doc| return doc;
+    if (findDoc(&series_attr_docs, name)) |doc| return doc;
+    if (findDoc(&input_group_attr_docs, name)) |doc| return doc;
+    if (findDoc(&input_group_actions_attr_docs, name)) |doc| return doc;
+    if (findDoc(&span_attr_docs, name)) |doc| return doc;
+    return findDoc(&if_attr_docs, name);
+}
+
+fn findDoc(list: []const Doc, name: []const u8) ?[]const u8 {
+    for (list) |entry| {
+        if (std.mem.eql(u8, entry.name, name)) return entry.doc;
+    }
+    return null;
+}

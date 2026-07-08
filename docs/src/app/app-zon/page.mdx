@@ -1,28 +1,71 @@
-# app.zon Reference
+# Config
 
-The `app.zon` manifest declares app metadata, permissions, bridge policies, security rules, and window layout. It is read by the CLI and tooling at build, package, and validation time.
+The `app.zon` manifest declares app metadata, permissions, security rules, window layout, and packaging inputs. It is read by the CLI and tooling at build, package, and validation time.
 
-## Example
+## Example: native-rendered app
+
+The manifest `native init` generates — identity, one shell window with a GPU surface view, and the minimal permission set:
 
 ```zig
 .{
-    .id = "dev.zero_native",
-    .name = "zero-native",
-    .display_name = "zero-native",
+    .id = "dev.native_sdk.my-app",
+    .name = "my-app",
+    .display_name = "My App",
+    .description = "A counter that lives in one native window.",
     .version = "0.1.0",
-    .icons = .{ "assets/icon.icns", "assets/icon.ico" },
+    .icons = .{"assets/icon.png"},
+    .platforms = .{"macos"},
+    .permissions = .{ "view", "command" },
+    .capabilities = .{ "native_views", "gpu_surfaces" },
+    .shell = .{
+        .windows = .{
+            .{
+                .label = "main",
+                .title = "My App",
+                .width = 480,
+                .height = 320,
+                .restore_state = false,
+                .restore_policy = "center_on_primary",
+                .views = .{
+                    .{ .label = "main-canvas", .kind = "gpu_surface", .fill = true, .role = "Counter canvas", .accessibility_label = "Counter", .gpu_backend = "metal", .gpu_pixel_format = "bgra8_unorm", .gpu_present_mode = "timer", .gpu_alpha_mode = "opaque", .gpu_color_space = "srgb", .gpu_vsync = true },
+                },
+            },
+        },
+    },
+    .security = .{
+        .navigation = .{
+            .allowed_origins = .{ "zero://app", "zero://inline" },
+            .external_links = .{ .action = "deny" },
+        },
+    },
+    .web_engine = "system",
+    .cef = .{ .dir = "third_party/cef/macos", .auto_install = false },
+}
+```
+
+## Example: app with web content, menus, and shortcuts
+
+A fuller manifest for an app that also [embeds web content](/frontend) and declares commands, shortcuts, menus, and packaging metadata:
+
+```zig
+.{
+    .id = "dev.native_sdk",
+    .name = "native-sdk",
+    .display_name = "native-sdk",
+    .version = "0.1.0",
+    .icons = .{"assets/icon.png"},
     .platforms = .{ "macos" },
     .permissions = .{ "command", "view", "dialog", "window", "clipboard", "credentials" },
-    .capabilities = .{ "webview", "js_bridge", "native_views", "menus", "shortcuts", "dialog", "clipboard", "credentials" },
+    .capabilities = .{ "webview", "js_bridge", "native_views", "gpu_surfaces", "menus", "shortcuts", "dialog", "clipboard", "credentials" },
     .bridge = .{
         .commands = .{
             .{ .name = "native.ping", .origins = .{ "zero://app" } },
-            .{ .name = "zero-native.window.create", .permissions = .{ "window" }, .origins = .{ "zero://app" } },
-            .{ .name = "zero-native.command.invoke", .permissions = .{ "command" }, .origins = .{ "zero://app" } },
-            .{ .name = "zero-native.view.list", .permissions = .{ "view" }, .origins = .{ "zero://app" } },
-            .{ .name = "zero-native.dialog.showMessage", .permissions = .{ "dialog" }, .origins = .{ "zero://app" } },
-            .{ .name = "zero-native.clipboard.readText", .permissions = .{ "clipboard" }, .origins = .{ "zero://app" } },
-            .{ .name = "zero-native.credentials.get", .permissions = .{ "credentials" }, .origins = .{ "zero://app" } },
+            .{ .name = "native-sdk.window.create", .permissions = .{ "window" }, .origins = .{ "zero://app" } },
+            .{ .name = "native-sdk.command.invoke", .permissions = .{ "command" }, .origins = .{ "zero://app" } },
+            .{ .name = "native-sdk.view.list", .permissions = .{ "view" }, .origins = .{ "zero://app" } },
+            .{ .name = "native-sdk.dialog.showMessage", .permissions = .{ "dialog" }, .origins = .{ "zero://app" } },
+            .{ .name = "native-sdk.clipboard.readText", .permissions = .{ "clipboard" }, .origins = .{ "zero://app" } },
+            .{ .name = "native-sdk.credentials.get", .permissions = .{ "credentials" }, .origins = .{ "zero://app" } },
         },
     },
     .security = .{
@@ -34,7 +77,7 @@ The `app.zon` manifest declares app metadata, permissions, bridge policies, secu
     .web_engine = "system",
     .cef = .{ .dir = "third_party/cef/macos", .auto_install = false },
     .windows = .{
-        .{ .label = "main", .title = "zero-native", .width = 720, .height = 480, .restore_state = true },
+        .{ .label = "main", .title = "native-sdk", .width = 720, .height = 480, .restore_state = true },
     },
     .commands = .{
         .{ .id = "command.palette", .title = "Command Palette" },
@@ -62,7 +105,7 @@ The `app.zon` manifest declares app metadata, permissions, bridge policies, secu
         },
     },
     .url_schemes = .{
-        .{ .scheme = "zero-native" },
+        .{ .scheme = "native-sdk" },
     },
 }
 ```
@@ -87,15 +130,19 @@ The `app.zon` manifest declares app metadata, permissions, bridge policies, secu
     </tr>
     <tr>
       <td><code>display_name</code></td>
-      <td>Human-readable app name (menu bar, window title fallback)</td>
+      <td>Human-readable app name — the application menu, Dock, app switcher, and About panel all use it, in dev runs and packaged bundles alike</td>
+    </tr>
+    <tr>
+      <td><code>description</code></td>
+      <td>Optional one-line description shown in the About panel (max 256 bytes, single line)</td>
     </tr>
     <tr>
       <td><code>version</code></td>
-      <td>Semver version string</td>
+      <td>Semver version string — also the version the About panel shows</td>
     </tr>
     <tr>
       <td><code>icons</code></td>
-      <td>Paths to icon files for packaging</td>
+      <td>The app icon: one square <code>.png</code> (1:1, ideally 1024x1024) or <code>.svg</code> source that packaging turns into every platform's icon artifacts &mdash; the macOS <code>.icns</code> gets the platform's rounded-rect icon shape applied automatically. A prebuilt <code>.icns</code>/<code>.ico</code> entry ships untouched for its platform instead</td>
     </tr>
     <tr>
       <td><code>platforms</code></td>
@@ -120,6 +167,10 @@ The `app.zon` manifest declares app metadata, permissions, bridge policies, secu
     <tr>
       <td><code>web_engine</code></td>
       <td><code>system</code> or <code>chromium</code>; Chromium is currently supported for macOS builds (see <a href="/web-engines">Web Engines</a>)</td>
+    </tr>
+    <tr>
+      <td><code>theme</code></td>
+      <td>Built-in theme pack: <code>house</code> (default) or <code>geist</code>; an unknown name is a build/check error (see <a href="/theming">Theming</a>)</td>
     </tr>
     <tr>
       <td><code>cef</code></td>
@@ -162,11 +213,13 @@ The `app.zon` manifest declares app metadata, permissions, bridge policies, secu
 
 ## `shell`
 
-The optional `shell` block declares native-first windows with explicit view trees. Existing `windows` entries remain the simple compatibility path; `shell.windows` is the richer contract for native chrome, native controls, WebViews, and future GPU surfaces.
+The optional `shell` block declares native-first windows with explicit view trees. Existing `windows` entries remain the simple compatibility path; `shell.windows` is the richer contract for native chrome, native controls, WebViews, and GPU surfaces.
 
 Tooling parses and validates the schema. Runtime code can return the same shape from `App.scene_fn`, materialize a parsed shell window with `runtime.createShellWindow(...)`, or attach a shell view list to an existing window with `runtime.createShellViews(...)`; platform hosts implement view kinds progressively, so unsupported native kinds fail at runtime with an explicit unsupported error until that backend grows support.
 
 When an app uses both `windows` and `shell.windows`, labels must stay unique across both lists. Use `windows` for the simple compatibility path or `shell.windows` for native-first structure; do not define two window entries with the same label.
+
+For a scene-first app — a `UiApp` passing its Zig scene (`shell_scene`) to the runner — the scene is authoritative at runtime: it re-applies size, title, and views when it loads. `app.zon`'s `.shell.windows[0]` exists because the host creates the startup window before the scene loads, and create-time-only properties must come from the manifest: `titlebar` chrome, `min_width`/`min_height` floors, and the show mode (canvas-first windows are created hidden and shown after the first frame presents). The numbers appearing in both places is by design — edit the scene for anything that can change after create (size, title, views), and the manifest for create-time chrome and floors.
 
 ```zig
 .shell = .{
@@ -183,6 +236,7 @@ When an app uses both `windows` and `shell.windows`, labels must stay unique acr
                 .{ .label = "sidebar-stack", .kind = "stack", .parent = "sidebar", .x = 16, .y = 16, .width = 220, .height = 120, .axis = "column" },
                 .{ .label = "sidebar-live", .kind = "checkbox", .parent = "sidebar-stack", .accessibility_label = "Toggle live updates", .text = "Live updates" },
                 .{ .label = "content", .kind = "webview", .parent = "body", .url = "zero://app/index.html", .fill = true },
+                .{ .label = "canvas", .kind = "gpu_surface", .parent = "body", .width = 480, .gpu_backend = "metal", .gpu_pixel_format = "bgra8_unorm", .gpu_present_mode = "timer", .gpu_alpha_mode = "opaque", .gpu_color_space = "srgb", .gpu_vsync = true },
                 .{ .label = "status", .kind = "statusbar", .edge = "bottom", .height = 24, .text = "Ready" },
             },
         },
@@ -190,9 +244,11 @@ When an app uses both `windows` and `shell.windows`, labels must stay unique acr
 },
 ```
 
+Each window takes a `label` plus optional `title`, `width`, `height`, `x`, `y`, `resizable`, `restore_state`, `restore_policy` (`clamp_to_visible_screen` or `center_on_primary`), `min_width`/`min_height` (a content min-size floor the window itself enforces — macOS `contentMinSize`; the first shell window's declaration threads through the startup create like `titlebar`, negative values are a manifest error, 0 means no floor), and `titlebar` (`standard`, `hidden_inset`, `hidden_inset_tall` — the tall variant centers macOS's traffic lights in the 52pt unified band for toolbar-height headers — or `chromeless`, the fully-skinned opt-in that removes all OS chrome including the system buttons; only for apps that draw their own working window controls, see `examples/deck`). `titlebar = "hidden_inset"` hides the titlebar and extends content under it (macOS keeps the traffic lights) — the first shell window's declaration threads through the STARTUP window create, so the main window's chrome is right from the first frame; the app's own header then takes over dragging and inset padding through the `window-drag` attribute and the `on_chrome` hook (see <a href="/native-ui">Native UI</a>). Platforms without the concept keep standard chrome. The same `titlebar` field is accepted on top-level `windows` entries.
+
 Supported `kind` values are `webview`, `toolbar`, `titlebar_accessory`, `sidebar`, `statusbar`, `split`, `stack`, `button`, `icon_button`, `list_item`, `checkbox`, `toggle`, `segmented_control`, `text_field`, `search_field`, `label`, `spacer`, `gpu_surface`, and `progress_indicator`.
 
-Each view has a required `label` and `kind`. WebView views require `url`. Optional layout fields are `parent`, `edge`, `axis`, `x`, `y`, `width`, `height`, `min_width`, `min_height`, `max_width`, `max_height`, `fill`, and `layer`. Optional behavior and accessibility metadata are `visible`, `enabled`, `role`, `accessibility_label`, `text`, and `command`. The `axis` field accepts `row` or `column` on parent containers such as `toolbar`, `sidebar`, `split`, and `stack`; it defaults to `row`.
+Each view has a required `label` and `kind`. WebView views require `url`. Optional layout fields are `parent`, `edge`, `axis`, `x`, `y`, `width`, `height`, `min_width`, `min_height`, `max_width`, `max_height`, `fill`, and `layer`. Optional behavior and accessibility metadata are `visible`, `enabled`, `role`, `accessibility_label`, `text`, and `command`. `gpu_surface` views may also set `gpu_backend`, `gpu_pixel_format`, `gpu_present_mode`, `gpu_alpha_mode`, `gpu_color_space`, and `gpu_vsync`; those fields are rejected on non-GPU view kinds. The currently implemented macOS system-WebView backend uses `metal`, `bgra8_unorm`, `timer`, `opaque`, `srgb`, and `gpu_vsync = true`. `gpu_backend` also accepts `software` (the CPU reference-renderer path); on Linux and Windows system-WebView hosts any declared backend falls back to software presentation rather than erroring. The `axis` field accepts `row` or `column` on parent containers such as `toolbar`, `sidebar`, `split`, and `stack`; it defaults to `row`.
 
 `createShellWindow` and `createShellViews` dock `edge` views against the remaining window content, let one or more top-level `fill` views use the final remaining rectangle, clamp resolved frames with any min/max size fields, and lay out parented controls such as toolbar buttons with small native defaults when explicit `x`, `y`, `width`, or `height` values are omitted. Parent containers flow omitted child positions horizontally with `axis = "row"` and vertically with `axis = "column"`. `split` containers use the same axis without inner spacing, so fixed-size children can sit beside a `fill` child. The runtime keeps the shell view slice as a layout binding and reapplies it when the window is resized, so pass data that lives for the lifetime of the window.
 
@@ -281,7 +337,7 @@ URL schemes require a lowercase custom `scheme`. Reserved schemes such as `http`
 
 ## `frontend.dev`
 
-The optional `frontend.dev` block configures the managed dev server for `zero-native dev` and `zig build dev`:
+The optional `frontend.dev` block configures the managed dev server for `native dev` and `zig build dev`:
 
 ```zig
 .frontend = .{
@@ -327,6 +383,6 @@ The optional `frontend.dev` block configures the managed dev server for `zero-na
 ## Validation
 
 ```bash
-zero-native validate app.zon
-zero-native doctor --manifest app.zon --strict
+native validate app.zon
+native doctor --manifest app.zon --strict
 ```

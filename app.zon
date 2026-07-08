@@ -1,7 +1,7 @@
 .{
-    .id = "dev.zero_native",
-    .name = "zero-native",
-    .display_name = "zero-native",
+    .id = "dev.native_sdk",
+    .name = "native-sdk",
+    .display_name = "Native SDK",
     .version = "0.1.0",
     .icons = .{ "assets/icon.icns", "assets/icon.ico" },
     .platforms = .{ "macos" },
@@ -10,10 +10,10 @@
     .bridge = .{
         .commands = .{
             .{ .name = "native.ping", .origins = .{ "zero://inline", "zero://app" } },
-            .{ .name = "zero-native.window.list", .permissions = .{ "window" }, .origins = .{ "zero://inline", "zero://app" } },
-            .{ .name = "zero-native.window.create", .permissions = .{ "window" }, .origins = .{ "zero://inline", "zero://app" } },
-            .{ .name = "zero-native.window.focus", .permissions = .{ "window" }, .origins = .{ "zero://inline", "zero://app" } },
-            .{ .name = "zero-native.window.close", .permissions = .{ "window" }, .origins = .{ "zero://inline", "zero://app" } },
+            .{ .name = "native-sdk.window.list", .permissions = .{ "window" }, .origins = .{ "zero://inline", "zero://app" } },
+            .{ .name = "native-sdk.window.create", .permissions = .{ "window" }, .origins = .{ "zero://inline", "zero://app" } },
+            .{ .name = "native-sdk.window.focus", .permissions = .{ "window" }, .origins = .{ "zero://inline", "zero://app" } },
+            .{ .name = "native-sdk.window.close", .permissions = .{ "window" }, .origins = .{ "zero://inline", "zero://app" } },
         },
     },
     .security = .{
@@ -25,6 +25,6 @@
     .web_engine = "system",
     .cef = .{ .dir = "third_party/cef/macos", .auto_install = false },
     .windows = .{
-        .{ .label = "main", .title = "zero-native", .width = 720, .height = 480, .restore_state = true },
+        .{ .label = "main", .title = "native-sdk", .width = 720, .height = 480, .restore_state = true },
     },
 }

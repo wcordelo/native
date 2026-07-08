@@ -5,33 +5,33 @@ usage() {
   cat >&2 <<'EOF'
 usage: tools/cef/build-from-source.sh --platform macosarm64|macosx64|linux64|linuxarm64|windows64|windowsarm64 [options]
 
-Build CEF from source for zero-native maintainers, assemble the expected runtime
-layout, and package a zero-native-cef release archive.
+Build CEF from source for native-sdk maintainers, assemble the expected runtime
+layout, and package a native-sdk-cef release archive.
 
 options:
   --platform name          Required. CEF platform slug.
   --work-dir path          Working directory for CEF/depot_tools checkout.
-                           Default: .zig-cache/zero-native-cef-source
+                           Default: .zig-cache/native-sdk-cef-source
   --depot-tools-dir path   Existing depot_tools checkout. If omitted, the
                            script clones depot_tools into the work dir.
   --cef-branch branch      Optional CEF branch passed to automate-git.py.
-  --version version        Version to use in the zero-native release artifact name.
+  --version version        Version to use in the native-sdk release artifact name.
                            If omitted, derived from the generated CEF archive.
   --output path            Output directory for prepared runtime archive.
                            Default: zig-out/cef
-  --zero-native-bin path   Path to zero-native CLI. Default: zig-out/bin/zero-native.
+  --native-sdk-bin path   Path to Native SDK CLI. Default: zig-out/bin/native.
   --force                  Pass --force-build and --force-distrib to CEF.
   --help                   Show this help.
 EOF
 }
 
 platform=""
-work_dir=".zig-cache/zero-native-cef-source"
+work_dir=".zig-cache/native-sdk-cef-source"
 depot_tools_dir=""
 cef_branch=""
 version=""
 output_dir="zig-out/cef"
-zero_native_bin="zig-out/bin/zero-native"
+native_sdk_bin="zig-out/bin/native"
 force=false
 
 while [[ $# -gt 0 ]]; do
@@ -60,8 +60,8 @@ while [[ $# -gt 0 ]]; do
       output_dir="${2:-}"
       shift 2
       ;;
-    --zero-native-bin)
-      zero_native_bin="${2:-}"
+    --native-sdk-bin)
+      native_sdk_bin="${2:-}"
       shift 2
       ;;
     --force)
@@ -169,8 +169,8 @@ esac
 find "$cef_root/build/libcef_dll_wrapper" -name "$wrapper" -print -quit \
   | xargs -I{} cp "{}" "$cef_root/libcef_dll_wrapper/$wrapper"
 
-if [[ ! -x "$zero_native_bin" ]]; then
+if [[ ! -x "$native_sdk_bin" ]]; then
   zig build
 fi
 
-"$zero_native_bin" cef prepare-release --dir "$cef_root" --output "$output_dir" --version "$version"
+"$native_sdk_bin" cef prepare-release --dir "$cef_root" --output "$output_dir" --version "$version"

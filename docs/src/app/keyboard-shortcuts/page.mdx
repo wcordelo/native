@@ -1,6 +1,6 @@
 # Keyboard Shortcuts
 
-zero-native can register app-level keyboard shortcuts and deliver them to both Zig and JavaScript. Shortcuts are matched by key plus modifiers and are scoped to the native window that receives the key event.
+The Native SDK can register app-level keyboard shortcuts and deliver them to both Zig and JavaScript. Shortcuts are matched by key plus modifiers and are scoped to the native window that receives the key event.
 
 ## Manifest
 
@@ -26,11 +26,11 @@ Generated runners read `app.zon` and register the manifest shortcuts automatical
 Apps that construct a runtime directly can pass shortcuts in `Runtime.init`:
 
 ```zig
-const shortcuts = [_]zero_native.Shortcut{
+const shortcuts = [_]native_sdk.Shortcut{
     .{ .id = "command.palette", .key = "p", .modifiers = .{ .primary = true, .shift = true } },
 };
 
-var runtime = zero_native.Runtime.init(.{
+var runtime = native_sdk.Runtime.init(.{
     .platform = platform,
     .shortcuts = &shortcuts,
 });

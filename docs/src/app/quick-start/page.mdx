@@ -1,27 +1,31 @@
 # Quick Start
 
-zero-native is a native desktop app framework with selectable web engines, native views, guarded bridge commands, and OS capabilities. Use a WebView for rich product UI, then add native shell surfaces where the operating system should own the interaction.
-
-## Beta scope
-
-System WebView builds are available on macOS, Linux, and Windows. Chromium/CEF builds and packages are currently supported on macOS only. Native controls are supported on macOS, Linux, and Windows system-WebView hosts.
+Native SDK is the complete toolkit for building beautiful native desktop applications: declarative markup, a predictable message-based state model, a modern component library, a native renderer, and tooling for building, running, and packaging apps — no browser or WebView in the binary. This page takes you from install to a running, tested app.
 
 ## Prerequisites
 
-- [Zig 0.16.0+](https://ziglang.org/download/)
-- Node.js with npm for the generated frontend
 - macOS 11 or newer, Linux, or Windows
 
-## Track 1: Simple WebView App
+## Get the CLI
 
 ```bash
-zero-native init my_app --frontend next
+npm install -g @native-sdk/cli
+native version
+```
+
+Two things the CLI handles for you, so you never configure them:
+
+- **The SDK location.** Apps build against the SDK the CLI ships with — `native init` records the path automatically (override with `--framework <sdk path>`).
+- **The Zig toolchain.** `native dev|build|test` use the Zig on your PATH when its version is compatible, and otherwise offer to download the pinned version into `~/.native/toolchains/` (checksum-verified; pass `--yes` to skip the prompt in scripts).
+
+## Create an app
+
+```bash
+native init my_app
 cd my_app
 ```
 
-Frontend options: `next`, `vite`, `react`, `svelte`, `vue`.
-
-This scaffolds a complete zero-native project:
+This scaffolds a native-rendered app — and nothing else. There are no build files to maintain: the CLI owns the build graph, generating it under `.native/build/` (gitignored) on each run.
 
 <table>
   <thead>
@@ -32,105 +36,131 @@ This scaffolds a complete zero-native project:
   </thead>
   <tbody>
     <tr>
-      <td><code>build.zig</code></td>
-      <td>Zig build graph with platform, trace, debug-overlay, automation, js-bridge, and web-engine options</td>
-    </tr>
-    <tr>
-      <td><code>build.zig.zon</code></td>
-      <td>Zig package manifest, declares zero-native dependency</td>
-    </tr>
-    <tr>
-      <td><code>app.zon</code></td>
-      <td>App metadata: name, icons, permissions, bridge commands, security policy, window definitions</td>
+      <td><code>src/app.native</code></td>
+      <td>The entire UI: elements, layout, bindings, and message dispatch</td>
     </tr>
     <tr>
       <td><code>src/main.zig</code></td>
-      <td>App struct with <code>app()</code> and optional <code>bridge()</code> methods</td>
+      <td>The logic: <code>Model</code>, <code>Msg</code>, <code>update</code>, and the window scene</td>
     </tr>
     <tr>
-      <td><code>src/runner.zig</code></td>
-      <td>Platform wiring: trace sinks, file logging, panic capture, state store, runtime init</td>
+      <td><code>src/tests.zig</code></td>
+      <td>Full-loop UI tests that click buttons through typed dispatch — no GUI needed</td>
     </tr>
     <tr>
-      <td><code>assets/icon.icns</code></td>
-      <td>App icon for macOS packages</td>
+      <td><code>app.zon</code></td>
+      <td>App manifest: identity, window and view declarations, permissions, security policy</td>
     </tr>
     <tr>
-      <td><code>frontend/</code></td>
-      <td>Frontend starter for the framework selected with <code>--frontend</code></td>
+      <td><code>assets/icon.png</code></td>
+      <td>The app icon source: one square image packaging turns into every platform's icon artifacts</td>
+    </tr>
+    <tr>
+      <td><code>.gitignore</code>, <code>README.md</code></td>
+      <td>Ignores for generated directories, and the commands on this page</td>
     </tr>
   </tbody>
 </table>
 
+Prefer to own `build.zig` from day one? `native init my_app --full` scaffolds the expanded shape (build files, editor config, a ready-made CI workflow) and you drive it with `zig build` directly.
+
 ## Run it
 
 ```bash
-zig build run
+native dev
 ```
 
-The first frontend build installs dependencies automatically. Your app opens a native window with a WebView rendering your HTML.
+The first run compiles the app and the SDK, so give it a minute; subsequent runs are incremental. A native window opens with a working counter. The whole view is `src/app.native` — a Native markup file:
 
-## Track 2: Native Shell App
-
-Use the native-shell example when you want native chrome around WebView content:
-
-```bash
-cd examples/native-shell
-zig build test
-zig build -Dplatform=macos -Dweb-engine=system
+```html
+<column gap="12" padding="16">
+  <row gap="8" cross="center">
+    <text grow="1">Counter</text>
+    <button size="sm" variant="ghost" on-press="reset">Reset</button>
+  </row>
+  <row gap="8" main="center" cross="center" grow="1">
+    <button variant="secondary" on-press="decrement">-</button>
+    <text>{count}</text>
+    <button variant="primary" on-press="increment">+</button>
+  </row>
+  <status-bar>count: {count}</status-bar>
+</column>
 ```
 
-The example builds a native toolbar, titlebar accessory, sidebar, statusbar, and WebView content area. Commands can come from native controls, menus, shortcuts, or the WebView bridge.
-
-## macOS package path
-
-Use this path when validating a signed macOS app:
-
-```bash
-zero-native init my_app --frontend next
-cd my_app
-zig build run
-zero-native cef install
-zig build run
-zero-native package --target macos --signing identity --identity "Developer ID Application: Your Name"
-zero-native doctor --manifest app.zon --strict
-```
-
-Set `.web_engine = "chromium"` and `.cef = .{ .dir = "third_party/cef/macos", .auto_install = false }` in `app.zon` before the Chromium run. `-Dweb-engine` and `--web-engine` are still available for one-off overrides, but the normal app workflow reads the manifest.
-
-For frontend frameworks, run the frontend dev server through [Dev Server](/cli/dev) during development, then package the built assets for distribution.
-
-## Hello world
-
-The simplest zero-native app provides a name and inline HTML:
+The markup binds values (`{count}`) and dispatches messages (`on-press="increment"`); it can never mutate state. All logic lives in `src/main.zig`:
 
 ```zig
-const HelloApp = struct {
-    fn app(self: *@This()) zero_native.App {
-        return .{
-            .context = self,
-            .name = "hello",
-            .source = zero_native.WebViewSource.html(
-                \\<!doctype html>
-                \\<html>
-                \\<body style="font-family: system-ui; padding: 2rem;">
-                \\  <h1>Hello from zero-native</h1>
-                \\</body>
-                \\</html>
-            ),
-        };
-    }
+pub const Msg = union(enum) {
+    increment,
+    decrement,
+    reset,
 };
+
+pub const Model = struct {
+    count: i64 = 0,
+};
+
+pub fn update(model: *Model, msg: Msg) void {
+    switch (msg) {
+        .increment => model.count += 1,
+        .decrement => model.count -= 1,
+        .reset => model.count = 0,
+    }
+}
 ```
+
+That is the whole loop: the model holds state, messages describe what happened, `update` is the only place state changes, and the view re-derives from the model. [App Model](/app-model) walks through how the pieces connect.
+
+## Edit while it runs
+
+`src/app.native` is embedded into the binary and watched while `native dev` runs — `native dev` runs a Debug build by default, which is what arms the hot-reload watcher. Edit it — change a label, add a button — and the window updates within a couple of seconds without losing the count. Parse failures keep the last good view on screen.
+
+## Check and test
+
+```bash
+native check
+```
+
+`native check` validates every `.native` file under `src/` plus `app.zon` without building anything:
+
+```
+src/app.native: ok
+info[manifest.valid]: app.zon is valid
+checked 1 markup file and app.zon
+```
+
+Markup errors come back with `file:line:column` and a teaching message (`native markup lsp` provides the same diagnostics plus completion and hover in your editor). Then run the real tests:
+
+```bash
+native test
+```
+
+The generated `src/tests.zig` builds the real view from the markup, finds the `+` button, dispatches its press exactly like the runtime would, and asserts on the model and the rebuilt view — headless, on any machine. See [Testing](/testing) for the full tiers, including driving the live app from the outside with [automation](/automation).
+
+## Build a release binary
+
+```bash
+native build
+```
+
+This produces an optimized binary and tells you where it landed:
+
+```
+built zig-out/bin/my-app (ReleaseFast)
+```
+
+(The binary name comes from `app.zon`: `native init my_app` sets `.name = "my-app"`.) Where `native dev` runs a Debug build to arm hot reload, `native build` produces an optimized ReleaseFast binary. From there, [Packaging](/packaging) turns it into a distributable app bundle with `native package`.
+
+## Escape hatch: own the build
+
+If the app outgrows the managed graph — extra build steps, custom sources — run `native eject` once. It writes a `build.zig`/`build.zig.zon` you own into the app and never touches them again; `native dev|build|test` keep working, now driving your files through `zig build`. See the [CLI](/cli) reference.
 
 ## Next steps
 
-- [Web Engines](/web-engines) -- Choose between system WebView and Chromium (CEF)
-- [App Model](/app-model) -- How apps, sources, and lifecycle callbacks work
-- [Native Surfaces](/native-surfaces) -- How native chrome, WebViews, controls, and OS services compose
-- [Native Controls](/native-controls) -- Build native chrome and utility panels
-- [Capabilities](/capabilities) -- Use native OS services safely
-- [Platform Support](/platform-support) -- Check backend support by host
-- [Frontend Projects](/frontend) -- Use React, Vue, or Svelte with zero-native
-- [Bridge](/bridge) -- Call native Zig code from JavaScript
-- [Security](/security) -- Permissions, policies, and navigation rules
+- [App Model](/app-model) — the model/message/update loop, wiring, and hot reload
+- [Native UI](/native-ui) — every element, attribute, and pattern in the markup
+- [Components](/components) — the component catalog
+- [State & Data Flow](/state) — derive-don't-store, bindings, and text editing state
+- [Examples](https://github.com/vercel-labs/zero-native/tree/main/examples) — complete apps in the repository, from a calculator to a native shell
+- [Web Content](/frontend) — the secondary path for apps that embed an existing web frontend
+- [Platform Support](/platform-support) — what each host supports today

@@ -1,4 +1,4 @@
-# zero-native capabilities example
+# Native SDK capabilities example
 
 This example shows guarded OS capabilities from trusted WebView code:
 

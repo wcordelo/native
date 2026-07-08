@@ -1,8 +1,8 @@
 const std = @import("std");
 const runner = @import("runner");
-const zero_native = @import("zero-native");
+const native_sdk = @import("native_sdk");
 
-pub const panic = std.debug.FullPanic(zero_native.debug.capturePanic);
+pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
 const window_width: f32 = 860;
 const window_height: f32 = 560;
@@ -96,13 +96,13 @@ const html =
     \\      if (window.zero && window.zero.commands && window.zero.commands.invoke) {
     \\        return window.zero.commands.invoke(name);
     \\      }
-    \\      return window.zero.invoke("zero-native.command.invoke", { name });
+    \\      return window.zero.invoke("native-sdk.command.invoke", { name });
     \\    };
     \\    const listCommands = () => {
     \\      if (window.zero && window.zero.commands && window.zero.commands.list) {
     \\        return window.zero.commands.list();
     \\      }
-    \\      return window.zero.invoke("zero-native.command.list", {});
+    \\      return window.zero.invoke("native-sdk.command.list", {});
     \\    };
     \\    document.querySelector("#sync").addEventListener("click", async () => {
     \\      try { show(await invokeCommand("app.sync")); } catch (error) { fail(error); }
@@ -115,64 +115,63 @@ const html =
     \\</html>
 ;
 
-const app_permissions = [_][]const u8{zero_native.security.permission_command};
+const app_permissions = [_][]const u8{native_sdk.security.permission_command};
 const bridge_origins = [_][]const u8{ "zero://inline", "zero://app" };
-const command_permission = [_][]const u8{zero_native.security.permission_command};
-const command_catalog = [_]zero_native.Command{.{ .id = command_id, .title = "Sync" }};
-const builtin_policies = [_]zero_native.BridgeCommandPolicy{
-    .{ .name = "zero-native.command.invoke", .permissions = &command_permission, .origins = &bridge_origins },
-    .{ .name = "zero-native.command.list", .permissions = &command_permission, .origins = &bridge_origins },
+const command_permission = [_][]const u8{native_sdk.security.permission_command};
+const command_catalog = [_]native_sdk.Command{.{ .id = command_id, .title = "Sync" }};
+const builtin_policies = [_]native_sdk.BridgeCommandPolicy{
+    .{ .name = "native-sdk.command.invoke", .permissions = &command_permission, .origins = &bridge_origins },
+    .{ .name = "native-sdk.command.list", .permissions = &command_permission, .origins = &bridge_origins },
 };
-const tray_items = [_]zero_native.TrayMenuItem{
+const tray_items = [_]native_sdk.TrayMenuItem{
     .{ .id = 1, .label = "Sync", .command = command_id },
 };
-const shell_views = [_]zero_native.ShellView{
+const shell_views = [_]native_sdk.ShellView{
     .{ .label = "toolbar", .kind = .toolbar, .edge = .top, .height = toolbar_height, .layer = 20, .role = "Toolbar" },
     .{ .label = "sync-button", .kind = .button, .parent = "toolbar", .x = 12, .y = 9, .width = 92, .height = 30, .layer = 21, .accessibility_label = "Sync now", .text = "Sync", .command = command_id },
     .{ .label = "main", .kind = .webview, .url = "zero://inline", .fill = true },
     .{ .label = "statusbar", .kind = .statusbar, .edge = .bottom, .height = statusbar_height, .layer = 20, .role = "Status" },
     .{ .label = "status-label", .kind = .label, .parent = "statusbar", .x = 14, .y = 8, .width = 620, .height = 18, .layer = 21, .text = "Ready. Use the toolbar, menu, tray, shortcut, or WebView button." },
 };
-const shell_windows = [_]zero_native.ShellWindow{.{
+const shell_windows = [_]native_sdk.ShellWindow{.{
     .label = "main",
-    .title = "zero-native Command App",
+    .title = "Native SDK Command App",
     .width = window_width,
     .height = window_height,
     .views = &shell_views,
 }};
-const shell_scene: zero_native.ShellConfig = .{ .windows = &shell_windows };
+const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 
 const CommandApp = struct {
     command_count: u32 = 0,
-    sources: [8]zero_native.CommandSource = [_]zero_native.CommandSource{.runtime} ** 8,
+    sources: [8]native_sdk.CommandSource = [_]native_sdk.CommandSource{.runtime} ** 8,
     last_command_name: []const u8 = "",
 
-    fn app(self: *@This()) zero_native.App {
+    fn app(self: *@This()) native_sdk.App {
         return .{
             .context = self,
             .name = "command-app",
-            .source = zero_native.WebViewSource.html(html),
+            .source = native_sdk.WebViewSource.html(html),
             .scene_fn = scene,
             .start_fn = start,
             .event_fn = event,
         };
     }
 
-    fn scene(context: *anyopaque) anyerror!zero_native.ShellConfig {
+    fn scene(context: *anyopaque) anyerror!native_sdk.ShellConfig {
         _ = context;
         return shell_scene;
     }
 
-    fn start(context: *anyopaque, runtime: *zero_native.Runtime) anyerror!void {
+    fn start(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
         _ = context;
         try runtime.createTray(.{
-            .icon_path = "assets/icon.icns",
-            .tooltip = "zero-native Command App",
+            .tooltip = "Native SDK Command App",
             .items = &tray_items,
         });
     }
 
-    fn event(context: *anyopaque, runtime: *zero_native.Runtime, event_value: zero_native.Event) anyerror!void {
+    fn event(context: *anyopaque, runtime: *native_sdk.Runtime, event_value: native_sdk.Event) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(context));
         switch (event_value) {
             .command => |command| {
@@ -180,11 +179,11 @@ const CommandApp = struct {
                     try self.handleCommand(runtime, command);
                 }
             },
-            .shortcut, .files_dropped, .lifecycle => {},
+            .appearance_changed, .shortcut, .timer, .effects_wake, .audio, .files_dropped, .gpu_surface_frame, .gpu_surface_resized, .gpu_surface_input, .canvas_widget_pointer, .canvas_widget_keyboard, .canvas_widget_scroll, .canvas_widget_file_drop, .canvas_widget_drag, .canvas_widget_context_menu, .canvas_widget_context_menu_request, .canvas_widget_dismiss, .canvas_widget_context_press, .canvas_widget_resize, .canvas_widget_change, .window_closed, .automation_provenance, .lifecycle => {},
         }
     }
 
-    fn handleCommand(self: *@This(), runtime: *zero_native.Runtime, command: zero_native.CommandEvent) anyerror!void {
+    fn handleCommand(self: *@This(), runtime: *native_sdk.Runtime, command: native_sdk.CommandEvent) anyerror!void {
         if (self.command_count < self.sources.len) {
             self.sources[self.command_count] = command.source;
         }
@@ -206,10 +205,9 @@ pub fn main(init: std.process.Init) !void {
     var app = CommandApp{};
     try runner.runWithOptions(app.app(), .{
         .app_name = "command-app",
-        .window_title = "zero-native Command App",
-        .bundle_id = "dev.zero_native.command_app",
-        .icon_path = "assets/icon.icns",
-        .default_frame = zero_native.geometry.RectF.init(0, 0, window_width, window_height),
+        .window_title = "Native SDK Command App",
+        .bundle_id = "dev.native_sdk.command_app",
+        .default_frame = native_sdk.geometry.RectF.init(0, 0, window_width, window_height),
         .builtin_bridge = .{ .enabled = true, .commands = &builtin_policies },
         .js_window_api = true,
         .security = .{
@@ -220,8 +218,8 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "command app routes toolbar menu tray shortcut and bridge commands" {
-    var harness: zero_native.TestHarness() = undefined;
-    harness.init(.{ .size = zero_native.geometry.SizeF.init(window_width, window_height) });
+    const harness = try native_sdk.TestHarness().create(std.testing.allocator, .{ .size = native_sdk.geometry.SizeF.init(window_width, window_height) });
+    defer harness.destroy(std.testing.allocator);
     harness.runtime.options.builtin_bridge = .{ .enabled = true, .commands = &builtin_policies };
     harness.runtime.options.js_window_api = true;
     harness.runtime.options.commands = &command_catalog;
@@ -251,13 +249,13 @@ test "command app routes toolbar menu tray shortcut and bridge commands" {
         .modifiers = .{ .primary = true },
     } });
     try harness.runtime.dispatchPlatformEvent(app.app(), .{ .bridge_message = .{
-        .bytes = "{\"id\":\"1\",\"command\":\"zero-native.command.invoke\",\"payload\":{\"name\":\"app.sync\"}}",
+        .bytes = "{\"id\":\"1\",\"command\":\"native-sdk.command.invoke\",\"payload\":{\"name\":\"app.sync\"}}",
         .origin = "zero://inline",
         .window_id = 1,
         .webview_label = "main",
     } });
     try harness.runtime.dispatchPlatformEvent(app.app(), .{ .bridge_message = .{
-        .bytes = "{\"id\":\"2\",\"command\":\"zero-native.command.list\",\"payload\":{}}",
+        .bytes = "{\"id\":\"2\",\"command\":\"native-sdk.command.list\",\"payload\":{}}",
         .origin = "zero://inline",
         .window_id = 1,
         .webview_label = "main",
@@ -265,11 +263,11 @@ test "command app routes toolbar menu tray shortcut and bridge commands" {
 
     try std.testing.expectEqual(@as(u32, 5), app.command_count);
     try std.testing.expectEqualStrings(command_id, app.last_command_name);
-    try std.testing.expectEqual(zero_native.CommandSource.toolbar, app.sources[0]);
-    try std.testing.expectEqual(zero_native.CommandSource.menu, app.sources[1]);
-    try std.testing.expectEqual(zero_native.CommandSource.tray, app.sources[2]);
-    try std.testing.expectEqual(zero_native.CommandSource.shortcut, app.sources[3]);
-    try std.testing.expectEqual(zero_native.CommandSource.bridge, app.sources[4]);
+    try std.testing.expectEqual(native_sdk.CommandSource.toolbar, app.sources[0]);
+    try std.testing.expectEqual(native_sdk.CommandSource.menu, app.sources[1]);
+    try std.testing.expectEqual(native_sdk.CommandSource.tray, app.sources[2]);
+    try std.testing.expectEqual(native_sdk.CommandSource.shortcut, app.sources[3]);
+    try std.testing.expectEqual(native_sdk.CommandSource.bridge, app.sources[4]);
     try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"ok\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"id\":\"app.sync\"") != null);
 }

@@ -120,12 +120,16 @@ static void destroyChildWebViewsForWindow(Host *host, uint64_t window_id) {
 
 extern "C" {
 
-Host *zero_native_gtk_create(const char *app_name, size_t app_name_len, const char *window_title, size_t window_title_len, const char *bundle_id, size_t bundle_id_len, const char *icon_path, size_t icon_path_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame) {
+Host *native_sdk_gtk_create(const char *app_name, size_t app_name_len, const char *window_title, size_t window_title_len, const char *bundle_id, size_t bundle_id_len, const char *icon_path, size_t icon_path_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, double min_width, double min_height) {
     (void)bundle_id;
     (void)bundle_id_len;
     (void)icon_path;
     (void)icon_path_len;
     (void)restore_frame;
+    (void)resizable;
+    (void)titlebar_style;
+    (void)min_width;
+    (void)min_height;
     Host *host = new Host();
     host->app_name = slice(app_name, app_name_len);
     host->window_title = slice(window_title, window_title_len);
@@ -142,11 +146,11 @@ Host *zero_native_gtk_create(const char *app_name, size_t app_name_len, const ch
     return host;
 }
 
-void zero_native_gtk_destroy(Host *host) {
+void native_sdk_gtk_destroy(Host *host) {
     delete host;
 }
 
-void zero_native_gtk_run(Host *host, EventCallback callback, void *context) {
+void native_sdk_gtk_run(Host *host, EventCallback callback, void *context) {
     if (!host) return;
     host->callback = callback;
     host->callback_context = context;
@@ -168,15 +172,15 @@ void zero_native_gtk_run(Host *host, EventCallback callback, void *context) {
     callback(context, &shutdown);
 }
 
-void zero_native_gtk_stop(Host *host) {
+void native_sdk_gtk_stop(Host *host) {
     if (host) host->running = false;
 }
 
-void zero_native_gtk_load_webview(Host *host, const char *source, size_t source_len, int source_kind, const char *asset_root, size_t asset_root_len, const char *asset_entry, size_t asset_entry_len, const char *asset_origin, size_t asset_origin_len, int spa_fallback) {
-    zero_native_gtk_load_window_webview(host, 1, source, source_len, source_kind, asset_root, asset_root_len, asset_entry, asset_entry_len, asset_origin, asset_origin_len, spa_fallback);
+void native_sdk_gtk_load_webview(Host *host, const char *source, size_t source_len, int source_kind, const char *asset_root, size_t asset_root_len, const char *asset_entry, size_t asset_entry_len, const char *asset_origin, size_t asset_origin_len, int spa_fallback) {
+    native_sdk_gtk_load_window_webview(host, 1, source, source_len, source_kind, asset_root, asset_root_len, asset_entry, asset_entry_len, asset_origin, asset_origin_len, spa_fallback);
 }
 
-void zero_native_gtk_load_window_webview(Host *host, uint64_t window_id, const char *source, size_t source_len, int source_kind, const char *asset_root, size_t asset_root_len, const char *asset_entry, size_t asset_entry_len, const char *asset_origin, size_t asset_origin_len, int spa_fallback) {
+void native_sdk_gtk_load_window_webview(Host *host, uint64_t window_id, const char *source, size_t source_len, int source_kind, const char *asset_root, size_t asset_root_len, const char *asset_entry, size_t asset_entry_len, const char *asset_origin, size_t asset_origin_len, int spa_fallback) {
     (void)source;
     (void)source_len;
     (void)source_kind;
@@ -192,24 +196,24 @@ void zero_native_gtk_load_window_webview(Host *host, uint64_t window_id, const c
     if (found != host->windows.end()) emit(host, found->second, kWindowFrame);
 }
 
-void zero_native_gtk_set_bridge_callback(Host *host, BridgeCallback callback, void *context) {
+void native_sdk_gtk_set_bridge_callback(Host *host, BridgeCallback callback, void *context) {
     if (!host) return;
     host->bridge_callback = callback;
     host->bridge_context = context;
 }
 
-void zero_native_gtk_bridge_respond(Host *host, const char *response, size_t response_len) {
-    zero_native_gtk_bridge_respond_window(host, 1, response, response_len);
+void native_sdk_gtk_bridge_respond(Host *host, const char *response, size_t response_len) {
+    native_sdk_gtk_bridge_respond_window(host, 1, response, response_len);
 }
 
-void zero_native_gtk_bridge_respond_window(Host *host, uint64_t window_id, const char *response, size_t response_len) {
+void native_sdk_gtk_bridge_respond_window(Host *host, uint64_t window_id, const char *response, size_t response_len) {
     (void)host;
     (void)window_id;
     (void)response;
     (void)response_len;
 }
 
-void zero_native_gtk_bridge_respond_webview(Host *host, uint64_t window_id, const char *webview_label, size_t webview_label_len, const char *response, size_t response_len) {
+void native_sdk_gtk_bridge_respond_webview(Host *host, uint64_t window_id, const char *webview_label, size_t webview_label_len, const char *response, size_t response_len) {
     (void)host;
     (void)window_id;
     (void)webview_label;
@@ -218,7 +222,7 @@ void zero_native_gtk_bridge_respond_webview(Host *host, uint64_t window_id, cons
     (void)response_len;
 }
 
-void zero_native_gtk_emit_window_event(Host *host, uint64_t window_id, const char *name, size_t name_len, const char *detail_json, size_t detail_json_len) {
+void native_sdk_gtk_emit_window_event(Host *host, uint64_t window_id, const char *name, size_t name_len, const char *detail_json, size_t detail_json_len) {
     (void)host;
     (void)window_id;
     (void)name;
@@ -227,7 +231,7 @@ void zero_native_gtk_emit_window_event(Host *host, uint64_t window_id, const cha
     (void)detail_json_len;
 }
 
-void zero_native_gtk_set_security_policy(Host *host, const char *allowed_origins, size_t allowed_origins_len, const char *external_urls, size_t external_urls_len, int external_action) {
+void native_sdk_gtk_set_security_policy(Host *host, const char *allowed_origins, size_t allowed_origins_len, const char *external_urls, size_t external_urls_len, int external_action) {
     (void)host;
     (void)allowed_origins;
     (void)allowed_origins_len;
@@ -236,7 +240,7 @@ void zero_native_gtk_set_security_policy(Host *host, const char *allowed_origins
     (void)external_action;
 }
 
-void zero_native_gtk_set_shortcuts(Host *host, const char *const *ids, const size_t *id_lens, const char *const *keys, const size_t *key_lens, const uint32_t *modifiers, size_t count) {
+void native_sdk_gtk_set_shortcuts(Host *host, const char *const *ids, const size_t *id_lens, const char *const *keys, const size_t *key_lens, const uint32_t *modifiers, size_t count) {
     (void)host;
     (void)ids;
     (void)id_lens;
@@ -246,8 +250,12 @@ void zero_native_gtk_set_shortcuts(Host *host, const char *const *ids, const siz
     (void)count;
 }
 
-int zero_native_gtk_create_window(Host *host, uint64_t window_id, const char *window_title, size_t window_title_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame) {
+int native_sdk_gtk_create_window(Host *host, uint64_t window_id, const char *window_title, size_t window_title_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, double min_width, double min_height) {
     (void)restore_frame;
+    (void)resizable;
+    (void)titlebar_style;
+    (void)min_width;
+    (void)min_height;
     if (!host || host->windows.find(window_id) != host->windows.end()) return 0;
     Window window;
     window.id = window_id;
@@ -262,7 +270,28 @@ int zero_native_gtk_create_window(Host *host, uint64_t window_id, const char *wi
     return 1;
 }
 
-int zero_native_gtk_focus_window(Host *host, uint64_t window_id) {
+void native_sdk_gtk_start_timer(Host *host, uint64_t timer_id, uint64_t interval_ns, int repeats) {
+    // Headless CEF tooling host: no main loop to schedule app timers on.
+    (void)host;
+    (void)timer_id;
+    (void)interval_ns;
+    (void)repeats;
+}
+
+void native_sdk_gtk_cancel_timer(Host *host, uint64_t timer_id) {
+    (void)host;
+    (void)timer_id;
+}
+
+int native_sdk_gtk_start_window_drag(Host *host, uint64_t window_id) {
+    // Headless CEF tooling host: no windowing system to move a window
+    // through, so the drag request reports "window not draggable".
+    (void)host;
+    (void)window_id;
+    return 0;
+}
+
+int native_sdk_gtk_focus_window(Host *host, uint64_t window_id) {
     if (!host) return 0;
     auto found = host->windows.find(window_id);
     if (found == host->windows.end()) return 0;
@@ -272,7 +301,7 @@ int zero_native_gtk_focus_window(Host *host, uint64_t window_id) {
     return 1;
 }
 
-int zero_native_gtk_close_window(Host *host, uint64_t window_id) {
+int native_sdk_gtk_close_window(Host *host, uint64_t window_id) {
     if (!host) return 0;
     auto found = host->windows.find(window_id);
     if (found == host->windows.end()) return 0;
@@ -282,7 +311,7 @@ int zero_native_gtk_close_window(Host *host, uint64_t window_id) {
     return 1;
 }
 
-int zero_native_gtk_create_view(Host *host, uint64_t window_id, const char *label, size_t label_len, int kind, const char *parent, size_t parent_len, double x, double y, double width, double height, int layer, int visible, int enabled, const char *role, size_t role_len, const char *accessibility_label, size_t accessibility_label_len, const char *text, size_t text_len, const char *command, size_t command_len) {
+int native_sdk_gtk_create_view(Host *host, uint64_t window_id, const char *label, size_t label_len, int kind, const char *parent, size_t parent_len, double x, double y, double width, double height, int layer, int visible, int enabled, const char *role, size_t role_len, const char *accessibility_label, size_t accessibility_label_len, const char *text, size_t text_len, const char *command, size_t command_len) {
     (void)host;
     (void)window_id;
     (void)label;
@@ -308,7 +337,7 @@ int zero_native_gtk_create_view(Host *host, uint64_t window_id, const char *labe
     return 0;
 }
 
-int zero_native_gtk_update_view(Host *host, uint64_t window_id, const char *label, size_t label_len, int has_frame, double x, double y, double width, double height, int has_layer, int layer, int has_visible, int visible, int has_enabled, int enabled, int has_role, const char *role, size_t role_len, int has_accessibility_label, const char *accessibility_label, size_t accessibility_label_len, int has_text, const char *text, size_t text_len, int has_command, const char *command, size_t command_len) {
+int native_sdk_gtk_update_view(Host *host, uint64_t window_id, const char *label, size_t label_len, int has_frame, double x, double y, double width, double height, int has_layer, int layer, int has_visible, int visible, int has_enabled, int enabled, int has_role, const char *role, size_t role_len, int has_accessibility_label, const char *accessibility_label, size_t accessibility_label_len, int has_text, const char *text, size_t text_len, int has_command, const char *command, size_t command_len) {
     (void)host;
     (void)window_id;
     (void)label;
@@ -339,7 +368,7 @@ int zero_native_gtk_update_view(Host *host, uint64_t window_id, const char *labe
     return 0;
 }
 
-int zero_native_gtk_set_view_frame(Host *host, uint64_t window_id, const char *label, size_t label_len, double x, double y, double width, double height) {
+int native_sdk_gtk_set_view_frame(Host *host, uint64_t window_id, const char *label, size_t label_len, double x, double y, double width, double height) {
     (void)host;
     (void)window_id;
     (void)label;
@@ -351,7 +380,7 @@ int zero_native_gtk_set_view_frame(Host *host, uint64_t window_id, const char *l
     return 0;
 }
 
-int zero_native_gtk_set_view_visible(Host *host, uint64_t window_id, const char *label, size_t label_len, int visible) {
+int native_sdk_gtk_set_view_visible(Host *host, uint64_t window_id, const char *label, size_t label_len, int visible) {
     (void)host;
     (void)window_id;
     (void)label;
@@ -360,7 +389,7 @@ int zero_native_gtk_set_view_visible(Host *host, uint64_t window_id, const char 
     return 0;
 }
 
-int zero_native_gtk_focus_view(Host *host, uint64_t window_id, const char *label, size_t label_len) {
+int native_sdk_gtk_focus_view(Host *host, uint64_t window_id, const char *label, size_t label_len) {
     (void)host;
     (void)window_id;
     (void)label;
@@ -368,7 +397,7 @@ int zero_native_gtk_focus_view(Host *host, uint64_t window_id, const char *label
     return 0;
 }
 
-int zero_native_gtk_close_view(Host *host, uint64_t window_id, const char *label, size_t label_len) {
+int native_sdk_gtk_close_view(Host *host, uint64_t window_id, const char *label, size_t label_len) {
     (void)host;
     (void)window_id;
     (void)label;
@@ -376,7 +405,7 @@ int zero_native_gtk_close_view(Host *host, uint64_t window_id, const char *label
     return 0;
 }
 
-int zero_native_gtk_create_webview(Host *host, uint64_t window_id, const char *label, size_t label_len, const char *url, size_t url_len, double x, double y, double width, double height, int layer, int transparent, int bridge_enabled) {
+int native_sdk_gtk_create_webview(Host *host, uint64_t window_id, const char *label, size_t label_len, const char *url, size_t url_len, double x, double y, double width, double height, int layer, int transparent, int bridge_enabled) {
     (void)host;
     (void)window_id;
     (void)label;
@@ -393,7 +422,7 @@ int zero_native_gtk_create_webview(Host *host, uint64_t window_id, const char *l
     return 0;
 }
 
-int zero_native_gtk_set_webview_frame(Host *host, uint64_t window_id, const char *label, size_t label_len, double x, double y, double width, double height) {
+int native_sdk_gtk_set_webview_frame(Host *host, uint64_t window_id, const char *label, size_t label_len, double x, double y, double width, double height) {
     (void)host;
     (void)window_id;
     (void)label;
@@ -405,7 +434,7 @@ int zero_native_gtk_set_webview_frame(Host *host, uint64_t window_id, const char
     return 0;
 }
 
-int zero_native_gtk_navigate_webview(Host *host, uint64_t window_id, const char *label, size_t label_len, const char *url, size_t url_len) {
+int native_sdk_gtk_navigate_webview(Host *host, uint64_t window_id, const char *label, size_t label_len, const char *url, size_t url_len) {
     (void)host;
     (void)window_id;
     (void)label;
@@ -415,7 +444,7 @@ int zero_native_gtk_navigate_webview(Host *host, uint64_t window_id, const char 
     return 0;
 }
 
-int zero_native_gtk_set_webview_zoom(Host *host, uint64_t window_id, const char *label, size_t label_len, double zoom) {
+int native_sdk_gtk_set_webview_zoom(Host *host, uint64_t window_id, const char *label, size_t label_len, double zoom) {
     (void)host;
     (void)window_id;
     (void)label;
@@ -424,7 +453,7 @@ int zero_native_gtk_set_webview_zoom(Host *host, uint64_t window_id, const char 
     return 0;
 }
 
-int zero_native_gtk_set_webview_layer(Host *host, uint64_t window_id, const char *label, size_t label_len, int layer) {
+int native_sdk_gtk_set_webview_layer(Host *host, uint64_t window_id, const char *label, size_t label_len, int layer) {
     (void)host;
     (void)window_id;
     (void)label;
@@ -433,7 +462,7 @@ int zero_native_gtk_set_webview_layer(Host *host, uint64_t window_id, const char
     return 0;
 }
 
-int zero_native_gtk_close_webview(Host *host, uint64_t window_id, const char *label, size_t label_len) {
+int native_sdk_gtk_close_webview(Host *host, uint64_t window_id, const char *label, size_t label_len) {
     (void)host;
     (void)window_id;
     (void)label;
@@ -441,21 +470,21 @@ int zero_native_gtk_close_webview(Host *host, uint64_t window_id, const char *la
     return 0;
 }
 
-int zero_native_gtk_open_external_url(Host *host, const char *url, size_t url_len) {
+int native_sdk_gtk_open_external_url(Host *host, const char *url, size_t url_len) {
     (void)host;
     (void)url;
     (void)url_len;
     return 0;
 }
 
-int zero_native_gtk_reveal_path(Host *host, const char *path, size_t path_len) {
+int native_sdk_gtk_reveal_path(Host *host, const char *path, size_t path_len) {
     (void)host;
     (void)path;
     (void)path_len;
     return 0;
 }
 
-int zero_native_gtk_show_notification(Host *host, const char *title, size_t title_len, const char *subtitle, size_t subtitle_len, const char *body, size_t body_len) {
+int native_sdk_gtk_show_notification(Host *host, const char *title, size_t title_len, const char *subtitle, size_t subtitle_len, const char *body, size_t body_len) {
     (void)host;
     (void)title;
     (void)title_len;
@@ -466,24 +495,24 @@ int zero_native_gtk_show_notification(Host *host, const char *title, size_t titl
     return 0;
 }
 
-int zero_native_gtk_add_recent_document(Host *host, const char *path, size_t path_len) {
+int native_sdk_gtk_add_recent_document(Host *host, const char *path, size_t path_len) {
     (void)host;
     (void)path;
     (void)path_len;
     return 0;
 }
 
-int zero_native_gtk_clear_recent_documents(Host *host) {
+int native_sdk_gtk_clear_recent_documents(Host *host) {
     (void)host;
     return 0;
 }
 
-int zero_native_gtk_credentials_available(Host *host) {
+int native_sdk_gtk_credentials_available(Host *host) {
     (void)host;
     return 0;
 }
 
-int zero_native_gtk_set_credential(Host *host, const char *service, size_t service_len, const char *account, size_t account_len, const char *secret, size_t secret_len) {
+int native_sdk_gtk_set_credential(Host *host, const char *service, size_t service_len, const char *account, size_t account_len, const char *secret, size_t secret_len) {
     (void)host;
     (void)service;
     (void)service_len;
@@ -494,7 +523,7 @@ int zero_native_gtk_set_credential(Host *host, const char *service, size_t servi
     return 0;
 }
 
-size_t zero_native_gtk_get_credential(Host *host, const char *service, size_t service_len, const char *account, size_t account_len, char *buffer, size_t buffer_len) {
+size_t native_sdk_gtk_get_credential(Host *host, const char *service, size_t service_len, const char *account, size_t account_len, char *buffer, size_t buffer_len) {
     (void)host;
     (void)service;
     (void)service_len;
@@ -505,7 +534,7 @@ size_t zero_native_gtk_get_credential(Host *host, const char *service, size_t se
     return 0;
 }
 
-int zero_native_gtk_delete_credential(Host *host, const char *service, size_t service_len, const char *account, size_t account_len) {
+int native_sdk_gtk_delete_credential(Host *host, const char *service, size_t service_len, const char *account, size_t account_len) {
     (void)host;
     (void)service;
     (void)service_len;
@@ -514,20 +543,20 @@ int zero_native_gtk_delete_credential(Host *host, const char *service, size_t se
     return 0;
 }
 
-size_t zero_native_gtk_clipboard_read(Host *host, char *buffer, size_t buffer_len) {
+size_t native_sdk_gtk_clipboard_read(Host *host, char *buffer, size_t buffer_len) {
     (void)host;
     (void)buffer;
     (void)buffer_len;
     return 0;
 }
 
-void zero_native_gtk_clipboard_write(Host *host, const char *text, size_t text_len) {
+void native_sdk_gtk_clipboard_write(Host *host, const char *text, size_t text_len) {
     (void)host;
     (void)text;
     (void)text_len;
 }
 
-size_t zero_native_gtk_clipboard_read_data(Host *host, const char *mime_type, size_t mime_type_len, char *buffer, size_t buffer_len) {
+size_t native_sdk_gtk_clipboard_read_data(Host *host, const char *mime_type, size_t mime_type_len, char *buffer, size_t buffer_len) {
     (void)host;
     (void)mime_type;
     (void)mime_type_len;
@@ -536,7 +565,7 @@ size_t zero_native_gtk_clipboard_read_data(Host *host, const char *mime_type, si
     return 0;
 }
 
-int zero_native_gtk_clipboard_write_data(Host *host, const char *mime_type, size_t mime_type_len, const char *bytes, size_t bytes_len) {
+int native_sdk_gtk_clipboard_write_data(Host *host, const char *mime_type, size_t mime_type_len, const char *bytes, size_t bytes_len) {
     (void)host;
     (void)mime_type;
     (void)mime_type_len;
@@ -545,7 +574,7 @@ int zero_native_gtk_clipboard_write_data(Host *host, const char *mime_type, size
     return 0;
 }
 
-OpenDialogResult zero_native_gtk_show_open_dialog(Host *host, const void *opts, char *buffer, size_t buffer_len) {
+OpenDialogResult native_sdk_gtk_show_open_dialog(Host *host, const void *opts, char *buffer, size_t buffer_len) {
     (void)host;
     (void)opts;
     (void)buffer;
@@ -553,7 +582,7 @@ OpenDialogResult zero_native_gtk_show_open_dialog(Host *host, const void *opts, 
     return {};
 }
 
-size_t zero_native_gtk_show_save_dialog(Host *host, const void *opts, char *buffer, size_t buffer_len) {
+size_t native_sdk_gtk_show_save_dialog(Host *host, const void *opts, char *buffer, size_t buffer_len) {
     (void)host;
     (void)opts;
     (void)buffer;
@@ -561,7 +590,7 @@ size_t zero_native_gtk_show_save_dialog(Host *host, const void *opts, char *buff
     return 0;
 }
 
-int zero_native_gtk_show_message_dialog(Host *host, const void *opts) {
+int native_sdk_gtk_show_message_dialog(Host *host, const void *opts) {
     (void)host;
     (void)opts;
     return 0;

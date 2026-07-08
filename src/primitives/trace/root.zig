@@ -317,6 +317,49 @@ pub fn formatJsonLine(record: Record, writer: anytype) !void {
     try writer.writeAll("}}\n");
 }
 
+/// Marker appended to a record that overflowed a bounded format buffer.
+pub const truncation_marker = "...[truncated]";
+
+/// Format `record` as text into `buffer`, truncating oversized records
+/// with `truncation_marker` instead of failing. Sinks that format into
+/// fixed buffers must never turn an oversized record into a dispatch
+/// error — capacity failures inside logging degrade, they do not
+/// terminate the app.
+pub fn formatTextBounded(record: Record, buffer: []u8) []const u8 {
+    var writer = std.Io.Writer.fixed(buffer);
+    formatText(record, &writer) catch {
+        return truncateWithMarker(buffer, writer.buffered().len);
+    };
+    return writer.buffered();
+}
+
+/// Format `record` as a JSON line into `buffer`. An oversized record is
+/// rewritten as a minimal valid record with `"truncated":true` so the
+/// log stays line-parseable; a buffer too small even for that yields an
+/// empty slice (the caller counts the drop).
+pub fn formatJsonLineBounded(record: Record, buffer: []u8) []const u8 {
+    var writer = std.Io.Writer.fixed(buffer);
+    formatJsonLine(record, &writer) catch {
+        var fallback = std.Io.Writer.fixed(buffer);
+        writeJsonFallback(record, &fallback) catch return "";
+        return fallback.buffered();
+    };
+    return writer.buffered();
+}
+
+fn truncateWithMarker(buffer: []u8, written: usize) []const u8 {
+    if (buffer.len <= truncation_marker.len) return buffer[0..0];
+    const keep = @min(written, buffer.len - truncation_marker.len);
+    @memcpy(buffer[keep .. keep + truncation_marker.len], truncation_marker);
+    return buffer[0 .. keep + truncation_marker.len];
+}
+
+fn writeJsonFallback(record: Record, writer: anytype) !void {
+    try writer.print("{{\"timestamp_ns\":{d},\"level\":\"{s}\",\"kind\":\"{s}\",\"name\":", .{ record.timestamp.ns, record.level.name(), record.kind.name() });
+    try writeJsonString(writer, record.name[0..@min(record.name.len, 128)]);
+    try writer.writeAll(",\"truncated\":true}\n");
+}
+
 fn formatFieldValueText(value: FieldValue, writer: anytype) !void {
     switch (value) {
         .string => |v| try writer.print("\"{s}\"", .{v}),
@@ -472,6 +515,37 @@ test "json line formatting is deterministic and escapes strings" {
         "{\"timestamp_ns\":5,\"level\":\"info\",\"kind\":\"event\",\"name\":\"cli\\nrun\",\"message\":\"hi \\\"there\\\"\",\"fields\":{\"quote\":\"a\\\"b\",\"path\":\"a\\\\b\",\"line\":\"a\\nb\",\"ok\":true}}\n",
         writer.buffered(),
     );
+}
+
+test "bounded text formatting truncates oversized records with a marker instead of failing" {
+    var big_message: [2048]u8 = undefined;
+    @memset(&big_message, 'm');
+    const record = event(.{ .ns = 9 }, .info, "chatty", &big_message, &.{});
+
+    var buffer: [256]u8 = undefined;
+    const line = formatTextBounded(record, &buffer);
+    try std.testing.expectEqual(buffer.len, line.len);
+    try std.testing.expect(std.mem.endsWith(u8, line, truncation_marker));
+    try std.testing.expect(std.mem.startsWith(u8, line, "ts=9 level=info"));
+
+    // Small records format exactly as `formatText` would.
+    const small = event(.{ .ns = 1 }, .info, "tick", null, &.{});
+    const small_line = formatTextBounded(small, &buffer);
+    try std.testing.expectEqualStrings("ts=1 level=info kind=event name=\"tick\"", small_line);
+}
+
+test "bounded json formatting rewrites oversized records as minimal valid json" {
+    var big_message: [2048]u8 = undefined;
+    @memset(&big_message, 'm');
+    const record = event(.{ .ns = 9 }, .warn, "chatty", &big_message, &.{});
+
+    var buffer: [256]u8 = undefined;
+    const line = formatJsonLineBounded(record, &buffer);
+    try std.testing.expectEqualStrings("{\"timestamp_ns\":9,\"level\":\"warn\",\"kind\":\"event\",\"name\":\"chatty\",\"truncated\":true}\n", line);
+
+    const small = event(.{ .ns = 2 }, .info, "tick", null, &.{});
+    const small_line = formatJsonLineBounded(small, &buffer);
+    try std.testing.expectEqualStrings("{\"timestamp_ns\":2,\"level\":\"info\",\"kind\":\"event\",\"name\":\"tick\",\"fields\":{}}\n", small_line);
 }
 
 test "counter gauge and frame constructors include values" {

@@ -14,18 +14,23 @@ export function DocsMobileNav() {
     return allDocsPages.find((page) => page.href === pathname) ?? allDocsPages[0];
   }, [pathname]);
 
+  // The homepage is a full-width landing page without the docs chrome.
+  if (pathname === "/") {
+    return null;
+  }
+
   return (
     <Sheet open={open} onOpenChange={setOpen}>
       <SheetTrigger
         aria-label="Open table of contents"
-        className="lg:hidden sticky top-14 z-40 w-full px-6 py-3 bg-white/80 dark:bg-neutral-950/80 backdrop-blur-sm border-b border-neutral-200 dark:border-neutral-800 flex items-center justify-between focus:outline-none"
+        className="lg:hidden sticky top-16 z-40 w-full px-6 py-3 bg-background-100/80 backdrop-blur-sm border-b border-gray-alpha-400 flex items-center justify-between focus:outline-none"
       >
-        <div className="text-sm font-medium text-neutral-900 dark:text-neutral-100">
+        <div className="label-14 font-medium text-gray-1000">
           {currentPage.name}
         </div>
         <div className="w-8 h-8 flex items-center justify-center">
           <svg
-            className="h-4 w-4 text-neutral-500 dark:text-neutral-400"
+            className="h-4 w-4 text-gray-900"
             viewBox="0 0 24 24"
             fill="none"
             stroke="currentColor"
@@ -43,7 +48,8 @@ export function DocsMobileNav() {
           </svg>
         </div>
       </SheetTrigger>
-      <SheetContent side="left" className="overflow-y-auto p-6" showCloseButton={false}>
+      {/* overscroll-contain: sheet edge-scroll must not chain to the page. */}
+      <SheetContent side="left" className="overflow-y-auto overscroll-contain p-6" showCloseButton={false}>
         <SheetTitle className="mb-6">Table of Contents</SheetTitle>
         <nav className="space-y-6">
           {navSections.map((section) => (

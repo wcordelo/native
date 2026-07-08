@@ -1,9 +1,8 @@
 .{
-    .id = "dev.zero_native.capabilities",
+    .id = "dev.native_sdk.capabilities",
     .name = "capabilities",
     .display_name = "Capabilities",
     .version = "0.1.0",
-    .icons = .{ "assets/icon.icns" },
     .platforms = .{ "macos", "linux" },
     .permissions = .{ "window", "network", "filesystem", "notifications", "dialog", "clipboard", "credentials" },
     .capabilities = .{
@@ -24,21 +23,20 @@
     },
     .file_associations = .{
         .{
-            .name = "zero-native Capability Document",
+            .name = "Native SDK Capability Document",
             .role = "viewer",
             .extensions = .{ "zncap" },
-            .mime_types = .{ "application/vnd.zero-native.capability+json" },
-            .icon = "assets/icon.icns",
+            .mime_types = .{ "application/vnd.native-sdk.capability+json" },
         },
     },
     .url_schemes = .{
-        .{ .scheme = "zero-native-capabilities" },
+        .{ .scheme = "native-sdk-capabilities" },
     },
     .shell = .{
         .windows = .{
             .{
                 .label = "main",
-                .title = "zero-native Capabilities",
+                .title = "Native SDK Capabilities",
                 .width = 900,
                 .height = 620,
                 .restore_policy = "center_on_primary",

@@ -1,3 +1,5 @@
+import { componentPages } from "./components-pages";
+
 export type NavItem = {
   name: string;
   href: string;
@@ -10,60 +12,90 @@ export type NavSection = {
 
 export const navSections: NavSection[] = [
   {
-    title: "Getting Started",
+    title: "Get Started",
     items: [
-      { name: "Introduction", href: "/" },
+      { name: "Introduction", href: "/introduction" },
       { name: "Quick Start", href: "/quick-start" },
-      { name: "App Model", href: "/app-model" },
-      { name: "Frontend Projects", href: "/frontend" },
-      { name: "Native Surfaces", href: "/native-surfaces" },
+      { name: "CLI", href: "/cli" },
+      { name: "Config", href: "/app-zon" },
+      { name: "Agent Skills", href: "/skills" },
     ],
   },
   {
     title: "Core Concepts",
     items: [
-      { name: "Web Engines", href: "/web-engines" },
-      { name: "Windows", href: "/windows" },
-      { name: "Multiple WebViews", href: "/webviews" },
-      { name: "Keyboard Shortcuts", href: "/keyboard-shortcuts" },
-      { name: "Commands", href: "/commands" },
-      { name: "Bridge", href: "/bridge" },
-      { name: "Builtin Commands", href: "/bridge/builtin-commands" },
-      { name: "Dialogs", href: "/dialogs" },
-      { name: "Menus", href: "/menus" },
-      { name: "Native Controls", href: "/native-controls" },
-      { name: "Capabilities", href: "/capabilities" },
-      { name: "Platform Support", href: "/platform-support" },
-      { name: "System Tray", href: "/tray" },
-      { name: "Security", href: "/security" },
+      { name: "App Model", href: "/app-model" },
+      { name: "Native UI", href: "/native-ui" },
+      { name: "State & Data Flow", href: "/state" },
+      { name: "Theming", href: "/theming" },
+      { name: "Building Components", href: "/building-components" },
     ],
   },
   {
-    title: "Tooling",
+    // One entry per built-in component page, generated from the shared
+    // components-pages inventory (previews regenerate via
+    // `zig build docs-component-previews`).
+    title: "Components",
     items: [
-      { name: "CLI Reference", href: "/cli" },
-      { name: "Dev Server", href: "/cli/dev" },
+      { name: "Overview", href: "/components" },
+      ...componentPages.map((page) => ({ name: page.name, href: `/components/${page.slug}` })),
+    ],
+  },
+  {
+    title: "Native Platform",
+    items: [
+      { name: "Windows", href: "/windows" },
+      { name: "Native Surfaces", href: "/native-surfaces" },
+      { name: "Menus", href: "/menus" },
+      { name: "Dialogs", href: "/dialogs" },
+      { name: "System Tray", href: "/tray" },
+      { name: "Keyboard Shortcuts", href: "/keyboard-shortcuts" },
+      { name: "Commands", href: "/commands" },
+      { name: "Native Controls", href: "/native-controls" },
+    ],
+  },
+  {
+    title: "Automation & Testing",
+    items: [
+      { name: "Automation", href: "/automation" },
+      { name: "Testing", href: "/testing" },
+      { name: "Testing in CI", href: "/testing/ci" },
+    ],
+  },
+  {
+    title: "Packaging & Distribution",
+    items: [
       { name: "Packaging", href: "/packaging" },
       { name: "Code Signing", href: "/packaging/signing" },
       { name: "Updates", href: "/updates" },
-      { name: "app.zon Reference", href: "/app-zon" },
-    ],
-  },
-  {
-    title: "Operations",
-    items: [
-      { name: "Debugging", href: "/debugging" },
-      { name: "zero-native doctor", href: "/debugging/doctor" },
-      { name: "Automation", href: "/automation" },
-      { name: "Testing", href: "/testing" },
-    ],
-  },
-  {
-    title: "Advanced",
-    items: [
-      { name: "Extensions", href: "/extensions" },
-      { name: "Embedded App", href: "/embed" },
       { name: "Package Distribution", href: "/packages" },
+    ],
+  },
+  {
+    title: "Mobile & Embedding",
+    items: [{ name: "Embedded App", href: "/embed" }],
+  },
+  {
+    title: "Web Content",
+    items: [
+      { name: "Web Engines", href: "/web-engines" },
+      { name: "Web Content", href: "/frontend" },
+      { name: "Dev Server", href: "/cli/dev" },
+      { name: "Multiple WebViews", href: "/webviews" },
+      { name: "Bridge", href: "/bridge" },
+      { name: "Builtin Commands", href: "/bridge/builtin-commands" },
+    ],
+  },
+  {
+    title: "Reference",
+    items: [
+      { name: "App & Runtime", href: "/runtime" },
+      { name: "Capabilities", href: "/capabilities" },
+      { name: "Security", href: "/security" },
+      { name: "Platform Support", href: "/platform-support" },
+      { name: "Debugging", href: "/debugging" },
+      { name: "native doctor", href: "/debugging/doctor" },
+      { name: "Extensions", href: "/extensions" },
     ],
   },
 ];

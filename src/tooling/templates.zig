@@ -1,6 +1,13 @@
 const std = @import("std");
 
-const fallback_icon_icns = "icns\x00\x00\x00\x08";
+/// The SDK's default app icon, rendered from vector source by
+/// `zig build generate-icon` (tools/generate_app_icon.zig). Embedded so
+/// `native init` always scaffolds a real icon regardless of the
+/// directory the CLI runs from. The scaffold ships the one-image PNG
+/// contract (`assets/icon.png` in app.zon `.icons`; packaging generates
+/// every platform's artifacts from it); the `.icns` twin stays embedded
+/// for packaging's no-icon fallback (src/tooling/package.zig).
+const default_icon_png = @embedFile("default_icon.png");
 
 pub const Frontend = enum {
     next,
@@ -8,6 +15,8 @@ pub const Frontend = enum {
     react,
     svelte,
     vue,
+    /// Native-rendered markup app (.native + Zig): no WebView, no npm frontend.
+    native,
 
     pub fn parse(value: []const u8) ?Frontend {
         if (std.mem.eql(u8, value, "next")) return .next;
@@ -15,6 +24,7 @@ pub const Frontend = enum {
         if (std.mem.eql(u8, value, "react")) return .react;
         if (std.mem.eql(u8, value, "svelte")) return .svelte;
         if (std.mem.eql(u8, value, "vue")) return .vue;
+        if (std.mem.eql(u8, value, "native")) return .native;
         return null;
     }
 
@@ -22,28 +32,42 @@ pub const Frontend = enum {
         return switch (self) {
             .next => "frontend/out",
             .vite, .react, .svelte, .vue => "frontend/dist",
+            .native => "assets",
         };
     }
 
     pub fn devPort(self: Frontend) []const u8 {
         return switch (self) {
             .next => "3000",
-            .vite, .react, .svelte, .vue => "5173",
+            .vite, .react, .svelte, .vue, .native => "5173",
         };
     }
 
     pub fn devUrl(self: Frontend) []const u8 {
         return switch (self) {
             .next => "http://127.0.0.1:3000/",
-            .vite, .react, .svelte, .vue => "http://127.0.0.1:5173/",
+            .vite, .react, .svelte, .vue, .native => "http://127.0.0.1:5173/",
         };
     }
+};
+
+/// Scaffold shape for the native frontend. `slim` is the zero-config
+/// default: app.zon + src/ + assets + README only — the `native` CLI owns
+/// the build graph (`native dev|build|test`) and `native eject` writes an
+/// owned build.zig later. `full` keeps the pre-zero-config shape
+/// (build.zig, build.zig.zon, .vscode, CI workflow) for users who want to
+/// own the build from day one. Web frontends always scaffold full: their
+/// npm build pipeline needs the expanded build.zig.
+pub const Shape = enum {
+    slim,
+    full,
 };
 
 pub const InitOptions = struct {
     app_name: []const u8,
     framework_path: []const u8 = ".",
     frontend: Frontend = .vite,
+    shape: Shape = .slim,
 };
 
 pub fn writeDefaultApp(allocator: std.mem.Allocator, io: std.Io, destination: []const u8, options: InitOptions) !void {
@@ -60,6 +84,16 @@ pub fn writeDefaultApp(allocator: std.mem.Allocator, io: std.Io, destination: []
     try app_dir.createDirPath(io, "src");
     try app_dir.createDirPath(io, "assets");
 
+    if (options.frontend == .native) {
+        if (options.shape == .slim) {
+            return writeNativeAppSlim(allocator, io, app_dir, names);
+        }
+        // build.zig.zon path dependencies must be relative to the app root.
+        const dependency_path = try nativeDependencyPath(allocator, io, destination, framework_path);
+        defer allocator.free(dependency_path);
+        return writeNativeApp(allocator, io, app_dir, names, dependency_path);
+    }
+
     const build_zig = try buildZig(allocator, names, framework_path, options.frontend);
     defer allocator.free(build_zig);
     const build_zon = try buildZon(allocator, names);
@@ -70,30 +104,694 @@ pub fn writeDefaultApp(allocator: std.mem.Allocator, io: std.Io, destination: []
     defer allocator.free(app_zon);
     const readme_md = try readme(allocator, names, framework_path, options.frontend);
     defer allocator.free(readme_md);
+    const ci_yaml = try frontendCiYaml(allocator, names);
+    defer allocator.free(ci_yaml);
 
+    try app_dir.createDirPath(io, ".github/workflows");
     try writeFile(app_dir, io, "build.zig", build_zig);
     try writeFile(app_dir, io, "build.zig.zon", build_zon);
     try writeFile(app_dir, io, "src/main.zig", main_zig);
     try writeFile(app_dir, io, "src/runner.zig", runnerZig());
     try writeFile(app_dir, io, "app.zon", app_zon);
-    const icon_bytes = readFile(allocator, io, "assets/icon.icns") catch fallback_icon_icns;
-    defer if (icon_bytes.ptr != fallback_icon_icns.ptr) allocator.free(icon_bytes);
-    try writeFile(app_dir, io, "assets/icon.icns", icon_bytes);
+    try writeFile(app_dir, io, "assets/icon.png", default_icon_png);
+    try writeFile(app_dir, io, ".github/workflows/ci.yml", ci_yaml);
     try writeFile(app_dir, io, "README.md", readme_md);
 
     try writeFrontendFiles(allocator, io, app_dir, names, options.frontend);
 }
 
-fn writeFile(dir: std.Io.Dir, io: std.Io, path: []const u8, bytes: []const u8) !void {
-    try dir.writeFile(io, .{ .sub_path = path, .data = bytes });
+/// The zero-config scaffold: no build files, no editor config, no CI — the
+/// README teaches the `native` verbs and everything else is app source.
+fn writeNativeAppSlim(allocator: std.mem.Allocator, io: std.Io, app_dir: std.Io.Dir, names: TemplateNames) !void {
+    const main_zig = try nativeMainZig(allocator, names);
+    defer allocator.free(main_zig);
+    const tests_zig = try nativeTestsZig(allocator, names);
+    defer allocator.free(tests_zig);
+    const app_zon = try nativeAppZon(allocator, names);
+    defer allocator.free(app_zon);
+    const readme_md = try slimNativeReadme(allocator, names);
+    defer allocator.free(readme_md);
+
+    try writeFile(app_dir, io, "src/main.zig", main_zig);
+    try writeFile(app_dir, io, "src/app.native", nativeAppMarkup());
+    try writeFile(app_dir, io, "src/tests.zig", tests_zig);
+    try writeFile(app_dir, io, "app.zon", app_zon);
+    try writeFile(app_dir, io, "assets/icon.png", default_icon_png);
+    try writeFile(app_dir, io, ".gitignore", slimGitignore());
+    try writeFile(app_dir, io, "README.md", readme_md);
 }
 
-fn readFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
-    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
-    defer file.close(io);
-    var read_buffer: [4096]u8 = undefined;
-    var reader = file.reader(io, &read_buffer);
-    return reader.interface.allocRemaining(allocator, .limited(16 * 1024 * 1024));
+fn slimGitignore() []const u8 {
+    return
+    \\.native/
+    \\zig-out/
+    \\.zig-cache/
+    \\
+    ;
+}
+
+fn slimNativeReadme(allocator: std.mem.Allocator, names: TemplateNames) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "# ");
+    try out.appendSlice(allocator, names.display_name);
+    try out.appendSlice(allocator,
+        \\
+        \\
+        \\A native-rendered Native SDK app: the view lives in `src/app.native`
+        \\(declarative markup) and the logic in `src/main.zig` (`Model`, `Msg`,
+        \\`update`). No WebView, no npm, no build files — the `native` CLI owns
+        \\the build.
+        \\
+        \\## Commands
+        \\
+        \\```sh
+        \\native dev     # build and run the app with hot reload
+        \\native test    # run the app's test suite
+        \\native build   # produce a ReleaseFast binary in zig-out/bin/
+        \\native check   # validate src/*.native markup and app.zon
+        \\```
+        \\
+        \\## Hot reload
+        \\
+        \\`src/app.native` is watched while `native dev` runs: edit it and the
+        \\window updates within ~2s without losing model state. Parse failures
+        \\keep the last good view.
+        \\
+        \\## Owning the build
+        \\
+        \\Need custom build logic? `native eject` writes a build.zig and
+        \\build.zig.zon into the app — from then on the `native` verbs drive
+        \\your files through `zig build` and never regenerate them.
+        \\
+    );
+    return out.toOwnedSlice(allocator);
+}
+
+fn writeNativeApp(allocator: std.mem.Allocator, io: std.Io, app_dir: std.Io.Dir, names: TemplateNames, framework_path: []const u8) !void {
+    try app_dir.createDirPath(io, ".vscode");
+    try app_dir.createDirPath(io, ".github/workflows");
+
+    const build_zig = try nativeBuildZig(allocator, names);
+    defer allocator.free(build_zig);
+    const build_zon = try nativeBuildZon(allocator, names, framework_path);
+    defer allocator.free(build_zon);
+    const main_zig = try nativeMainZig(allocator, names);
+    defer allocator.free(main_zig);
+    const tests_zig = try nativeTestsZig(allocator, names);
+    defer allocator.free(tests_zig);
+    const app_zon = try nativeAppZon(allocator, names);
+    defer allocator.free(app_zon);
+    const readme_md = try nativeReadme(allocator, names, framework_path);
+    defer allocator.free(readme_md);
+    const ci_yaml = try nativeCiYaml(allocator, names, framework_path);
+    defer allocator.free(ci_yaml);
+
+    try writeFile(app_dir, io, "build.zig", build_zig);
+    try writeFile(app_dir, io, "build.zig.zon", build_zon);
+    try writeFile(app_dir, io, "src/main.zig", main_zig);
+    try writeFile(app_dir, io, "src/app.native", nativeAppMarkup());
+    try writeFile(app_dir, io, "src/tests.zig", tests_zig);
+    try writeFile(app_dir, io, "app.zon", app_zon);
+    try writeFile(app_dir, io, "assets/icon.png", default_icon_png);
+    try writeFile(app_dir, io, ".vscode/settings.json", nativeVscodeSettings());
+    try writeFile(app_dir, io, ".github/workflows/ci.yml", ci_yaml);
+    try writeFile(app_dir, io, ".gitignore", nativeGitignore());
+    try writeFile(app_dir, io, "README.md", readme_md);
+}
+
+fn nativeBuildZig(allocator: std.mem.Allocator, names: TemplateNames) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator,
+        \\const std = @import("std");
+        \\const native_sdk = @import("native_sdk");
+        \\
+        \\pub fn build(b: *std.Build) void {
+        \\    native_sdk.addApp(b, b.dependency("native_sdk", .{}), .{ .name =
+    );
+    try out.appendSlice(allocator, " ");
+    try appendZigString(&out, allocator, names.package_name);
+    try out.appendSlice(allocator,
+        \\ });
+        \\}
+        \\
+    );
+    return out.toOwnedSlice(allocator);
+}
+
+fn nativeBuildZon(allocator: std.mem.Allocator, names: TemplateNames, framework_path: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator,
+        \\.{
+        \\    .name = .
+    );
+    try out.appendSlice(allocator, names.module_name);
+    try out.appendSlice(allocator,
+        \\,
+        \\    .fingerprint = 0x
+    );
+    var fingerprint_buffer: [16]u8 = undefined;
+    const fingerprint = try std.fmt.bufPrint(&fingerprint_buffer, "{x}", .{fingerprintForName(names.module_name)});
+    try out.appendSlice(allocator, fingerprint);
+    try out.appendSlice(allocator,
+        \\,
+        \\    .version = "0.1.0",
+        \\    .minimum_zig_version = "0.16.0",
+        \\    .dependencies = .{ .native_sdk = .{ .path =
+    );
+    try out.appendSlice(allocator, " ");
+    try appendZigString(&out, allocator, framework_path);
+    try out.appendSlice(allocator,
+        \\ } },
+        \\    .paths = .{ "build.zig", "build.zig.zon", "src", "assets", "app.zon", "README.md" },
+        \\}
+        \\
+    );
+    return out.toOwnedSlice(allocator);
+}
+
+fn nativeMainZig(allocator: std.mem.Allocator, names: TemplateNames) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator,
+        \\//! A minimal native-rendered Native SDK app: the view lives in
+        \\//! `app.native` (embedded into the binary, and watched for hot reload in
+        \\//! dev); this file is the logic: `Model`, `Msg`, and `update`.
+        \\
+        \\const std = @import("std");
+        \\const runner = @import("runner");
+        \\const native_sdk = @import("native_sdk");
+        \\
+        \\pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
+        \\
+        \\const canvas = native_sdk.canvas;
+        \\const geometry = native_sdk.geometry;
+        \\
+        \\const canvas_label = "main-canvas";
+        \\const window_width: f32 = 480;
+        \\const window_height: f32 = 320;
+        \\
+        \\const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view };
+        \\const shell_views = [_]native_sdk.ShellView{
+        \\    .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Counter canvas", .accessibility_label = "Counter", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true },
+        \\};
+        \\const shell_windows = [_]native_sdk.ShellWindow{.{
+        \\    .label = "main",
+        \\    .title =
+    );
+    try out.appendSlice(allocator, " ");
+    try appendZigString(&out, allocator, names.display_name);
+    try out.appendSlice(allocator,
+        \\,
+        \\    .width = window_width,
+        \\    .height = window_height,
+        \\    .restore_state = false,
+        \\    .views = &shell_views,
+        \\}};
+        \\const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
+        \\
+        \\// ------------------------------------------------------------------ model
+        \\
+        \\pub const Msg = union(enum) {
+        \\    increment,
+        \\    decrement,
+        \\    reset,
+        \\};
+        \\
+        \\pub const Model = struct {
+        \\    count: i64 = 0,
+        \\};
+        \\
+        \\pub fn update(model: *Model, msg: Msg) void {
+        \\    switch (msg) {
+        \\        .increment => model.count += 1,
+        \\        .decrement => model.count -= 1,
+        \\        .reset => model.count = 0,
+        \\    }
+        \\}
+        \\
+        \\// ------------------------------------------------------------------- view
+        \\
+        \\pub const AppUi = canvas.Ui(Msg);
+        \\pub const app_markup = @embedFile("app.native");
+        \\
+        \\// -------------------------------------------------------------------- app
+        \\
+        \\const CounterApp = native_sdk.UiApp(Model, Msg);
+        \\
+        \\pub fn initialModel() Model {
+        \\    return .{};
+        \\}
+        \\
+        \\pub fn main(init: std.process.Init) !void {
+        \\    // The app struct (and any real Model) is multi-MB: `create`
+        \\    // heap-allocates and constructs everything in place, so neither
+        \\    // ever rides the stack. Mutate `app_state.model` through the
+        \\    // pointer before running if boot state is not the default.
+        \\    const app_state = try CounterApp.create(std.heap.page_allocator, .{
+        \\        .name =
+    );
+    try out.appendSlice(allocator, " ");
+    try appendZigString(&out, allocator, names.package_name);
+    try out.appendSlice(allocator,
+        \\,
+        \\        .scene = shell_scene,
+        \\        .canvas_label = canvas_label,
+        \\        .update = update,
+        \\        .markup = .{ .source = app_markup, .watch_path = "src/app.native", .io = init.io },
+        \\    });
+        \\    defer app_state.destroy();
+        \\    app_state.model = initialModel();
+        \\
+        \\    try runner.runWithOptions(app_state.app(), .{
+        \\        .app_name =
+    );
+    try out.appendSlice(allocator, " ");
+    try appendZigString(&out, allocator, names.package_name);
+    try out.appendSlice(allocator,
+        \\,
+        \\        .window_title =
+    );
+    try out.appendSlice(allocator, " ");
+    try appendZigString(&out, allocator, names.display_name);
+    try out.appendSlice(allocator,
+        \\,
+        \\        .bundle_id =
+    );
+    try out.appendSlice(allocator, " ");
+    try appendZigString(&out, allocator, names.app_id);
+    try out.appendSlice(allocator,
+        \\,
+        \\        .icon_path = "assets/icon.png",
+        \\        .default_frame = geometry.RectF.init(0, 0, window_width, window_height),
+        \\        .restore_state = false,
+        \\        .js_window_api = false,
+        \\        .security = .{
+        \\            .permissions = &app_permissions,
+        \\            .navigation = .{ .allowed_origins = &.{ "zero://inline", "zero://app" } },
+        \\        },
+        \\    }, init);
+        \\}
+        \\
+        \\test {
+        \\    _ = @import("tests.zig");
+        \\}
+        \\
+    );
+    return out.toOwnedSlice(allocator);
+}
+
+fn nativeAppMarkup() []const u8 {
+    return
+    \\<!-- The whole view. Embedded into the binary and hot-reloaded in dev:
+    \\     edit this file while the app runs and the window updates without
+    \\     losing the count. Validate with: native markup check src/app.native -->
+    \\<column gap="12" padding="16">
+    \\  <row gap="8" cross="center">
+    \\    <text grow="1">Counter</text>
+    \\    <button size="sm" variant="ghost" on-press="reset">Reset</button>
+    \\  </row>
+    \\  <row gap="8" main="center" cross="center" grow="1">
+    \\    <button variant="secondary" on-press="decrement">-</button>
+    \\    <text>{count}</text>
+    \\    <button variant="primary" on-press="increment">+</button>
+    \\  </row>
+    \\  <status-bar>count: {count}</status-bar>
+    \\</column>
+    \\
+    ;
+}
+
+fn nativeTestsZig(allocator: std.mem.Allocator, names: TemplateNames) ![]const u8 {
+    _ = names;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator,
+        \\const std = @import("std");
+        \\const native_sdk = @import("native_sdk");
+        \\const main = @import("main.zig");
+        \\
+        \\const canvas = native_sdk.canvas;
+        \\const testing = std.testing;
+        \\
+        \\const AppUi = main.AppUi;
+        \\const Model = main.Model;
+        \\const Msg = main.Msg;
+        \\
+        \\const AppMarkup = canvas.MarkupView(Model, Msg);
+        \\
+        \\fn buildTree(arena: std.mem.Allocator, model: *const Model) !AppUi.Tree {
+        \\    var view = try AppMarkup.init(arena, main.app_markup);
+        \\    var ui = AppUi.init(arena);
+        \\    const node = view.build(&ui, model) catch |err| {
+        \\        // Name the app.native position instead of leaving a bare error
+        \\        // trace: the usual causes are a binding without a matching
+        \\        // Model field or an on-* message without a Msg arm.
+        \\        if (err == error.MarkupBuild) {
+        \\            std.debug.print("app.native:{d}:{d}: {s}\n", .{ view.diagnostic.line, view.diagnostic.column, view.diagnostic.message });
+        \\        }
+        \\        return err;
+        \\    };
+        \\    return ui.finalize(node);
+        \\}
+        \\
+        \\fn findByText(widget: canvas.Widget, kind: canvas.WidgetKind, text: []const u8) ?canvas.Widget {
+        \\    if (widget.kind == kind and std.mem.eql(u8, widget.text, text)) return widget;
+        \\    for (widget.children) |child| {
+        \\        if (findByText(child, kind, text)) |found| return found;
+        \\    }
+        \\    return null;
+        \\}
+        \\
+        \\/// A miss fails the test with the mismatch spelled out instead of a
+        \\/// null-unwrap panic: the usual cause is app.native and this test
+        \\/// drifting apart after an edit.
+        \\fn expectByText(widget: canvas.Widget, kind: canvas.WidgetKind, text: []const u8) !canvas.Widget {
+        \\    return findByText(widget, kind, text) orelse {
+        \\        std.debug.print("no {t} with text \"{s}\" in the view - if you changed app.native, update this test to match\n", .{ kind, text });
+        \\        return error.WidgetNotFound;
+        \\    };
+        \\}
+        \\
+        \\test "clicking the buttons drives the model through typed dispatch" {
+        \\    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        \\    defer arena_state.deinit();
+        \\    const arena = arena_state.allocator();
+        \\
+        \\    var model = main.initialModel();
+        \\
+        \\    var tree = try buildTree(arena, &model);
+        \\    _ = try expectByText(tree.root, .text, "0");
+        \\    _ = try expectByText(tree.root, .status_bar, "count: 0");
+        \\
+        \\    // Click "+": the count increments and the view rebuilds with the
+        \\    // new value, keeping widget ids stable.
+        \\    const plus = try expectByText(tree.root, .button, "+");
+        \\    main.update(&model, tree.msgForPointer(plus.id, .up).?);
+        \\    try testing.expectEqual(@as(i64, 1), model.count);
+        \\
+        \\    tree = try buildTree(arena, &model);
+        \\    _ = try expectByText(tree.root, .text, "1");
+        \\    _ = try expectByText(tree.root, .status_bar, "count: 1");
+        \\    try testing.expectEqual(plus.id, (try expectByText(tree.root, .button, "+")).id);
+        \\
+        \\    // Click "-" twice: the count goes negative.
+        \\    const minus = try expectByText(tree.root, .button, "-");
+        \\    main.update(&model, tree.msgForPointer(minus.id, .up).?);
+        \\    main.update(&model, tree.msgForPointer(minus.id, .up).?);
+        \\    try testing.expectEqual(@as(i64, -1), model.count);
+        \\
+        \\    // Click "Reset": back to zero.
+        \\    tree = try buildTree(arena, &model);
+        \\    const reset = try expectByText(tree.root, .button, "Reset");
+        \\    main.update(&model, tree.msgForPointer(reset.id, .up).?);
+        \\    try testing.expectEqual(@as(i64, 0), model.count);
+        \\
+        \\    tree = try buildTree(arena, &model);
+        \\    _ = try expectByText(tree.root, .status_bar, "count: 0");
+        \\}
+        \\
+        \\test "the view lays out through the canvas engine" {
+        \\    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        \\    defer arena_state.deinit();
+        \\
+        \\    var model = main.initialModel();
+        \\    const tree = try buildTree(arena_state.allocator(), &model);
+        \\
+        \\    var nodes: [64]canvas.WidgetLayoutNode = undefined;
+        \\    const layout = try canvas.layoutWidgetTree(tree.root, native_sdk.geometry.RectF.init(0, 0, 480, 320), &nodes);
+        \\    try testing.expect(layout.nodes.len > 0);
+        \\
+        \\    const plus = try expectByText(tree.root, .button, "+");
+        \\    var saw_button = false;
+        \\    for (layout.nodes) |node| {
+        \\        if (node.widget.id == plus.id) saw_button = true;
+        \\    }
+        \\    try testing.expect(saw_button);
+        \\}
+        \\
+    );
+    return out.toOwnedSlice(allocator);
+}
+
+fn nativeAppZon(allocator: std.mem.Allocator, names: TemplateNames) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator,
+        \\.{
+        \\    .id =
+    );
+    try out.appendSlice(allocator, " ");
+    try appendZigString(&out, allocator, names.app_id);
+    try out.appendSlice(allocator,
+        \\,
+        \\    .name =
+    );
+    try out.appendSlice(allocator, " ");
+    try appendZigString(&out, allocator, names.package_name);
+    try out.appendSlice(allocator,
+        \\,
+        \\    .display_name =
+    );
+    try out.appendSlice(allocator, " ");
+    try appendZigString(&out, allocator, names.display_name);
+    try out.appendSlice(allocator,
+        \\,
+        \\    .description = "A counter that lives in one native window.",
+        \\    .version = "0.1.0",
+        \\    .icons = .{"assets/icon.png"},
+        \\    .platforms = .{"macos"},
+        \\    .permissions = .{ "view", "command" },
+        \\    .capabilities = .{ "native_views", "gpu_surfaces" },
+        \\    .shell = .{
+        \\        .windows = .{
+        \\            .{
+        \\                .label = "main",
+        \\                .title =
+    );
+    try out.appendSlice(allocator, " ");
+    try appendZigString(&out, allocator, names.display_name);
+    try out.appendSlice(allocator,
+        \\,
+        \\                .width = 480,
+        \\                .height = 320,
+        \\                .restore_state = false,
+        \\                .restore_policy = "center_on_primary",
+        \\                .views = .{
+        \\                    .{ .label = "main-canvas", .kind = "gpu_surface", .fill = true, .role = "Counter canvas", .accessibility_label = "Counter", .gpu_backend = "metal", .gpu_pixel_format = "bgra8_unorm", .gpu_present_mode = "timer", .gpu_alpha_mode = "opaque", .gpu_color_space = "srgb", .gpu_vsync = true },
+        \\                },
+        \\            },
+        \\        },
+        \\    },
+        \\    .security = .{
+        \\        .navigation = .{
+        \\            .allowed_origins = .{ "zero://app", "zero://inline" },
+        \\            .external_links = .{ .action = "deny" },
+        \\        },
+        \\    },
+        \\    .web_engine = "system",
+        \\    .cef = .{ .dir = "third_party/cef/macos", .auto_install = false },
+        \\}
+        \\
+    );
+    return out.toOwnedSlice(allocator);
+}
+
+fn nativeVscodeSettings() []const u8 {
+    return
+    \\{
+    \\  "files.associations": { "*.native": "html" }
+    \\}
+    \\
+    ;
+}
+
+fn nativeGitignore() []const u8 {
+    return
+    \\zig-out/
+    \\.zig-cache/
+    \\
+    ;
+}
+
+fn nativeReadme(allocator: std.mem.Allocator, names: TemplateNames, framework_path: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "# ");
+    try out.appendSlice(allocator, names.display_name);
+    try out.appendSlice(allocator,
+        \\
+        \\
+        \\A native-rendered Native SDK app: the view lives in `src/app.native`
+        \\(declarative markup) and the logic in `src/main.zig` (`Model`, `Msg`,
+        \\`update`). No WebView, no npm — the UI renders on a GPU surface.
+        \\
+        \\## Commands
+        \\
+        \\```sh
+        \\zig build run                          # build and launch the app
+        \\zig build test                         # run the full-loop UI tests
+        \\native markup check src/app.native   # validate the markup without building
+        \\```
+        \\
+        \\## Hot reload
+        \\
+        \\`src/app.native` is embedded into the binary and watched during development:
+        \\edit it while the app runs and the window updates within ~2s without
+        \\losing model state. Parse failures keep the last good view.
+        \\
+        \\## Framework path
+        \\
+        \\`build.zig.zon` points the `native_sdk` dependency at:
+        \\
+        \\```text
+        \\
+    );
+    try out.appendSlice(allocator, framework_path);
+    try out.appendSlice(allocator,
+        \\
+        \\```
+        \\
+        \\Edit `.dependencies.native_sdk.path` in `build.zig.zon` if you move
+        \\this app or the framework checkout.
+        \\
+    );
+    return out.toOwnedSlice(allocator);
+}
+
+/// GitHub Actions workflow for a native-rendered app: a null-platform
+/// logic-test job plus a Linux Xvfb automation smoke job that launches the
+/// real binary and asserts on the accessibility snapshot. The generated
+/// file belongs to the user, like everything init writes.
+fn nativeCiYaml(allocator: std.mem.Allocator, names: TemplateNames, framework_path: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator,
+        \\name: CI
+        \\
+        \\on:
+        \\  pull_request:
+        \\  push:
+        \\    branches:
+        \\      - main
+        \\
+        \\permissions:
+        \\  contents: read
+        \\
+        \\env:
+        \\  # build.zig.zon expects the Native SDK framework checkout at this
+        \\  # path, relative to the repository root. Adjust both together if
+        \\  # your framework checkout lives elsewhere.
+        \\  NATIVE_SDK_PATH:
+    );
+    try out.appendSlice(allocator, " ");
+    try appendEscapedString(&out, allocator, framework_path);
+    try out.appendSlice(allocator,
+        \\
+        \\
+        \\jobs:
+        \\  test:
+        \\    name: Logic Tests
+        \\    runs-on: ubuntu-latest
+        \\    steps:
+        \\      - uses: actions/checkout@v4
+        \\      - uses: mlugg/setup-zig@v2
+        \\        with:
+        \\          version: 0.16.0
+        \\      - name: Fetch native-sdk
+        \\        run: |
+        \\          if [ ! -f "$NATIVE_SDK_PATH/build.zig" ]; then
+        \\            git clone --depth 1 https://github.com/vercel-labs/zero-native.git "$NATIVE_SDK_PATH"
+        \\          fi
+        \\      - run: zig build test -Dplatform=null
+        \\
+        \\  smoke:
+        \\    name: Automation Smoke (Linux)
+        \\    runs-on: ubuntu-latest
+        \\    steps:
+        \\      - uses: actions/checkout@v4
+        \\      - uses: mlugg/setup-zig@v2
+        \\        with:
+        \\          version: 0.16.0
+        \\      - name: Install GTK and Xvfb
+        \\        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libwebkitgtk-6.0-dev xvfb
+        \\      - name: Fetch native-sdk
+        \\        run: |
+        \\          if [ ! -f "$NATIVE_SDK_PATH/build.zig" ]; then
+        \\            git clone --depth 1 https://github.com/vercel-labs/zero-native.git "$NATIVE_SDK_PATH"
+        \\          fi
+        \\      - name: Build the Native SDK CLI
+        \\        run: cd "$NATIVE_SDK_PATH" && zig build
+        \\      - name: Build and drive the app headless
+        \\        run: |
+        \\          set -euo pipefail
+        \\          cli="$NATIVE_SDK_PATH/zig-out/bin/native"
+        \\          zig build -Dplatform=linux -Dweb-engine=system -Dautomation=true
+        \\          rm -rf .zig-cache/native-sdk-automation
+        \\          xvfb-run -a ./zig-out/bin/
+    );
+    try out.appendSlice(allocator, names.package_name);
+    try out.appendSlice(allocator,
+        \\ &
+        \\          pid=$!
+        \\          trap 'kill "$pid" >/dev/null 2>&1 || true' EXIT
+        \\          "$cli" automate wait
+        \\          "$cli" automate assert 'gpu_nonblank=true' 'role=button name="Reset"' 'count: 0'
+        \\          "$cli" automate screenshot main-canvas
+        \\          test -s .zig-cache/native-sdk-automation/screenshot-main-canvas.png
+        \\
+    );
+    return out.toOwnedSlice(allocator);
+}
+
+/// GitHub Actions workflow for a web-frontend app: null-platform logic
+/// tests, pointing `-Dnative-sdk-path` at a framework checkout fetched in
+/// CI (web templates default to a machine-local path).
+fn frontendCiYaml(allocator: std.mem.Allocator, names: TemplateNames) ![]const u8 {
+    _ = names;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator,
+        \\name: CI
+        \\
+        \\on:
+        \\  pull_request:
+        \\  push:
+        \\    branches:
+        \\      - main
+        \\
+        \\permissions:
+        \\  contents: read
+        \\
+        \\env:
+        \\  # Where CI keeps the Native SDK framework checkout; the build
+        \\  # override below points the app at it.
+        \\  NATIVE_SDK_PATH: "../native-sdk"
+        \\
+        \\jobs:
+        \\  test:
+        \\    name: Logic Tests
+        \\    runs-on: ubuntu-latest
+        \\    steps:
+        \\      - uses: actions/checkout@v4
+        \\      - uses: mlugg/setup-zig@v2
+        \\        with:
+        \\          version: 0.16.0
+        \\      - name: Fetch native-sdk
+        \\        run: |
+        \\          if [ ! -f "$NATIVE_SDK_PATH/build.zig" ]; then
+        \\            git clone --depth 1 https://github.com/vercel-labs/zero-native.git "$NATIVE_SDK_PATH"
+        \\          fi
+        \\      - run: zig build test -Dplatform=null -Dnative-sdk-path="$NATIVE_SDK_PATH"
+        \\
+    );
+    return out.toOwnedSlice(allocator);
+}
+
+fn writeFile(dir: std.Io.Dir, io: std.Io, path: []const u8, bytes: []const u8) !void {
+    try dir.writeFile(io, .{ .sub_path = path, .data = bytes });
 }
 
 const TemplateNames = struct {
@@ -109,7 +807,7 @@ const TemplateNames = struct {
         errdefer allocator.free(module_name);
         const display_name = try displayName(allocator, package_name);
         errdefer allocator.free(display_name);
-        const app_id = try std.fmt.allocPrint(allocator, "dev.zero_native.{s}", .{package_name});
+        const app_id = try std.fmt.allocPrint(allocator, "dev.native_sdk.{s}", .{package_name});
         errdefer allocator.free(app_id);
         return .{
             .package_name = package_name,
@@ -160,7 +858,7 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\    linux,
         \\};
         \\
-        \\const default_zero_native_path =
+        \\const default_native_sdk_path =
     );
     try appendZigString(&out, allocator, framework_path);
     try out.appendSlice(allocator, ";\nconst app_exe_name = ");
@@ -169,18 +867,18 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\;
         \\
         \\pub fn build(b: *std.Build) void {
-        \\    const target = zeroNativeTarget(b);
+        \\    const target = nativeSdkTarget(b);
         \\    const optimize = b.standardOptimizeOption(.{});
         \\    const platform_option = b.option(PlatformOption, "platform", "Desktop backend: auto, null, macos, linux, windows") orelse .auto;
         \\    const trace_option = b.option(TraceOption, "trace", "Trace output: off, events, runtime, all") orelse .events;
         \\    const debug_overlay = b.option(bool, "debug-overlay", "Enable debug overlay output") orelse false;
-        \\    const automation_enabled = b.option(bool, "automation", "Enable zero-native automation artifacts") orelse false;
+        \\    const automation_enabled = b.option(bool, "automation", "Enable Native SDK automation artifacts") orelse false;
         \\    const js_bridge_enabled = b.option(bool, "js-bridge", "Enable optional JavaScript bridge stubs") orelse false;
         \\    const web_engine_override = b.option(WebEngineOption, "web-engine", "Override app.zon web engine: system, chromium");
         \\    const cef_dir_override = b.option([]const u8, "cef-dir", "Override CEF root directory for Chromium builds");
         \\    const cef_auto_install_override = b.option(bool, "cef-auto-install", "Override app.zon CEF auto-install setting");
         \\    const package_target = b.option(PackageTarget, "package-target", "Package target: macos, windows, linux") orelse .macos;
-        \\    const zero_native_path = b.option([]const u8, "zero-native-path", "Path to the zero-native framework checkout") orelse default_zero_native_path;
+        \\    const native_sdk_path = b.option([]const u8, "native-sdk-path", "Path to the Native SDK framework checkout") orelse default_native_sdk_path;
         \\    const optimize_name = @tagName(optimize);
         \\    const selected_platform: PlatformOption = switch (platform_option) {
         \\        .auto => if (target.result.os.tag == .macos) .macos else if (target.result.os.tag == .linux) .linux else if (target.result.os.tag == .windows) .windows else .@"null",
@@ -203,7 +901,7 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\        @panic("-Dweb-engine=chromium currently requires -Dplatform=macos");
         \\    }
         \\
-        \\    const zero_native_mod = zeroNativeModule(b, target, optimize, zero_native_path);
+        \\    const native_sdk_mod = nativeSdkModule(b, target, optimize, native_sdk_path);
         \\    const options = b.addOptions();
         \\    options.addOption([]const u8, "platform", switch (selected_platform) {
         \\        .auto => unreachable,
@@ -220,18 +918,18 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\    const options_mod = options.createModule();
         \\
         \\    const runner_mod = localModule(b, target, optimize, "src/runner.zig");
-        \\    runner_mod.addImport("zero-native", zero_native_mod);
+        \\    runner_mod.addImport("native_sdk", native_sdk_mod);
         \\    runner_mod.addImport("build_options", options_mod);
         \\    runner_mod.addImport("app_manifest_zon", b.createModule(.{ .root_source_file = b.path("app.zon") }));
         \\
         \\    const app_mod = localModule(b, target, optimize, "src/main.zig");
-        \\    app_mod.addImport("zero-native", zero_native_mod);
+        \\    app_mod.addImport("native_sdk", native_sdk_mod);
         \\    app_mod.addImport("runner", runner_mod);
         \\    const exe = b.addExecutable(.{
         \\        .name = app_exe_name,
         \\        .root_module = app_mod,
         \\    });
-        \\    linkPlatform(b, target, app_mod, exe, selected_platform, web_engine, zero_native_path, cef_dir, cef_auto_install);
+        \\    linkPlatform(b, target, app_mod, exe, selected_platform, web_engine, native_sdk_path, cef_dir, cef_auto_install);
         \\    b.installArtifact(exe);
         \\
         \\    const frontend_install = b.addSystemCommand(&.{ "npm", "install", "--prefix", "frontend" });
@@ -249,7 +947,7 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\    const run_step = b.step("run", "Run the app");
         \\    run_step.dependOn(&run.step);
         \\
-        \\    const dev = b.addSystemCommand(&.{ "zero-native", "dev", "--manifest", "app.zon", "--binary" });
+        \\    const dev = b.addSystemCommand(&.{ "native", "dev", "--manifest", "app.zon", "--binary" });
         \\    dev.addFileArg(exe.getEmittedBin());
         \\    dev.step.dependOn(&exe.step);
         \\    dev.step.dependOn(&frontend_install.step);
@@ -257,7 +955,7 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\    dev_step.dependOn(&dev.step);
         \\
         \\    const package = b.addSystemCommand(&.{
-        \\        "zero-native",
+        \\        "native",
         \\        "package",
         \\        "--target",
         \\        @tagName(package_target),
@@ -287,7 +985,7 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\    test_step.dependOn(&b.addRunArtifact(tests).step);
         \\}
         \\
-        \\fn zeroNativeTarget(b: *std.Build) std.Build.ResolvedTarget {
+        \\fn nativeSdkTarget(b: *std.Build) std.Build.ResolvedTarget {
         \\    const target = b.standardTargetOptions(.{});
         \\    if (target.result.os.tag != .macos) return target;
         \\
@@ -327,64 +1025,71 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\    });
         \\}
         \\
-        \\fn zeroNativePath(b: *std.Build, zero_native_path: []const u8, sub_path: []const u8) std.Build.LazyPath {
-        \\    return .{ .cwd_relative = b.pathJoin(&.{ zero_native_path, sub_path }) };
+        \\fn nativeSdkPath(b: *std.Build, native_sdk_path: []const u8, sub_path: []const u8) std.Build.LazyPath {
+        \\    return .{ .cwd_relative = b.pathJoin(&.{ native_sdk_path, sub_path }) };
         \\}
         \\
-        \\fn zeroNativeModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, zero_native_path: []const u8) *std.Build.Module {
-        \\    const geometry_mod = externalModule(b, target, optimize, zero_native_path, "src/primitives/geometry/root.zig");
-        \\    const assets_mod = externalModule(b, target, optimize, zero_native_path, "src/primitives/assets/root.zig");
-        \\    const app_dirs_mod = externalModule(b, target, optimize, zero_native_path, "src/primitives/app_dirs/root.zig");
-        \\    const trace_mod = externalModule(b, target, optimize, zero_native_path, "src/primitives/trace/root.zig");
-        \\    const app_manifest_mod = externalModule(b, target, optimize, zero_native_path, "src/primitives/app_manifest/root.zig");
-        \\    const diagnostics_mod = externalModule(b, target, optimize, zero_native_path, "src/primitives/diagnostics/root.zig");
-        \\    const platform_info_mod = externalModule(b, target, optimize, zero_native_path, "src/primitives/platform_info/root.zig");
-        \\    const json_mod = externalModule(b, target, optimize, zero_native_path, "src/primitives/json/root.zig");
-        \\    const debug_mod = externalModule(b, target, optimize, zero_native_path, "src/debug/root.zig");
+        \\fn nativeSdkModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, native_sdk_path: []const u8) *std.Build.Module {
+        \\    const geometry_mod = externalModule(b, target, optimize, native_sdk_path, "src/primitives/geometry/root.zig");
+        \\    const assets_mod = externalModule(b, target, optimize, native_sdk_path, "src/primitives/assets/root.zig");
+        \\    const app_dirs_mod = externalModule(b, target, optimize, native_sdk_path, "src/primitives/app_dirs/root.zig");
+        \\    const trace_mod = externalModule(b, target, optimize, native_sdk_path, "src/primitives/trace/root.zig");
+        \\    const app_manifest_mod = externalModule(b, target, optimize, native_sdk_path, "src/primitives/app_manifest/root.zig");
+        \\    const diagnostics_mod = externalModule(b, target, optimize, native_sdk_path, "src/primitives/diagnostics/root.zig");
+        \\    const platform_info_mod = externalModule(b, target, optimize, native_sdk_path, "src/primitives/platform_info/root.zig");
+        \\    const json_mod = externalModule(b, target, optimize, native_sdk_path, "src/primitives/json/root.zig");
+        \\    const canvas_mod = externalModule(b, target, optimize, native_sdk_path, "src/primitives/canvas/root.zig");
+        \\    canvas_mod.addImport("geometry", geometry_mod);
+        \\    canvas_mod.addImport("json", json_mod);
+        \\    const debug_mod = externalModule(b, target, optimize, native_sdk_path, "src/debug/root.zig");
         \\    debug_mod.addImport("app_dirs", app_dirs_mod);
         \\    debug_mod.addImport("trace", trace_mod);
         \\
-        \\    const zero_native_mod = externalModule(b, target, optimize, zero_native_path, "src/root.zig");
-        \\    zero_native_mod.addImport("geometry", geometry_mod);
-        \\    zero_native_mod.addImport("assets", assets_mod);
-        \\    zero_native_mod.addImport("app_dirs", app_dirs_mod);
-        \\    zero_native_mod.addImport("trace", trace_mod);
-        \\    zero_native_mod.addImport("app_manifest", app_manifest_mod);
-        \\    zero_native_mod.addImport("diagnostics", diagnostics_mod);
-        \\    zero_native_mod.addImport("platform_info", platform_info_mod);
-        \\    zero_native_mod.addImport("json", json_mod);
-        \\    return zero_native_mod;
+        \\    const native_sdk_mod = externalModule(b, target, optimize, native_sdk_path, "src/root.zig");
+        \\    native_sdk_mod.addImport("geometry", geometry_mod);
+        \\    native_sdk_mod.addImport("assets", assets_mod);
+        \\    native_sdk_mod.addImport("app_dirs", app_dirs_mod);
+        \\    native_sdk_mod.addImport("trace", trace_mod);
+        \\    native_sdk_mod.addImport("app_manifest", app_manifest_mod);
+        \\    native_sdk_mod.addImport("diagnostics", diagnostics_mod);
+        \\    native_sdk_mod.addImport("platform_info", platform_info_mod);
+        \\    native_sdk_mod.addImport("json", json_mod);
+        \\    native_sdk_mod.addImport("canvas", canvas_mod);
+        \\    return native_sdk_mod;
         \\}
         \\
-        \\fn externalModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, zero_native_path: []const u8, path: []const u8) *std.Build.Module {
+        \\fn externalModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, native_sdk_path: []const u8, path: []const u8) *std.Build.Module {
         \\    return b.createModule(.{
-        \\        .root_source_file = zeroNativePath(b, zero_native_path, path),
+        \\        .root_source_file = nativeSdkPath(b, native_sdk_path, path),
         \\        .target = target,
         \\        .optimize = optimize,
         \\    });
         \\}
         \\
-        \\fn linkPlatform(b: *std.Build, target: std.Build.ResolvedTarget, app_mod: *std.Build.Module, exe: *std.Build.Step.Compile, platform: PlatformOption, web_engine: WebEngineOption, zero_native_path: []const u8, cef_dir: []const u8, cef_auto_install: bool) void {
+        \\fn linkPlatform(b: *std.Build, target: std.Build.ResolvedTarget, app_mod: *std.Build.Module, exe: *std.Build.Step.Compile, platform: PlatformOption, web_engine: WebEngineOption, native_sdk_path: []const u8, cef_dir: []const u8, cef_auto_install: bool) void {
         \\    if (platform == .macos) {
         \\        switch (web_engine) {
         \\            .system => {
         \\                const sdk_include = if (b.sysroot) |sysroot| b.fmt("-I{s}/usr/include", .{sysroot}) else "";
-        \\                const flags: []const []const u8 = if (b.sysroot) |sysroot| &.{ "-fobjc-arc", "-ObjC", "-mmacosx-version-min=11.0", "-isysroot", sysroot, sdk_include } else &.{ "-fobjc-arc", "-ObjC", "-mmacosx-version-min=11.0" };
-        \\                app_mod.addCSourceFile(.{ .file = zeroNativePath(b, zero_native_path, "src/platform/macos/appkit_host.m"), .flags = flags });
+        \\                const flags: []const []const u8 = if (b.sysroot) |sysroot| &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=11.0", "-isysroot", sysroot, sdk_include } else &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=11.0" };
+        \\                app_mod.addCSourceFile(.{ .file = nativeSdkPath(b, native_sdk_path, "src/platform/macos/appkit_host.m"), .flags = flags });
         \\                app_mod.linkFramework("WebKit", .{});
         \\            },
         \\            .chromium => {
         \\                const cef_check = addCefCheck(b, target, cef_dir);
         \\                if (cef_auto_install) {
-        \\                    const cef_auto = b.addSystemCommand(&.{ "zero-native", "cef", "install", "--dir", cef_dir });
+        \\                    const cef_auto = b.addSystemCommand(&.{ "native", "cef", "install", "--dir", cef_dir });
         \\                    cef_check.step.dependOn(&cef_auto.step);
         \\                }
         \\                exe.step.dependOn(&cef_check.step);
         \\                const include_arg = b.fmt("-I{s}", .{cef_dir});
-        \\                const define_arg = b.fmt("-DZERO_NATIVE_CEF_DIR=\"{s}\"", .{cef_dir});
-        \\                const sdk_include = if (b.sysroot) |sysroot| b.fmt("-I{s}/usr/include", .{sysroot}) else "";
-        \\                const flags: []const []const u8 = if (b.sysroot) |sysroot| &.{ "-fobjc-arc", "-ObjC++", "-std=c++17", "-stdlib=libc++", "-mmacosx-version-min=11.0", "-isysroot", sysroot, sdk_include, include_arg, define_arg } else &.{ "-fobjc-arc", "-ObjC++", "-std=c++17", "-stdlib=libc++", "-mmacosx-version-min=11.0", include_arg, define_arg };
-        \\                app_mod.addCSourceFile(.{ .file = zeroNativePath(b, zero_native_path, "src/platform/macos/cef_host.mm"), .flags = flags });
+        \\                const define_arg = b.fmt("-DNATIVE_SDK_CEF_DIR=\"{s}\"", .{cef_dir});
+        \\                // The SDK's usr/include must stay a system include dir (searched after zig's
+        \\                // bundled libc++/libc headers). A plain -I shadows libc++'s <string.h>/<math.h>
+        \\                // wrappers in ObjC++ and surfaces SDK nullability gaps as a diagnostic flood.
+        \\                const sdk_include = if (b.sysroot) |sysroot| b.fmt("-isystem{s}/usr/include", .{sysroot}) else "";
+        \\                const flags: []const []const u8 = if (b.sysroot) |sysroot| &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC++", "-std=c++17", "-stdlib=libc++", "-mmacosx-version-min=11.0", "-isysroot", sysroot, sdk_include, include_arg, define_arg } else &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC++", "-std=c++17", "-stdlib=libc++", "-mmacosx-version-min=11.0", include_arg, define_arg };
+        \\                app_mod.addCSourceFile(.{ .file = nativeSdkPath(b, native_sdk_path, "src/platform/macos/cef_host.mm"), .flags = flags });
         \\                app_mod.addObjectFile(b.path(b.fmt("{s}/libcef_dll_wrapper/libcef_dll_wrapper.a", .{cef_dir})));
         \\                app_mod.addFrameworkPath(b.path(b.fmt("{s}/Release", .{cef_dir})));
         \\                app_mod.linkFramework("Chromium Embedded Framework", .{});
@@ -395,15 +1100,21 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\            app_mod.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "System/Library/Frameworks" }) });
         \\        }
         \\        app_mod.linkFramework("AppKit", .{});
+        \\        app_mod.linkFramework("AVFoundation", .{});
+        \\        app_mod.linkFramework("MediaToolbox", .{});
+        \\        app_mod.linkFramework("Accelerate", .{});
         \\        app_mod.linkFramework("Foundation", .{});
+        \\        app_mod.linkFramework("CoreText", .{});
         \\        app_mod.linkFramework("UniformTypeIdentifiers", .{});
         \\        app_mod.linkFramework("Security", .{});
+        \\        app_mod.linkFramework("Metal", .{});
+        \\        app_mod.linkFramework("QuartzCore", .{});
         \\        app_mod.linkSystemLibrary("c", .{});
         \\        if (web_engine == .chromium) app_mod.linkSystemLibrary("c++", .{});
         \\    } else if (platform == .linux) {
         \\        switch (web_engine) {
         \\            .system => {
-        \\                app_mod.addCSourceFile(.{ .file = zeroNativePath(b, zero_native_path, "src/platform/linux/gtk_host.c"), .flags = &.{} });
+        \\                app_mod.addCSourceFile(.{ .file = nativeSdkPath(b, native_sdk_path, "src/platform/linux/gtk_host.c"), .flags = &.{} });
         \\                app_mod.linkSystemLibrary("gtk4", .{});
         \\                app_mod.linkSystemLibrary("webkitgtk-6.0", .{});
         \\                app_mod.linkSystemLibrary("dl", .{});
@@ -411,13 +1122,13 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\            .chromium => {
         \\                const cef_check = addCefCheck(b, target, cef_dir);
         \\                if (cef_auto_install) {
-        \\                    const cef_auto = b.addSystemCommand(&.{ "zero-native", "cef", "install", "--dir", cef_dir });
+        \\                    const cef_auto = b.addSystemCommand(&.{ "native", "cef", "install", "--dir", cef_dir });
         \\                    cef_check.step.dependOn(&cef_auto.step);
         \\                }
         \\                exe.step.dependOn(&cef_check.step);
         \\                const include_arg = b.fmt("-I{s}", .{cef_dir});
-        \\                const define_arg = b.fmt("-DZERO_NATIVE_CEF_DIR=\"{s}\"", .{cef_dir});
-        \\                app_mod.addCSourceFile(.{ .file = zeroNativePath(b, zero_native_path, "src/platform/linux/cef_host.cpp"), .flags = &.{ "-std=c++17", include_arg, define_arg } });
+        \\                const define_arg = b.fmt("-DNATIVE_SDK_CEF_DIR=\"{s}\"", .{cef_dir});
+        \\                app_mod.addCSourceFile(.{ .file = nativeSdkPath(b, native_sdk_path, "src/platform/linux/cef_host.cpp"), .flags = &.{ "-std=c++17", include_arg, define_arg } });
         \\                app_mod.addObjectFile(b.path(b.fmt("{s}/libcef_dll_wrapper/libcef_dll_wrapper.a", .{cef_dir})));
         \\                app_mod.addLibraryPath(b.path(b.fmt("{s}/Release", .{cef_dir})));
         \\                app_mod.linkSystemLibrary("cef", .{});
@@ -428,17 +1139,17 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\        if (web_engine == .chromium) app_mod.linkSystemLibrary("stdc++", .{});
         \\    } else if (platform == .windows) {
         \\        switch (web_engine) {
-        \\            .system => app_mod.addCSourceFile(.{ .file = zeroNativePath(b, zero_native_path, "src/platform/windows/webview2_host.cpp"), .flags = &.{ "-std=c++17" } }),
+        \\            .system => app_mod.addCSourceFile(.{ .file = nativeSdkPath(b, native_sdk_path, "src/platform/windows/webview2_host.cpp"), .flags = &.{ "-std=c++17" } }),
         \\            .chromium => {
         \\                const cef_check = addCefCheck(b, target, cef_dir);
         \\                if (cef_auto_install) {
-        \\                    const cef_auto = b.addSystemCommand(&.{ "zero-native", "cef", "install", "--dir", cef_dir });
+        \\                    const cef_auto = b.addSystemCommand(&.{ "native", "cef", "install", "--dir", cef_dir });
         \\                    cef_check.step.dependOn(&cef_auto.step);
         \\                }
         \\                exe.step.dependOn(&cef_check.step);
         \\                const include_arg = b.fmt("-I{s}", .{cef_dir});
-        \\                const define_arg = b.fmt("-DZERO_NATIVE_CEF_DIR=\"{s}\"", .{cef_dir});
-        \\                app_mod.addCSourceFile(.{ .file = zeroNativePath(b, zero_native_path, "src/platform/windows/cef_host.cpp"), .flags = &.{ "-std=c++17", include_arg, define_arg } });
+        \\                const define_arg = b.fmt("-DNATIVE_SDK_CEF_DIR=\"{s}\"", .{cef_dir});
+        \\                app_mod.addCSourceFile(.{ .file = nativeSdkPath(b, native_sdk_path, "src/platform/windows/cef_host.cpp"), .flags = &.{ "-std=c++17", include_arg, define_arg } });
         \\                app_mod.addObjectFile(b.path(b.fmt("{s}/libcef_dll_wrapper/libcef_dll_wrapper.lib", .{cef_dir})));
         \\                app_mod.addLibraryPath(b.path(b.fmt("{s}/Release", .{cef_dir})));
         \\            },
@@ -446,10 +1157,17 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\        app_mod.linkSystemLibrary("c", .{});
         \\        app_mod.linkSystemLibrary("c++", .{});
         \\        app_mod.linkSystemLibrary("user32", .{});
+        \\        app_mod.linkSystemLibrary("gdi32", .{});
+        \\        app_mod.linkSystemLibrary("imm32", .{});
         \\        app_mod.linkSystemLibrary("comctl32", .{});
         \\        app_mod.linkSystemLibrary("ole32", .{});
         \\        app_mod.linkSystemLibrary("oleacc", .{});
         \\        app_mod.linkSystemLibrary("shell32", .{});
+        \\        // The audio backend: Media Foundation (session + source resolver
+        \\        // + streaming audio renderer) and WinHTTP (the cache fill).
+        \\        app_mod.linkSystemLibrary("mf", .{});
+        \\        app_mod.linkSystemLibrary("mfplat", .{});
+        \\        app_mod.linkSystemLibrary("winhttp", .{});
         \\        if (web_engine == .chromium) app_mod.linkSystemLibrary("libcef", .{});
         \\    }
         \\}
@@ -486,7 +1204,7 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\        \\  echo "  {s}/include/cef_app.h" >&2
         \\        \\  echo "  {s}/Release/Chromium Embedded Framework.framework" >&2
         \\        \\  echo "  {s}/libcef_dll_wrapper/libcef_dll_wrapper.a" >&2
-        \\        \\  echo "Fix with: zero-native cef install --dir {s}" >&2
+        \\        \\  echo "Fix with: native cef install --dir {s}" >&2
         \\        \\  echo "Or rerun with: -Dcef-auto-install=true" >&2
         \\        \\  echo "Pass -Dcef-dir=/path/to/cef if your bundle lives elsewhere." >&2
         \\        \\  exit 1
@@ -497,7 +1215,7 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\        \\test -f "{s}/Release/libcef.so" &&
         \\        \\test -f "{s}/libcef_dll_wrapper/libcef_dll_wrapper.a" || {{
         \\        \\  echo "missing CEF dependency for -Dweb-engine=chromium" >&2
-        \\        \\  echo "Fix with: zero-native cef install --dir {s}" >&2
+        \\        \\  echo "Fix with: native cef install --dir {s}" >&2
         \\        \\  exit 1
         \\        \\}}
         \\        , .{ cef_dir, cef_dir, cef_dir, cef_dir }),
@@ -506,7 +1224,7 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\        \\test -f "{s}/Release/libcef.dll" &&
         \\        \\test -f "{s}/libcef_dll_wrapper/libcef_dll_wrapper.lib" || {{
         \\        \\  echo "missing CEF dependency for -Dweb-engine=chromium" >&2
-        \\        \\  echo "Fix with: zero-native cef install --dir {s}" >&2
+        \\        \\  echo "Fix with: native cef install --dir {s}" >&2
         \\        \\  exit 1
         \\        \\}}
         \\        , .{ cef_dir, cef_dir, cef_dir, cef_dir }),
@@ -629,14 +1347,14 @@ fn mainZig(allocator: std.mem.Allocator, names: TemplateNames, frontend: Fronten
     try out.appendSlice(allocator,
         \\const std = @import("std");
         \\const runner = @import("runner");
-        \\const zero_native = @import("zero-native");
+        \\const native_sdk = @import("native_sdk");
         \\
-        \\pub const panic = std.debug.FullPanic(zero_native.debug.capturePanic);
+        \\pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
         \\
         \\const App = struct {
         \\    env_map: *std.process.Environ.Map,
         \\
-        \\    fn app(self: *@This()) zero_native.App {
+        \\    fn app(self: *@This()) native_sdk.App {
         \\        return .{
         \\            .context = self,
         \\            .name =
@@ -644,7 +1362,7 @@ fn mainZig(allocator: std.mem.Allocator, names: TemplateNames, frontend: Fronten
     try appendZigString(&out, allocator, names.package_name);
     try out.appendSlice(allocator,
         \\,
-        \\            .source = zero_native.frontend.productionSource(.{ .dist =
+        \\            .source = native_sdk.frontend.productionSource(.{ .dist =
     );
     try appendZigString(&out, allocator, frontend.distDir());
     try out.appendSlice(allocator,
@@ -653,9 +1371,9 @@ fn mainZig(allocator: std.mem.Allocator, names: TemplateNames, frontend: Fronten
         \\        };
         \\    }
         \\
-        \\    fn source(context: *anyopaque) anyerror!zero_native.WebViewSource {
+        \\    fn source(context: *anyopaque) anyerror!native_sdk.WebViewSource {
         \\        const self: *@This() = @ptrCast(@alignCast(context));
-        \\        return zero_native.frontend.sourceFromEnv(self.env_map, .{
+        \\        return native_sdk.frontend.sourceFromEnv(self.env_map, .{
         \\            .dist =
     );
     try appendZigString(&out, allocator, frontend.distDir());
@@ -693,7 +1411,7 @@ fn mainZig(allocator: std.mem.Allocator, names: TemplateNames, frontend: Fronten
     try appendZigString(&out, allocator, names.app_id);
     try out.appendSlice(allocator,
         \\,
-        \\        .icon_path = "assets/icon.icns",
+        \\        .icon_path = "assets/icon.png",
         \\        .security = .{
         \\            .navigation = .{ .allowed_origins = &dev_origins },
         \\        },
@@ -720,7 +1438,7 @@ fn runnerZig() []const u8 {
     return
     \\const std = @import("std");
     \\const build_options = @import("build_options");
-    \\const zero_native = @import("zero-native");
+    \\const native_sdk = @import("native_sdk");
     \\const app_manifest = @import("app_manifest_zon");
     \\const manifest_commands = if (@hasField(@TypeOf(app_manifest), "commands")) app_manifest.commands else .{};
     \\const manifest_shortcuts = if (@hasField(@TypeOf(app_manifest), "shortcuts")) app_manifest.shortcuts else .{};
@@ -728,17 +1446,17 @@ fn runnerZig() []const u8 {
     \\const manifest_windows = if (@hasField(@TypeOf(app_manifest), "windows")) app_manifest.windows else .{};
     \\
     \\pub const StdoutTraceSink = struct {
-    \\    pub fn sink(self: *StdoutTraceSink) zero_native.trace.Sink {
+    \\    pub fn sink(self: *StdoutTraceSink) native_sdk.trace.Sink {
     \\        return .{ .context = self, .write_fn = write };
     \\    }
     \\
-    \\    fn write(context: *anyopaque, record: zero_native.trace.Record) zero_native.trace.WriteError!void {
+    \\    fn write(context: *anyopaque, record: native_sdk.trace.Record) native_sdk.trace.WriteError!void {
     \\        _ = context;
     \\        if (!shouldTrace(record)) return;
-    \\        var buffer: [1024]u8 = undefined;
-    \\        var writer = std.Io.Writer.fixed(&buffer);
-    \\        zero_native.trace.formatText(record, &writer) catch return error.OutOfSpace;
-    \\        std.debug.print("{s}\n", .{writer.buffered()});
+    \\        // Never fail on an oversized record: logging failures must
+    \\        // degrade (truncated output), not fail dispatch upstream.
+    \\        var buffer: [4096]u8 = undefined;
+    \\        std.debug.print("{s}\n", .{native_sdk.trace.formatTextBounded(record, &buffer)});
     \\    }
     \\};
     \\
@@ -746,17 +1464,17 @@ fn runnerZig() []const u8 {
     \\    app_name: []const u8,
     \\    window_title: []const u8 = "",
     \\    bundle_id: []const u8,
-    \\    icon_path: []const u8 = "assets/icon.icns",
-    \\    bridge: ?zero_native.BridgeDispatcher = null,
-    \\    builtin_bridge: zero_native.BridgePolicy = .{},
-    \\    security: zero_native.SecurityPolicy = .{},
+    \\    icon_path: []const u8 = "assets/icon.png",
+    \\    bridge: ?native_sdk.BridgeDispatcher = null,
+    \\    builtin_bridge: native_sdk.BridgePolicy = .{},
+    \\    security: native_sdk.SecurityPolicy = .{},
     \\    js_window_api: bool = false,
-    \\    commands: ?[]const zero_native.Command = null,
-    \\    menus: ?[]const zero_native.Menu = null,
-    \\    shortcuts: ?[]const zero_native.Shortcut = null,
+    \\    commands: ?[]const native_sdk.Command = null,
+    \\    menus: ?[]const native_sdk.Menu = null,
+    \\    shortcuts: ?[]const native_sdk.Shortcut = null,
     \\
-    \\    fn appInfo(self: RunOptions, buffers: *StateBuffers) zero_native.AppInfo {
-    \\        var info: zero_native.AppInfo = .{
+    \\    fn appInfo(self: RunOptions, buffers: *StateBuffers) native_sdk.AppInfo {
+    \\        var info: native_sdk.AppInfo = .{
     \\            .app_name = self.app_name,
     \\            .window_title = self.window_title,
     \\            .bundle_id = self.bundle_id,
@@ -770,25 +1488,25 @@ fn runnerZig() []const u8 {
     \\        return info;
     \\    }
     \\
-    \\    fn resolvedShortcuts(self: RunOptions, storage: *ShortcutStorage) []const zero_native.Shortcut {
+    \\    fn resolvedShortcuts(self: RunOptions, storage: *ShortcutStorage) []const native_sdk.Shortcut {
     \\        return self.shortcuts orelse storage.fromManifest();
     \\    }
     \\
-    \\    fn resolvedCommands(self: RunOptions, storage: *CommandStorage) []const zero_native.Command {
+    \\    fn resolvedCommands(self: RunOptions, storage: *CommandStorage) []const native_sdk.Command {
     \\        return self.commands orelse storage.fromManifest();
     \\    }
     \\
-    \\    fn resolvedMenus(self: RunOptions, storage: *MenuStorage) []const zero_native.Menu {
+    \\    fn resolvedMenus(self: RunOptions, storage: *MenuStorage) []const native_sdk.Menu {
     \\        return self.menus orelse storage.fromManifest();
     \\    }
     \\};
     \\
     \\const CommandStorage = struct {
-    \\    commands: [zero_native.app_manifest.max_commands]zero_native.Command = undefined,
+    \\    commands: [native_sdk.app_manifest.max_commands]native_sdk.Command = undefined,
     \\
-    \\    fn fromManifest(self: *CommandStorage) []const zero_native.Command {
+    \\    fn fromManifest(self: *CommandStorage) []const native_sdk.Command {
     \\        comptime {
-    \\            if (manifest_commands.len > zero_native.app_manifest.max_commands) {
+    \\            if (manifest_commands.len > native_sdk.app_manifest.max_commands) {
     \\                @compileError("app.zon defines too many commands");
     \\            }
     \\        }
@@ -806,12 +1524,12 @@ fn runnerZig() []const u8 {
     \\};
     \\
     \\const MenuStorage = struct {
-    \\    menus: [zero_native.platform.max_menus]zero_native.Menu = undefined,
-    \\    items: [zero_native.platform.max_menu_items]zero_native.MenuItem = undefined,
+    \\    menus: [native_sdk.platform.max_menus]native_sdk.Menu = undefined,
+    \\    items: [native_sdk.platform.max_menu_items]native_sdk.MenuItem = undefined,
     \\
-    \\    fn fromManifest(self: *MenuStorage) []const zero_native.Menu {
+    \\    fn fromManifest(self: *MenuStorage) []const native_sdk.Menu {
     \\        comptime {
-    \\            if (manifest_menus.len > zero_native.platform.max_menus) {
+    \\            if (manifest_menus.len > native_sdk.platform.max_menus) {
     \\                @compileError("app.zon defines too many menus");
     \\            }
     \\            var item_count: usize = 0;
@@ -819,7 +1537,7 @@ fn runnerZig() []const u8 {
     \\                const items = if (@hasField(@TypeOf(menu), "items")) menu.items else .{};
     \\                item_count += items.len;
     \\            }
-    \\            if (item_count > zero_native.platform.max_menu_items) {
+    \\            if (item_count > native_sdk.platform.max_menu_items) {
     \\                @compileError("app.zon defines too many menu items");
     \\            }
     \\        }
@@ -842,11 +1560,11 @@ fn runnerZig() []const u8 {
     \\};
     \\
     \\const ShortcutStorage = struct {
-    \\    shortcuts: [zero_native.platform.max_shortcuts]zero_native.Shortcut = undefined,
+    \\    shortcuts: [native_sdk.platform.max_shortcuts]native_sdk.Shortcut = undefined,
     \\
-    \\    fn fromManifest(self: *ShortcutStorage) []const zero_native.Shortcut {
+    \\    fn fromManifest(self: *ShortcutStorage) []const native_sdk.Shortcut {
     \\        comptime {
-    \\            if (manifest_shortcuts.len > zero_native.platform.max_shortcuts) {
+    \\            if (manifest_shortcuts.len > native_sdk.platform.max_shortcuts) {
     \\                @compileError("app.zon defines too many shortcuts");
     \\            }
     \\        }
@@ -862,9 +1580,9 @@ fn runnerZig() []const u8 {
     \\    }
     \\};
     \\
-    \\fn manifestWindowOptions(buffers: *StateBuffers) []const zero_native.WindowOptions {
+    \\fn manifestWindowOptions(buffers: *StateBuffers) []const native_sdk.WindowOptions {
     \\    comptime {
-    \\        if (manifest_windows.len > zero_native.platform.max_windows) {
+    \\        if (manifest_windows.len > native_sdk.platform.max_windows) {
     \\            @compileError("app.zon defines too many windows");
     \\        }
     \\    }
@@ -875,12 +1593,12 @@ fn runnerZig() []const u8 {
     \\    return buffers.restored_windows[0..manifest_windows.len];
     \\}
     \\
-    \\fn manifestWindow(comptime window: anytype, comptime index: usize) zero_native.WindowOptions {
+    \\fn manifestWindow(comptime window: anytype, comptime index: usize) native_sdk.WindowOptions {
     \\    return .{
     \\        .id = index + 1,
     \\        .label = windowLabel(window, index),
     \\        .title = windowTitle(window),
-    \\        .default_frame = zero_native.geometry.RectF.init(
+    \\        .default_frame = native_sdk.geometry.RectF.init(
     \\            windowFloat(window, "x", 0),
     \\            windowFloat(window, "y", 0),
     \\            windowFloat(window, "width", 720),
@@ -914,7 +1632,7 @@ fn runnerZig() []const u8 {
     \\    return default_value;
     \\}
     \\
-    \\fn windowRestorePolicy(comptime window: anytype) zero_native.WindowRestorePolicy {
+    \\fn windowRestorePolicy(comptime window: anytype) native_sdk.WindowRestorePolicy {
     \\    if (comptime !@hasField(@TypeOf(window), "restore_policy")) return .clamp_to_visible_screen;
     \\    const value = window.restore_policy;
     \\    if (comptime std.mem.eql(u8, value, "clamp_to_visible_screen")) return .clamp_to_visible_screen;
@@ -922,7 +1640,7 @@ fn runnerZig() []const u8 {
     \\    @compileError("unknown app.zon window restore_policy");
     \\}
     \\
-    \\fn menuItem(comptime item: anytype) zero_native.MenuItem {
+    \\fn menuItem(comptime item: anytype) native_sdk.MenuItem {
     \\    return .{
     \\        .label = if (@hasField(@TypeOf(item), "label")) item.label else "",
     \\        .command = if (@hasField(@TypeOf(item), "command")) item.command else "",
@@ -934,9 +1652,9 @@ fn runnerZig() []const u8 {
     \\    };
     \\}
     \\
-    \\fn shortcutModifiers(comptime shortcut: anytype) zero_native.ShortcutModifiers {
+    \\fn shortcutModifiers(comptime shortcut: anytype) native_sdk.ShortcutModifiers {
     \\    const values = if (@hasField(@TypeOf(shortcut), "modifiers")) shortcut.modifiers else .{};
-    \\    var modifiers: zero_native.ShortcutModifiers = .{};
+    \\    var modifiers: native_sdk.ShortcutModifiers = .{};
     \\    inline for (values) |value| {
     \\        const modifier: []const u8 = value;
     \\        if (comptime std.mem.eql(u8, modifier, "primary")) {
@@ -956,7 +1674,7 @@ fn runnerZig() []const u8 {
     \\    return modifiers;
     \\}
     \\
-    \\pub fn runWithOptions(app: zero_native.App, options: RunOptions, init: std.process.Init) !void {
+    \\pub fn runWithOptions(app: native_sdk.App, options: RunOptions, init: std.process.Init) !void {
     \\    if (build_options.debug_overlay) {
     \\        std.debug.print("debug-overlay=true backend={s} web-engine={s} trace={s}\n", .{ build_options.platform, build_options.web_engine, build_options.trace });
     \\    }
@@ -971,21 +1689,21 @@ fn runnerZig() []const u8 {
     \\    }
     \\}
     \\
-    \\fn runNull(app: zero_native.App, options: RunOptions, init: std.process.Init) !void {
+    \\fn runNull(app: native_sdk.App, options: RunOptions, init: std.process.Init) !void {
     \\    var buffers: StateBuffers = undefined;
     \\    var app_info = options.appInfo(&buffers);
     \\    const store = prepareStateStore(init.io, init.environ_map, &app_info, &buffers);
-    \\    var null_platform = zero_native.NullPlatform.initWithOptions(.{}, webEngine(), app_info);
+    \\    var null_platform = native_sdk.NullPlatform.initWithOptions(.{}, webEngine(), app_info);
     \\    var trace_sink = StdoutTraceSink{};
-    \\    var log_buffers: zero_native.debug.LogPathBuffers = .{};
-    \\    const log_setup = zero_native.debug.setupLogging(init.io, init.environ_map, app_info.bundle_id, &log_buffers) catch null;
-    \\    if (log_setup) |setup| zero_native.debug.installPanicCapture(init.io, setup.paths);
-    \\    var file_trace_sink: zero_native.debug.FileTraceSink = undefined;
-    \\    var fanout_sinks: [2]zero_native.trace.Sink = undefined;
-    \\    var fanout_sink: zero_native.debug.FanoutTraceSink = undefined;
+    \\    var log_buffers: native_sdk.debug.LogPathBuffers = .{};
+    \\    const log_setup = native_sdk.debug.setupLogging(init.io, init.environ_map, app_info.bundle_id, &log_buffers) catch null;
+    \\    if (log_setup) |setup| native_sdk.debug.installPanicCapture(init.io, setup.paths);
+    \\    var file_trace_sink: native_sdk.debug.FileTraceSink = undefined;
+    \\    var fanout_sinks: [2]native_sdk.trace.Sink = undefined;
+    \\    var fanout_sink: native_sdk.debug.FanoutTraceSink = undefined;
     \\    var runtime_trace_sink = trace_sink.sink();
     \\    if (log_setup) |setup| {
-    \\        file_trace_sink = zero_native.debug.FileTraceSink.init(init.io, setup.paths.log_dir, setup.paths.log_file, setup.format);
+    \\        file_trace_sink = native_sdk.debug.FileTraceSink.init(init.io, setup.paths.log_dir, setup.paths.log_file, setup.format);
     \\        fanout_sinks = .{ trace_sink.sink(), file_trace_sink.sink() };
     \\        fanout_sink = .{ .sinks = &fanout_sinks };
     \\        runtime_trace_sink = fanout_sink.sink();
@@ -996,7 +1714,11 @@ fn runnerZig() []const u8 {
     \\    const menus = options.resolvedMenus(&menu_storage);
     \\    var command_storage: CommandStorage = .{};
     \\    const commands = options.resolvedCommands(&command_storage);
-    \\    var runtime = zero_native.Runtime.init(.{
+    \\    // The Runtime is multi-megabyte; default thread stacks overflow on a
+    \\    // stack instance, so construct it on the heap.
+    \\    const runtime = try std.heap.page_allocator.create(native_sdk.Runtime);
+    \\    defer std.heap.page_allocator.destroy(runtime);
+    \\    native_sdk.Runtime.initAt(runtime, .{
     \\        .platform = null_platform.platform(),
     \\        .trace_sink = runtime_trace_sink,
     \\        .log_path = if (log_setup) |setup| setup.paths.log_file else null,
@@ -1007,29 +1729,30 @@ fn runnerZig() []const u8 {
     \\        .commands = commands,
     \\        .menus = menus,
     \\        .shortcuts = shortcuts,
-    \\        .automation = if (build_options.automation) zero_native.automation.Server.init(init.io, ".zig-cache/zero-native-automation", app_info.resolvedWindowTitle()) else null,
+    \\        .automation = if (build_options.automation) native_sdk.automation.Server.init(init.io, ".zig-cache/native-sdk-automation", app_info.resolvedWindowTitle()) else null,
     \\        .window_state_store = store,
+    \\        .environ = init.minimal.environ,
     \\    });
     \\
     \\    try runtime.run(app);
     \\}
     \\
-    \\fn runMacos(app: zero_native.App, options: RunOptions, init: std.process.Init) !void {
+    \\fn runMacos(app: native_sdk.App, options: RunOptions, init: std.process.Init) !void {
     \\    var buffers: StateBuffers = undefined;
     \\    var app_info = options.appInfo(&buffers);
     \\    const store = prepareStateStore(init.io, init.environ_map, &app_info, &buffers);
-    \\    var mac_platform = try zero_native.platform.macos.MacPlatform.initWithOptions(zero_native.geometry.SizeF.init(720, 480), webEngine(), app_info);
+    \\    var mac_platform = try native_sdk.platform.macos.MacPlatform.initWithOptions(native_sdk.geometry.SizeF.init(720, 480), webEngine(), app_info);
     \\    defer mac_platform.deinit();
     \\    var trace_sink = StdoutTraceSink{};
-    \\    var log_buffers: zero_native.debug.LogPathBuffers = .{};
-    \\    const log_setup = zero_native.debug.setupLogging(init.io, init.environ_map, app_info.bundle_id, &log_buffers) catch null;
-    \\    if (log_setup) |setup| zero_native.debug.installPanicCapture(init.io, setup.paths);
-    \\    var file_trace_sink: zero_native.debug.FileTraceSink = undefined;
-    \\    var fanout_sinks: [2]zero_native.trace.Sink = undefined;
-    \\    var fanout_sink: zero_native.debug.FanoutTraceSink = undefined;
+    \\    var log_buffers: native_sdk.debug.LogPathBuffers = .{};
+    \\    const log_setup = native_sdk.debug.setupLogging(init.io, init.environ_map, app_info.bundle_id, &log_buffers) catch null;
+    \\    if (log_setup) |setup| native_sdk.debug.installPanicCapture(init.io, setup.paths);
+    \\    var file_trace_sink: native_sdk.debug.FileTraceSink = undefined;
+    \\    var fanout_sinks: [2]native_sdk.trace.Sink = undefined;
+    \\    var fanout_sink: native_sdk.debug.FanoutTraceSink = undefined;
     \\    var runtime_trace_sink = trace_sink.sink();
     \\    if (log_setup) |setup| {
-    \\        file_trace_sink = zero_native.debug.FileTraceSink.init(init.io, setup.paths.log_dir, setup.paths.log_file, setup.format);
+    \\        file_trace_sink = native_sdk.debug.FileTraceSink.init(init.io, setup.paths.log_dir, setup.paths.log_file, setup.format);
     \\        fanout_sinks = .{ trace_sink.sink(), file_trace_sink.sink() };
     \\        fanout_sink = .{ .sinks = &fanout_sinks };
     \\        runtime_trace_sink = fanout_sink.sink();
@@ -1040,7 +1763,11 @@ fn runnerZig() []const u8 {
     \\    const menus = options.resolvedMenus(&menu_storage);
     \\    var command_storage: CommandStorage = .{};
     \\    const commands = options.resolvedCommands(&command_storage);
-    \\    var runtime = zero_native.Runtime.init(.{
+    \\    // The Runtime is multi-megabyte; default thread stacks overflow on a
+    \\    // stack instance, so construct it on the heap.
+    \\    const runtime = try std.heap.page_allocator.create(native_sdk.Runtime);
+    \\    defer std.heap.page_allocator.destroy(runtime);
+    \\    native_sdk.Runtime.initAt(runtime, .{
     \\        .platform = mac_platform.platform(),
     \\        .trace_sink = runtime_trace_sink,
     \\        .log_path = if (log_setup) |setup| setup.paths.log_file else null,
@@ -1051,29 +1778,30 @@ fn runnerZig() []const u8 {
     \\        .commands = commands,
     \\        .menus = menus,
     \\        .shortcuts = shortcuts,
-    \\        .automation = if (build_options.automation) zero_native.automation.Server.init(init.io, ".zig-cache/zero-native-automation", app_info.resolvedWindowTitle()) else null,
+    \\        .automation = if (build_options.automation) native_sdk.automation.Server.init(init.io, ".zig-cache/native-sdk-automation", app_info.resolvedWindowTitle()) else null,
     \\        .window_state_store = store,
+    \\        .environ = init.minimal.environ,
     \\    });
     \\
     \\    try runtime.run(app);
     \\}
     \\
-    \\fn runLinux(app: zero_native.App, options: RunOptions, init: std.process.Init) !void {
+    \\fn runLinux(app: native_sdk.App, options: RunOptions, init: std.process.Init) !void {
     \\    var buffers: StateBuffers = undefined;
     \\    var app_info = options.appInfo(&buffers);
     \\    const store = prepareStateStore(init.io, init.environ_map, &app_info, &buffers);
-    \\    var linux_platform = try zero_native.platform.linux.LinuxPlatform.initWithOptions(zero_native.geometry.SizeF.init(720, 480), webEngine(), app_info);
+    \\    var linux_platform = try native_sdk.platform.linux.LinuxPlatform.initWithOptions(native_sdk.geometry.SizeF.init(720, 480), webEngine(), app_info);
     \\    defer linux_platform.deinit();
     \\    var trace_sink = StdoutTraceSink{};
-    \\    var log_buffers: zero_native.debug.LogPathBuffers = .{};
-    \\    const log_setup = zero_native.debug.setupLogging(init.io, init.environ_map, app_info.bundle_id, &log_buffers) catch null;
-    \\    if (log_setup) |setup| zero_native.debug.installPanicCapture(init.io, setup.paths);
-    \\    var file_trace_sink: zero_native.debug.FileTraceSink = undefined;
-    \\    var fanout_sinks: [2]zero_native.trace.Sink = undefined;
-    \\    var fanout_sink: zero_native.debug.FanoutTraceSink = undefined;
+    \\    var log_buffers: native_sdk.debug.LogPathBuffers = .{};
+    \\    const log_setup = native_sdk.debug.setupLogging(init.io, init.environ_map, app_info.bundle_id, &log_buffers) catch null;
+    \\    if (log_setup) |setup| native_sdk.debug.installPanicCapture(init.io, setup.paths);
+    \\    var file_trace_sink: native_sdk.debug.FileTraceSink = undefined;
+    \\    var fanout_sinks: [2]native_sdk.trace.Sink = undefined;
+    \\    var fanout_sink: native_sdk.debug.FanoutTraceSink = undefined;
     \\    var runtime_trace_sink = trace_sink.sink();
     \\    if (log_setup) |setup| {
-    \\        file_trace_sink = zero_native.debug.FileTraceSink.init(init.io, setup.paths.log_dir, setup.paths.log_file, setup.format);
+    \\        file_trace_sink = native_sdk.debug.FileTraceSink.init(init.io, setup.paths.log_dir, setup.paths.log_file, setup.format);
     \\        fanout_sinks = .{ trace_sink.sink(), file_trace_sink.sink() };
     \\        fanout_sink = .{ .sinks = &fanout_sinks };
     \\        runtime_trace_sink = fanout_sink.sink();
@@ -1084,7 +1812,11 @@ fn runnerZig() []const u8 {
     \\    const menus = options.resolvedMenus(&menu_storage);
     \\    var command_storage: CommandStorage = .{};
     \\    const commands = options.resolvedCommands(&command_storage);
-    \\    var runtime = zero_native.Runtime.init(.{
+    \\    // The Runtime is multi-megabyte; default thread stacks overflow on a
+    \\    // stack instance, so construct it on the heap.
+    \\    const runtime = try std.heap.page_allocator.create(native_sdk.Runtime);
+    \\    defer std.heap.page_allocator.destroy(runtime);
+    \\    native_sdk.Runtime.initAt(runtime, .{
     \\        .platform = linux_platform.platform(),
     \\        .trace_sink = runtime_trace_sink,
     \\        .log_path = if (log_setup) |setup| setup.paths.log_file else null,
@@ -1095,29 +1827,30 @@ fn runnerZig() []const u8 {
     \\        .commands = commands,
     \\        .menus = menus,
     \\        .shortcuts = shortcuts,
-    \\        .automation = if (build_options.automation) zero_native.automation.Server.init(init.io, ".zig-cache/zero-native-automation", app_info.resolvedWindowTitle()) else null,
+    \\        .automation = if (build_options.automation) native_sdk.automation.Server.init(init.io, ".zig-cache/native-sdk-automation", app_info.resolvedWindowTitle()) else null,
     \\        .window_state_store = store,
+    \\        .environ = init.minimal.environ,
     \\    });
     \\
     \\    try runtime.run(app);
     \\}
     \\
-    \\fn runWindows(app: zero_native.App, options: RunOptions, init: std.process.Init) !void {
+    \\fn runWindows(app: native_sdk.App, options: RunOptions, init: std.process.Init) !void {
     \\    var buffers: StateBuffers = undefined;
     \\    var app_info = options.appInfo(&buffers);
     \\    const store = prepareStateStore(init.io, init.environ_map, &app_info, &buffers);
-    \\    var windows_platform = try zero_native.platform.windows.WindowsPlatform.initWithOptions(zero_native.geometry.SizeF.init(720, 480), webEngine(), app_info);
+    \\    var windows_platform = try native_sdk.platform.windows.WindowsPlatform.initWithOptions(native_sdk.geometry.SizeF.init(720, 480), webEngine(), app_info);
     \\    defer windows_platform.deinit();
     \\    var trace_sink = StdoutTraceSink{};
-    \\    var log_buffers: zero_native.debug.LogPathBuffers = .{};
-    \\    const log_setup = zero_native.debug.setupLogging(init.io, init.environ_map, app_info.bundle_id, &log_buffers) catch null;
-    \\    if (log_setup) |setup| zero_native.debug.installPanicCapture(init.io, setup.paths);
-    \\    var file_trace_sink: zero_native.debug.FileTraceSink = undefined;
-    \\    var fanout_sinks: [2]zero_native.trace.Sink = undefined;
-    \\    var fanout_sink: zero_native.debug.FanoutTraceSink = undefined;
+    \\    var log_buffers: native_sdk.debug.LogPathBuffers = .{};
+    \\    const log_setup = native_sdk.debug.setupLogging(init.io, init.environ_map, app_info.bundle_id, &log_buffers) catch null;
+    \\    if (log_setup) |setup| native_sdk.debug.installPanicCapture(init.io, setup.paths);
+    \\    var file_trace_sink: native_sdk.debug.FileTraceSink = undefined;
+    \\    var fanout_sinks: [2]native_sdk.trace.Sink = undefined;
+    \\    var fanout_sink: native_sdk.debug.FanoutTraceSink = undefined;
     \\    var runtime_trace_sink = trace_sink.sink();
     \\    if (log_setup) |setup| {
-    \\        file_trace_sink = zero_native.debug.FileTraceSink.init(init.io, setup.paths.log_dir, setup.paths.log_file, setup.format);
+    \\        file_trace_sink = native_sdk.debug.FileTraceSink.init(init.io, setup.paths.log_dir, setup.paths.log_file, setup.format);
     \\        fanout_sinks = .{ trace_sink.sink(), file_trace_sink.sink() };
     \\        fanout_sink = .{ .sinks = &fanout_sinks };
     \\        runtime_trace_sink = fanout_sink.sink();
@@ -1128,7 +1861,11 @@ fn runnerZig() []const u8 {
     \\    const menus = options.resolvedMenus(&menu_storage);
     \\    var command_storage: CommandStorage = .{};
     \\    const commands = options.resolvedCommands(&command_storage);
-    \\    var runtime = zero_native.Runtime.init(.{
+    \\    // The Runtime is multi-megabyte; default thread stacks overflow on a
+    \\    // stack instance, so construct it on the heap.
+    \\    const runtime = try std.heap.page_allocator.create(native_sdk.Runtime);
+    \\    defer std.heap.page_allocator.destroy(runtime);
+    \\    native_sdk.Runtime.initAt(runtime, .{
     \\        .platform = windows_platform.platform(),
     \\        .trace_sink = runtime_trace_sink,
     \\        .log_path = if (log_setup) |setup| setup.paths.log_file else null,
@@ -1139,21 +1876,22 @@ fn runnerZig() []const u8 {
     \\        .commands = commands,
     \\        .menus = menus,
     \\        .shortcuts = shortcuts,
-    \\        .automation = if (build_options.automation) zero_native.automation.Server.init(init.io, ".zig-cache/zero-native-automation", app_info.resolvedWindowTitle()) else null,
+    \\        .automation = if (build_options.automation) native_sdk.automation.Server.init(init.io, ".zig-cache/native-sdk-automation", app_info.resolvedWindowTitle()) else null,
     \\        .window_state_store = store,
+    \\        .environ = init.minimal.environ,
     \\    });
     \\
     \\    try runtime.run(app);
     \\}
     \\
-    \\fn shouldTrace(record: zero_native.trace.Record) bool {
+    \\fn shouldTrace(record: native_sdk.trace.Record) bool {
     \\    if (comptime std.mem.eql(u8, build_options.trace, "off")) return false;
     \\    if (comptime std.mem.eql(u8, build_options.trace, "all")) return true;
     \\    if (comptime std.mem.eql(u8, build_options.trace, "events")) return true;
     \\    return std.mem.indexOf(u8, record.name, build_options.trace) != null;
     \\}
     \\
-    \\fn webEngine() zero_native.WebEngine {
+    \\fn webEngine() native_sdk.WebEngine {
     \\    if (comptime std.mem.eql(u8, build_options.web_engine, "chromium")) return .chromium;
     \\    return .system;
     \\}
@@ -1162,12 +1900,12 @@ fn runnerZig() []const u8 {
     \\    state_dir: [1024]u8 = undefined,
     \\    file_path: [1200]u8 = undefined,
     \\    read: [8192]u8 = undefined,
-    \\    restored_windows: [zero_native.platform.max_windows]zero_native.WindowOptions = undefined,
+    \\    restored_windows: [native_sdk.platform.max_windows]native_sdk.WindowOptions = undefined,
     \\};
     \\
-    \\fn prepareStateStore(io: std.Io, env_map: *std.process.Environ.Map, app_info: *zero_native.AppInfo, buffers: *StateBuffers) ?zero_native.window_state.Store {
-    \\    const paths = zero_native.window_state.defaultPaths(&buffers.state_dir, &buffers.file_path, app_info.bundle_id, zero_native.debug.envFromMap(env_map)) catch return null;
-    \\    const store = zero_native.window_state.Store.init(io, paths.state_dir, paths.file_path);
+    \\fn prepareStateStore(io: std.Io, env_map: *std.process.Environ.Map, app_info: *native_sdk.AppInfo, buffers: *StateBuffers) ?native_sdk.window_state.Store {
+    \\    const paths = native_sdk.window_state.defaultPaths(&buffers.state_dir, &buffers.file_path, app_info.bundle_id, native_sdk.debug.envFromMap(env_map)) catch return null;
+    \\    const store = native_sdk.window_state.Store.init(io, paths.state_dir, paths.file_path);
     \\    if (app_info.windows.len > 0) {
     \\        const restored_windows = buffers.restored_windows[0..app_info.windows.len];
     \\        for (restored_windows, 0..) |*window, index| {
@@ -1209,7 +1947,7 @@ fn appZon(allocator: std.mem.Allocator, names: TemplateNames, frontend: Frontend
     try out.appendSlice(allocator,
         \\,
         \\    .version = "0.1.0",
-        \\    .icons = .{ "assets/icon.icns" },
+        \\    .icons = .{ "assets/icon.png" },
         \\    .platforms = .{ "macos", "linux" },
         \\    .permissions = .{},
         \\    .capabilities = .{ "webview" },
@@ -1275,6 +2013,9 @@ fn writeFrontendFiles(allocator: std.mem.Allocator, io: std.Io, app_dir: std.Io.
         .react => try writeReactFrontend(allocator, io, app_dir, names),
         .svelte => try writeSvelteFrontend(allocator, io, app_dir, names),
         .vue => try writeVueFrontend(allocator, io, app_dir, names),
+        // Native apps never reach here: writeDefaultApp dispatches to
+        // writeNativeApp before any frontend files are written.
+        .native => unreachable,
     }
 }
 
@@ -1464,7 +2205,7 @@ fn nextPage(allocator: std.mem.Allocator, names: TemplateNames) ![]const u8 {
         \\
         \\  return (
         \\    <main>
-        \\      <p className="eyebrow">zero-native + Next.js</p>
+        \\      <p className="eyebrow">Native SDK + Next.js</p>
         \\      <h1>
     );
     try out.appendSlice(allocator, names.display_name);
@@ -1525,7 +2266,7 @@ fn viteIndexHtml(allocator: std.mem.Allocator, names: TemplateNames) ![]const u8
         \\  </head>
         \\  <body>
         \\    <main id="app">
-        \\      <p class="eyebrow">zero-native + Vite</p>
+        \\      <p class="eyebrow">Native SDK + Vite</p>
         \\      <h1>
     );
     try out.appendSlice(allocator, names.display_name);
@@ -1715,7 +2456,7 @@ fn reactAppTsx(allocator: std.mem.Allocator, names: TemplateNames) ![]const u8 {
         \\
         \\  return (
         \\    <main>
-        \\      <p className="eyebrow">zero-native + React</p>
+        \\      <p className="eyebrow">Native SDK + React</p>
         \\      <h1>
     );
     try out.appendSlice(allocator, names.display_name);
@@ -1832,7 +2573,7 @@ fn svelteAppComponent(names: TemplateNames) []const u8 {
     \\</script>
     \\
     \\<main>
-    \\  <p class="eyebrow">zero-native + Svelte</p>
+    \\  <p class="eyebrow">Native SDK + Svelte</p>
     \\  <h1>App</h1>
     \\  <p class="lede">A Svelte frontend running inside the system WebView.</p>
     \\  <div class="card">
@@ -1935,7 +2676,7 @@ fn vueAppComponent(names: TemplateNames) []const u8 {
     \\
     \\<template>
     \\  <main>
-    \\    <p class="eyebrow">zero-native + Vue</p>
+    \\    <p class="eyebrow">Native SDK + Vue</p>
     \\    <h1>App</h1>
     \\    <p class="lede">A Vue frontend running inside the system WebView.</p>
     \\    <div class="card">
@@ -1956,7 +2697,7 @@ fn readme(allocator: std.mem.Allocator, names: TemplateNames, framework_path: []
     try out.appendSlice(allocator,
         \\
         \\
-        \\A minimal zero-native desktop app with a web frontend.
+        \\A minimal native-sdk desktop app with a web frontend.
         \\
         \\## Setup
         \\
@@ -1966,7 +2707,7 @@ fn readme(allocator: std.mem.Allocator, names: TemplateNames, framework_path: []
         \\npm install --prefix frontend
         \\```
         \\
-        \\The generated build defaults to this zero-native framework path:
+        \\The generated build defaults to this Native SDK framework path:
         \\
         \\```text
     );
@@ -1977,7 +2718,7 @@ fn readme(allocator: std.mem.Allocator, names: TemplateNames, framework_path: []
         \\
         \\```
         \\
-        \\Override it with `-Dzero-native-path=/path/to/zero-native` if you move this app.
+        \\Override it with `-Dnative-sdk-path=/path/to/native-sdk` if you move this app.
         \\
         \\## Commands
         \\
@@ -1986,10 +2727,10 @@ fn readme(allocator: std.mem.Allocator, names: TemplateNames, framework_path: []
         \\zig build run
         \\zig build test
         \\zig build package
-        \\zero-native doctor --manifest app.zon
+        \\native doctor --manifest app.zon
         \\```
         \\
-        \\`zig build dev` starts the frontend dev server from `app.zon`, waits for it, and launches the native shell with `ZERO_NATIVE_FRONTEND_URL`.
+        \\`zig build dev` starts the frontend dev server from `app.zon`, waits for it, and launches the native shell with `NATIVE_SDK_FRONTEND_URL`.
         \\
         \\Frontend:
         \\
@@ -2014,11 +2755,11 @@ fn readme(allocator: std.mem.Allocator, names: TemplateNames, framework_path: []
         \\The generated app defaults to the system WebView. On macOS you can switch to Chromium/CEF with:
         \\
         \\```sh
-        \\zero-native cef install
+        \\native cef install
         \\zig build run -Dplatform=macos -Dweb-engine=chromium
         \\```
         \\
-        \\`zero-native cef install` downloads zero-native's prepared CEF runtime, including the native wrapper library.
+        \\`native cef install` downloads Native SDK's prepared CEF runtime, including the native wrapper library.
         \\
         \\For one-command local setup, opt into build-time install:
         \\
@@ -2029,13 +2770,13 @@ fn readme(allocator: std.mem.Allocator, names: TemplateNames, framework_path: []
         \\Use `-Dcef-dir=/path/to/cef` when you keep CEF outside the platform default under `third_party/cef`.
         \\
         \\```sh
-        \\zero-native doctor --web-engine chromium
+        \\native doctor --web-engine chromium
         \\```
         \\
         \\Diagnostics:
         \\
-        \\- Set `ZERO_NATIVE_LOG_DIR` to override the platform log directory during development.
-        \\- Set `ZERO_NATIVE_LOG_FORMAT=text|jsonl` to choose persistent log format.
+        \\- Set `NATIVE_SDK_LOG_DIR` to override the platform log directory during development.
+        \\- Set `NATIVE_SDK_LOG_FORMAT=text|jsonl` to choose persistent log format.
         \\
     );
     return out.toOwnedSlice(allocator);
@@ -2060,7 +2801,7 @@ test "template names are sanitized for generated metadata" {
     try std.testing.expectEqualStrings("my-cool-app", names.package_name);
     try std.testing.expectEqualStrings("my_cool_app", names.module_name);
     try std.testing.expectEqualStrings("My Cool App", names.display_name);
-    try std.testing.expectEqualStrings("dev.zero_native.my-cool-app", names.app_id);
+    try std.testing.expectEqualStrings("dev.native_sdk.my-cool-app", names.app_id);
 }
 
 test "template fingerprint includes package name checksum" {
@@ -2092,7 +2833,7 @@ test "writeDefaultApp emits Vite project files" {
     try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "\"npm\", \"install\", \"--prefix\", \"frontend\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "frontend-build") != null);
     try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "frontend_build.step.dependOn(&frontend_install.step)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "\"zero-native\", \"dev\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "\"native\", \"dev\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "dev.step.dependOn(&frontend_install.step)") != null);
     try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "chromium") != null);
     try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "cef-dir") != null);
@@ -2102,19 +2843,34 @@ test "writeDefaultApp emits Vite project files" {
     try std.testing.expect(std.mem.indexOf(u8, main_zig_text, "frontend/dist") != null);
     try std.testing.expect(std.mem.indexOf(u8, main_zig_text, "127.0.0.1:5173") != null);
     try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "@import(\"app_manifest_zon\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "commands: ?[]const zero_native.Command = null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "commands: ?[]const native_sdk.Command = null") != null);
     try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "resolvedCommands") != null);
-    try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "menus: ?[]const zero_native.Menu = null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "menus: ?[]const native_sdk.Menu = null") != null);
     try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "resolvedMenus") != null);
-    try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "shortcuts: ?[]const zero_native.Shortcut = null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "shortcuts: ?[]const native_sdk.Shortcut = null") != null);
     try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "resolvedShortcuts") != null);
     try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "const manifest_windows") != null);
     try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "fn appInfo(self: RunOptions, buffers: *StateBuffers)") != null);
     try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "fn manifestWindowOptions") != null);
     try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "info.windows = windows") != null);
     try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "for (restored_windows, 0..)") != null);
+    // The Runtime is multi-megabyte; the generated runner must heap-allocate
+    // it and construct in place, never build it by value on the stack.
+    try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "std.heap.page_allocator.create(native_sdk.Runtime)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "defer std.heap.page_allocator.destroy(runtime)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "native_sdk.Runtime.initAt(runtime, .{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "Runtime.init(.{") == null);
     try std.testing.expect(std.mem.indexOf(u8, package_json_text, "\"vite\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, main_js_text, "window.zero") != null);
+
+    const ci_yaml_text = try readTestFile(std.testing.allocator, std.testing.io, destination, ".github/workflows/ci.yml");
+    defer std.testing.allocator.free(ci_yaml_text);
+    try expectBasicYaml(ci_yaml_text);
+    try std.testing.expect(std.mem.indexOf(u8, ci_yaml_text, "zig build test -Dplatform=null -Dnative-sdk-path=\"$NATIVE_SDK_PATH\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ci_yaml_text, "mlugg/setup-zig@v2") != null);
+    // Web-frontend workflows stop at logic tests: the automation smoke
+    // recipe is native-app specific.
+    try std.testing.expect(std.mem.indexOf(u8, ci_yaml_text, "smoke:") == null);
 }
 
 test "writeDefaultApp emits frontend-specific Next paths" {
@@ -2138,7 +2894,135 @@ test "writeDefaultApp emits frontend-specific Next paths" {
     try std.testing.expect(std.mem.indexOf(u8, tsconfig_text, "\"@/*\": [\"./app/*\"]") != null);
 }
 
-fn normalizePackageName(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
+test "writeDefaultApp emits a slim native scaffold by default" {
+    const destination = ".zig-cache/test-native-slim-template";
+    try writeDefaultApp(std.testing.allocator, std.testing.io, destination, .{ .app_name = "My App", .framework_path = ".", .frontend = .native });
+
+    const app_zon_text = try readTestFile(std.testing.allocator, std.testing.io, destination, "app.zon");
+    defer std.testing.allocator.free(app_zon_text);
+    const main_zig_text = try readTestFile(std.testing.allocator, std.testing.io, destination, "src/main.zig");
+    defer std.testing.allocator.free(main_zig_text);
+    const gitignore_text = try readTestFile(std.testing.allocator, std.testing.io, destination, ".gitignore");
+    defer std.testing.allocator.free(gitignore_text);
+    const readme_text = try readTestFile(std.testing.allocator, std.testing.io, destination, "README.md");
+    defer std.testing.allocator.free(readme_text);
+    const icon = try readTestFile(std.testing.allocator, std.testing.io, destination, "assets/icon.png");
+    defer std.testing.allocator.free(icon);
+
+    // Zero-config: no build files, no editor config, no CI workflow.
+    try std.testing.expectError(error.FileNotFound, readTestFile(std.testing.allocator, std.testing.io, destination, "build.zig"));
+    try std.testing.expectError(error.FileNotFound, readTestFile(std.testing.allocator, std.testing.io, destination, "build.zig.zon"));
+    try std.testing.expectError(error.FileNotFound, readTestFile(std.testing.allocator, std.testing.io, destination, ".vscode/settings.json"));
+    try std.testing.expectError(error.FileNotFound, readTestFile(std.testing.allocator, std.testing.io, destination, ".github/workflows/ci.yml"));
+
+    try std.testing.expect(std.mem.indexOf(u8, app_zon_text, "gpu_surface") != null);
+    try std.testing.expect(std.mem.indexOf(u8, main_zig_text, "native_sdk.UiApp(Model, Msg)") != null);
+    // The generated + derived state is ignored wholesale.
+    try std.testing.expect(std.mem.indexOf(u8, gitignore_text, ".native/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gitignore_text, "zig-out/") != null);
+    // The README teaches the native verbs, not zig build.
+    try std.testing.expect(std.mem.indexOf(u8, readme_text, "native dev") != null);
+    try std.testing.expect(std.mem.indexOf(u8, readme_text, "native test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, readme_text, "native build") != null);
+    try std.testing.expect(std.mem.indexOf(u8, readme_text, "native check") != null);
+    try std.testing.expect(std.mem.indexOf(u8, readme_text, "native eject") != null);
+    try std.testing.expect(std.mem.indexOf(u8, readme_text, "zig build run") == null);
+}
+
+test "writeDefaultApp emits native project files" {
+    const destination = ".zig-cache/test-native-init-template";
+    try writeDefaultApp(std.testing.allocator, std.testing.io, destination, .{ .app_name = "My App", .framework_path = ".", .frontend = .native, .shape = .full });
+
+    const app_zon_text = try readTestFile(std.testing.allocator, std.testing.io, destination, "app.zon");
+    defer std.testing.allocator.free(app_zon_text);
+    const build_zig_text = try readTestFile(std.testing.allocator, std.testing.io, destination, "build.zig");
+    defer std.testing.allocator.free(build_zig_text);
+    const build_zon_text = try readTestFile(std.testing.allocator, std.testing.io, destination, "build.zig.zon");
+    defer std.testing.allocator.free(build_zon_text);
+    const main_zig_text = try readTestFile(std.testing.allocator, std.testing.io, destination, "src/main.zig");
+    defer std.testing.allocator.free(main_zig_text);
+    const app_markup_text = try readTestFile(std.testing.allocator, std.testing.io, destination, "src/app.native");
+    defer std.testing.allocator.free(app_markup_text);
+    const tests_zig_text = try readTestFile(std.testing.allocator, std.testing.io, destination, "src/tests.zig");
+    defer std.testing.allocator.free(tests_zig_text);
+    const vscode_text = try readTestFile(std.testing.allocator, std.testing.io, destination, ".vscode/settings.json");
+    defer std.testing.allocator.free(vscode_text);
+    const gitignore_text = try readTestFile(std.testing.allocator, std.testing.io, destination, ".gitignore");
+    defer std.testing.allocator.free(gitignore_text);
+    const readme_text = try readTestFile(std.testing.allocator, std.testing.io, destination, "README.md");
+    defer std.testing.allocator.free(readme_text);
+
+    // No WebView frontend files.
+    try std.testing.expectError(error.FileNotFound, readTestFile(std.testing.allocator, std.testing.io, destination, "frontend/package.json"));
+    try std.testing.expectError(error.FileNotFound, readTestFile(std.testing.allocator, std.testing.io, destination, "src/runner.zig"));
+
+    try std.testing.expect(std.mem.indexOf(u8, app_zon_text, "gpu_surface") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app_zon_text, "\"native_views\", \"gpu_surfaces\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app_zon_text, "dev.native_sdk.my-app") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app_zon_text, ".frontend") == null);
+    try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "native_sdk.addApp(b, b.dependency(\"native_sdk\", .{}), .{ .name = \"my-app\" })") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build_zon_text, ".native_sdk = .{ .path = ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build_zon_text, ".name = .my_app") != null);
+    try std.testing.expect(std.mem.indexOf(u8, main_zig_text, "native_sdk.UiApp(Model, Msg)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, main_zig_text, "@embedFile(\"app.native\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, main_zig_text, ".watch_path = \"src/app.native\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app_markup_text, "on-press=\"increment\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tests_zig_text, "msgForPointer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tests_zig_text, "canvas.MarkupView(Model, Msg)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vscode_text, "\"*.native\": \"html\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gitignore_text, "zig-out/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, readme_text, "native markup check src/app.native") != null);
+    try std.testing.expect(std.mem.indexOf(u8, readme_text, "hot") != null or std.mem.indexOf(u8, readme_text, "Hot") != null);
+}
+
+test "writeDefaultApp emits a CI workflow for native apps" {
+    const destination = ".zig-cache/test-native-ci-template";
+    try writeDefaultApp(std.testing.allocator, std.testing.io, destination, .{ .app_name = "My App", .framework_path = ".", .frontend = .native, .shape = .full });
+
+    const ci_yaml_text = try readTestFile(std.testing.allocator, std.testing.io, destination, ".github/workflows/ci.yml");
+    defer std.testing.allocator.free(ci_yaml_text);
+
+    try expectBasicYaml(ci_yaml_text);
+    // Both jobs are present, sized for a user app.
+    try std.testing.expect(std.mem.indexOf(u8, ci_yaml_text, "jobs:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ci_yaml_text, "  test:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ci_yaml_text, "  smoke:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ci_yaml_text, "mlugg/setup-zig@v2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ci_yaml_text, "version: 0.16.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ci_yaml_text, "zig build test -Dplatform=null") != null);
+    // The smoke job builds with automation, launches under Xvfb, and drives
+    // the snapshot: the binary name comes from the template context.
+    try std.testing.expect(std.mem.indexOf(u8, ci_yaml_text, "libgtk-4-dev libwebkitgtk-6.0-dev xvfb") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ci_yaml_text, "zig build -Dplatform=linux -Dweb-engine=system -Dautomation=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ci_yaml_text, "xvfb-run -a ./zig-out/bin/my-app &") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ci_yaml_text, "automate wait") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ci_yaml_text, "automate assert 'gpu_nonblank=true' 'role=button name=\"Reset\"' 'count: 0'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ci_yaml_text, "automate screenshot main-canvas") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ci_yaml_text, "test -s .zig-cache/native-sdk-automation/screenshot-main-canvas.png") != null);
+    // The framework fetch step reuses the build.zig.zon dependency path.
+    try std.testing.expect(std.mem.indexOf(u8, ci_yaml_text, "NATIVE_SDK_PATH:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ci_yaml_text, "git clone --depth 1 https://github.com/vercel-labs/zero-native.git \"$NATIVE_SDK_PATH\"") != null);
+}
+
+/// Structural sanity for generated workflows (the repo scaffold CI job runs
+/// a real YAML parse over the generated file): top-level keys present, no
+/// tabs, space indentation in even steps, no trailing whitespace.
+fn expectBasicYaml(text: []const u8) !void {
+    try std.testing.expect(std.mem.startsWith(u8, text, "name: CI\n"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "\non:\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\njobs:\n") != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, text, '\t') == null);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        try std.testing.expect(!std.ascii.isWhitespace(line[line.len - 1]));
+        var indent: usize = 0;
+        while (indent < line.len and line[indent] == ' ') indent += 1;
+        try std.testing.expect(indent % 2 == 0);
+    }
+}
+
+pub fn normalizePackageName(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var last_separator = false;
@@ -2152,11 +3036,11 @@ fn normalizePackageName(allocator: std.mem.Allocator, value: []const u8) ![]cons
         }
     }
     if (out.items.len > 0 and out.items[out.items.len - 1] == '-') _ = out.pop();
-    if (out.items.len == 0) try out.appendSlice(allocator, "zero-native-app");
+    if (out.items.len == 0) try out.appendSlice(allocator, "native-sdk-app");
     return out.toOwnedSlice(allocator);
 }
 
-fn normalizeModuleName(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
+pub fn normalizeModuleName(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
     const max_zig_package_name_len = 32;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -2197,11 +3081,11 @@ fn displayName(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
         }
         start_word = false;
     }
-    if (out.items.len == 0) try out.appendSlice(allocator, "zero-native app");
+    if (out.items.len == 0) try out.appendSlice(allocator, "Native SDK app");
     return out.toOwnedSlice(allocator);
 }
 
-fn fingerprintForName(name: []const u8) u64 {
+pub fn fingerprintForName(name: []const u8) u64 {
     const checksum: u64 = std.hash.Crc32.hash(name);
     return (checksum << 32) | 0x5a707070;
 }
@@ -2237,6 +3121,32 @@ fn defaultFrameworkPath(allocator: std.mem.Allocator, io: std.Io, destination: [
 
     if (out.items.len == 0) try out.append(allocator, '.');
     return out.toOwnedSlice(allocator);
+}
+
+/// The native_sdk dependency path for build.zig.zon: always relative to the
+/// generated app root, since Zig rejects absolute paths in path dependencies.
+/// `framework_path` comes from defaultFrameworkPath, so it is either already
+/// destination-relative or absolute.
+fn nativeDependencyPath(allocator: std.mem.Allocator, io: std.Io, destination: []const u8, framework_path: []const u8) ![]const u8 {
+    if (!std.fs.path.isAbsolute(framework_path)) {
+        return allocator.dupe(u8, framework_path);
+    }
+
+    // Resolve symlinks (e.g. /tmp -> /private/tmp on macOS) before computing
+    // the relative path, so `..` segments traverse the real directory tree.
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const destination_real = try std.Io.Dir.cwd().realPathFileAlloc(io, destination, allocator);
+    defer allocator.free(destination_real);
+    const framework_real = try std.Io.Dir.realPathFileAbsoluteAlloc(io, framework_path, allocator);
+    defer allocator.free(framework_real);
+
+    const relative = try std.fs.path.relative(allocator, cwd, null, destination_real, framework_real);
+    if (relative.len == 0) {
+        allocator.free(relative);
+        return allocator.dupe(u8, ".");
+    }
+    return relative;
 }
 
 fn appendZigString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {

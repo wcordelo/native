@@ -1,4 +1,4 @@
-# zero-native native-shell example
+# Native SDK native-shell example
 
 This example shows the native-first app shape:
 

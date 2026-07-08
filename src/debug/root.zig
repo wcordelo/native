@@ -94,10 +94,10 @@ pub const FanoutTraceSink = struct {
 
 pub fn setupLogging(io: std.Io, env_map: *std.process.Environ.Map, app_name: []const u8, buffers: *LogPathBuffers) !LogSetup {
     _ = io;
-    const paths = try resolveLogPaths(buffers, app_name, envFromMap(env_map), env_map.get("ZERO_NATIVE_LOG_DIR"));
+    const paths = try resolveLogPaths(buffers, app_name, envFromMap(env_map), env_map.get("NATIVE_SDK_LOG_DIR"));
     return .{
         .paths = paths,
-        .format = if (env_map.get("ZERO_NATIVE_LOG_FORMAT")) |value| LogFormat.parse(value) orelse .json_lines else .json_lines,
+        .format = if (env_map.get("NATIVE_SDK_LOG_FORMAT")) |value| LogFormat.parse(value) orelse .json_lines else .json_lines,
     };
 }
 
@@ -107,7 +107,7 @@ pub fn resolveLogPaths(buffers: *LogPathBuffers, app_name: []const u8, env: app_
         try copyInto(&buffers.log_dir, dir)
     else
         try app_dirs.resolveOne(.{ .name = app_name }, platform, env, .logs, &buffers.log_dir);
-    const log_file = try app_dirs.join(platform, &buffers.log_file, &.{ log_dir, "zero-native.jsonl" });
+    const log_file = try app_dirs.join(platform, &buffers.log_file, &.{ log_dir, "native-sdk.jsonl" });
     const panic_file = try app_dirs.join(platform, &buffers.panic_file, &.{ log_dir, "last-panic.txt" });
     return .{ .log_dir = log_dir, .log_file = log_file, .panic_file = panic_file };
 }
@@ -145,16 +145,20 @@ pub fn envFromMap(env_map: *std.process.Environ.Map) app_dirs.Env {
 }
 
 pub fn appendTraceRecord(io: std.Io, log_dir: []const u8, path: []const u8, format: LogFormat, record: trace.Record) !void {
+    // Bounded formatting: oversized records are truncated (text) or
+    // rewritten minimally (json), never turned into a write error that
+    // would fail dispatch upstream.
     var line_buffer: [4096]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&line_buffer);
-    switch (format.traceFormat()) {
-        .text => {
-            try trace.formatText(record, &writer);
-            try writer.writeAll("\n");
+    const line = switch (format.traceFormat()) {
+        .text => blk: {
+            const text = trace.formatTextBounded(record, line_buffer[0 .. line_buffer.len - 1]);
+            line_buffer[text.len] = '\n';
+            break :blk line_buffer[0 .. text.len + 1];
         },
-        .json_lines => try trace.formatJsonLine(record, &writer),
-    }
-    try appendFile(io, log_dir, path, writer.buffered());
+        .json_lines => trace.formatJsonLineBounded(record, &line_buffer),
+    };
+    if (line.len == 0) return;
+    try appendFile(io, log_dir, path, line);
 }
 
 fn appendFile(io: std.Io, directory: []const u8, path: []const u8, bytes: []const u8) !void {
@@ -221,9 +225,9 @@ test "trace mode parsing and matching" {
 test "log path resolution uses platform logs directory and overrides" {
     var buffers: LogPathBuffers = .{};
     const env: app_dirs.Env = .{ .home = "/Users/alice", .tmpdir = "/tmp" };
-    const paths = try resolveLogPaths(&buffers, "dev.zero_native.test", env, "/tmp/zero-native-logs");
-    try std.testing.expectEqualStrings("/tmp/zero-native-logs", paths.log_dir);
-    try std.testing.expect(std.mem.indexOf(u8, paths.log_file, "zero-native.jsonl") != null);
+    const paths = try resolveLogPaths(&buffers, "dev.native_sdk.test", env, "/tmp/native-sdk-logs");
+    try std.testing.expectEqualStrings("/tmp/native-sdk-logs", paths.log_dir);
+    try std.testing.expect(std.mem.indexOf(u8, paths.log_file, "native-sdk.jsonl") != null);
     try std.testing.expect(std.mem.indexOf(u8, paths.panic_file, "last-panic.txt") != null);
 }
 

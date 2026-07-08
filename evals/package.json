@@ -1,0 +1,22 @@
+{
+  "name": "@native-sdk/evals",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.23.0",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "eval": "node src/main.ts",
+    "check": "pnpm typecheck"
+  },
+  "devDependencies": {
+    "@types/node": "^24",
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@vercel/sandbox": "^2.3.0"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

@@ -96,13 +96,13 @@ jobs:
           esac
           find "$CEF_ROOT/build/libcef_dll_wrapper" -name "$wrapper" -print -quit | xargs -I{} cp "{}" "$CEF_ROOT/libcef_dll_wrapper/$wrapper"
 
-      - name: Prepare zero-native runtime archive
+      - name: Prepare native-sdk runtime archive
         if: ${{ inputs.source == 'official' }}
         shell: bash
         run: |
           zig build
-          cli="zig-out/bin/zero-native"
-          if [[ "${{ runner.os }}" == "Windows" ]]; then cli="zig-out/bin/zero-native.exe"; fi
+          cli="zig-out/bin/native"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then cli="zig-out/bin/native.exe"; fi
           "$cli" cef prepare-release --dir "$CEF_ROOT" --output zig-out/cef --version "${{ inputs.cef_version }}"
 
       - name: Build CEF from source and prepare runtime
@@ -116,7 +116,7 @@ jobs:
             --platform "${{ matrix.platform }}"
             --version "${{ inputs.cef_version }}"
             --output zig-out/cef
-            --zero-native-bin zig-out/bin/zero-native
+            --native-sdk-bin zig-out/bin/native
           )
           if [ -n "${{ inputs.cef_branch }}" ]; then
             args+=(--cef-branch "${{ inputs.cef_branch }}")
@@ -129,5 +129,5 @@ jobs:
           tag_name: cef-${{ inputs.cef_version }}
           name: CEF ${{ inputs.cef_version }}
           files: |
-            zig-out/cef/zero-native-cef-${{ inputs.cef_version }}-${{ matrix.platform }}.tar.gz
-            zig-out/cef/zero-native-cef-${{ inputs.cef_version }}-${{ matrix.platform }}.tar.gz.sha256
+            zig-out/cef/native-sdk-cef-${{ inputs.cef_version }}-${{ matrix.platform }}.tar.gz
+            zig-out/cef/native-sdk-cef-${{ inputs.cef_version }}-${{ matrix.platform }}.tar.gz.sha256

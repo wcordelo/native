@@ -5,6 +5,8 @@ pub const app_manifest = @import("app_manifest");
 pub const trace = @import("trace");
 pub const diagnostics = @import("diagnostics");
 pub const platform_info = @import("platform_info");
+pub const canvas = @import("canvas");
+pub const markdown = canvas.markdown;
 
 pub const runtime = @import("runtime/root.zig");
 pub const platform = @import("platform/root.zig");
@@ -28,11 +30,70 @@ pub const Command = runtime.Command;
 pub const CommandEvent = runtime.CommandEvent;
 pub const CommandSource = runtime.CommandSource;
 pub const TestHarness = runtime.TestHarness;
+pub const UiApp = runtime.UiApp;
+pub const UiAppWithFeatures = runtime.UiAppWithFeatures;
+pub const UiAppFeatures = runtime.UiAppFeatures;
+pub const Effects = runtime.Effects;
+pub const EffectLine = runtime.EffectLine;
+pub const EffectExit = runtime.EffectExit;
+pub const EffectExitReason = runtime.EffectExitReason;
+pub const EffectExecutor = runtime.EffectExecutor;
+pub const EffectOutputMode = runtime.EffectOutputMode;
+pub const FetchResponseMode = runtime.FetchResponseMode;
+pub const EffectResponse = runtime.EffectResponse;
+pub const EffectFetchOutcome = runtime.EffectFetchOutcome;
+pub const EffectFileOp = runtime.EffectFileOp;
+pub const EffectFileOutcome = runtime.EffectFileOutcome;
+pub const EffectFileResult = runtime.EffectFileResult;
+pub const effect_error_exit_code = runtime.effect_error_exit_code;
+pub const max_effects = runtime.max_effects;
+pub const max_effect_argv = runtime.max_effect_argv;
+pub const max_effect_argv_bytes = runtime.max_effect_argv_bytes;
+pub const max_effect_stdin_bytes = runtime.max_effect_stdin_bytes;
+pub const max_effect_line_bytes = runtime.max_effect_line_bytes;
+pub const max_effect_line_bytes_ceiling = runtime.max_effect_line_bytes_ceiling;
+pub const max_effect_collect_bytes = runtime.max_effect_collect_bytes;
+pub const max_effect_stderr_tail_bytes = runtime.max_effect_stderr_tail_bytes;
+pub const max_effect_queue_entries = runtime.max_effect_queue_entries;
+pub const max_effect_url_bytes = runtime.max_effect_url_bytes;
+pub const max_effect_fetch_headers = runtime.max_effect_fetch_headers;
+pub const max_effect_fetch_header_bytes = runtime.max_effect_fetch_header_bytes;
+pub const max_effect_fetch_payload_bytes = runtime.max_effect_fetch_payload_bytes;
+pub const max_effect_body_bytes = runtime.max_effect_body_bytes;
+pub const default_effect_fetch_timeout_ms = runtime.default_effect_fetch_timeout_ms;
+pub const max_effect_file_path_bytes = runtime.max_effect_file_path_bytes;
+pub const max_effect_file_bytes = runtime.max_effect_file_bytes;
+pub const EffectClipboardOp = runtime.EffectClipboardOp;
+pub const EffectClipboardOutcome = runtime.EffectClipboardOutcome;
+pub const EffectClipboardResult = runtime.EffectClipboardResult;
+pub const max_effect_clipboard_bytes = runtime.max_effect_clipboard_bytes;
+pub const TimerMode = runtime.TimerMode;
+pub const EffectTimer = runtime.EffectTimer;
+pub const EffectTimerOutcome = runtime.EffectTimerOutcome;
+pub const max_effect_timers = runtime.max_effect_timers;
+pub const EffectAudio = runtime.EffectAudio;
+pub const EffectAudioEventKind = runtime.EffectAudioEventKind;
+pub const EffectAudioSource = runtime.EffectAudioSource;
+pub const audioCachePath = runtime.audioCachePath;
+pub const max_effect_audio_path_bytes = runtime.max_effect_audio_path_bytes;
+pub const Clock = runtime.Clock;
+pub const TestClock = runtime.TestClock;
+pub const nowMs = runtime.nowMs;
+pub const nowNanoseconds = runtime.nowNanoseconds;
+pub const monotonicMs = runtime.monotonicMs;
+pub const monotonicNanoseconds = runtime.monotonicNanoseconds;
+pub const setFreestandingMonotonicNanoseconds = runtime.setFreestandingMonotonicNanoseconds;
+pub const RegisteredImage = runtime.RegisteredImage;
+pub const max_registered_canvas_images = runtime.max_registered_canvas_images;
+pub const max_registered_canvas_image_pixel_bytes = runtime.max_registered_canvas_image_pixel_bytes;
 pub const ShellConfig = app_manifest.ShellConfig;
 pub const ShellWindow = app_manifest.ShellWindow;
 pub const ShellView = app_manifest.ShellView;
 pub const ShellEdge = app_manifest.ShellEdge;
 pub const ShellAxis = app_manifest.ShellAxis;
+pub const ShellTab = app_manifest.ShellTab;
+pub const ShellPrimaryAction = app_manifest.ShellPrimaryAction;
+pub const ShellChrome = app_manifest.ShellChrome;
 
 pub const WebViewSource = platform.WebViewSource;
 pub const WebViewSourceKind = platform.WebViewSourceKind;
@@ -43,6 +104,15 @@ pub const ViewKind = platform.ViewKind;
 pub const ViewOptions = platform.ViewOptions;
 pub const ViewPatch = platform.ViewPatch;
 pub const ViewInfo = platform.ViewInfo;
+pub const GpuFrame = platform.GpuFrame;
+pub const GpuSurfaceOptions = platform.GpuSurfaceOptions;
+pub const GpuSurfaceBackend = platform.GpuSurfaceBackend;
+pub const GpuSurfacePixelFormat = platform.GpuSurfacePixelFormat;
+pub const GpuSurfacePresentMode = platform.GpuSurfacePresentMode;
+pub const GpuSurfaceAlphaMode = platform.GpuSurfaceAlphaMode;
+pub const GpuSurfaceColorSpace = platform.GpuSurfaceColorSpace;
+pub const GpuSurfaceStatus = platform.GpuSurfaceStatus;
+pub const CanvasFrameProfileRisk = platform.CanvasFrameProfileRisk;
 pub const AppInfo = platform.AppInfo;
 pub const Platform = platform.Platform;
 pub const NullPlatform = platform.NullPlatform;
@@ -52,11 +122,24 @@ pub const WindowCreateOptions = platform.WindowCreateOptions;
 pub const WindowInfo = platform.WindowInfo;
 pub const WindowState = platform.WindowState;
 pub const WindowRestorePolicy = platform.WindowRestorePolicy;
+pub const WindowTitlebarStyle = platform.WindowTitlebarStyle;
+pub const WindowChrome = platform.WindowChrome;
+pub const FormFactor = platform.FormFactor;
+pub const WindowDragRegion = platform.WindowDragRegion;
+pub const WindowShowMode = platform.WindowShowMode;
 pub const Menu = platform.Menu;
 pub const MenuItem = platform.MenuItem;
 pub const Shortcut = platform.Shortcut;
 pub const ShortcutModifiers = platform.ShortcutModifiers;
 pub const ShortcutEvent = platform.ShortcutEvent;
+pub const TimerEvent = platform.TimerEvent;
+pub const reserved_timer_id_base = platform.reserved_timer_id_base;
+pub const ColorScheme = platform.ColorScheme;
+pub const Appearance = platform.Appearance;
+pub const GpuSurfaceFrameEvent = platform.GpuSurfaceFrameEvent;
+pub const GpuSurfaceResizeEvent = platform.GpuSurfaceResizeEvent;
+pub const GpuSurfaceInputKind = platform.GpuSurfaceInputKind;
+pub const GpuSurfaceInputEvent = platform.GpuSurfaceInputEvent;
 pub const FileFilter = platform.FileFilter;
 pub const OpenDialogOptions = platform.OpenDialogOptions;
 pub const OpenDialogResult = platform.OpenDialogResult;
@@ -79,64 +162,4 @@ pub const ExternalLinkAction = security.ExternalLinkAction;
 
 test {
     @import("std").testing.refAllDecls(@This());
-}
-
-pub export fn zero_native_app_create() ?*anyopaque {
-    return embed.zero_native_app_create();
-}
-
-pub export fn zero_native_app_destroy(app: ?*anyopaque) void {
-    embed.zero_native_app_destroy(app);
-}
-
-pub export fn zero_native_app_start(app: ?*anyopaque) void {
-    embed.zero_native_app_start(app);
-}
-
-pub export fn zero_native_app_activate(app: ?*anyopaque) void {
-    embed.zero_native_app_activate(app);
-}
-
-pub export fn zero_native_app_deactivate(app: ?*anyopaque) void {
-    embed.zero_native_app_deactivate(app);
-}
-
-pub export fn zero_native_app_stop(app: ?*anyopaque) void {
-    embed.zero_native_app_stop(app);
-}
-
-pub export fn zero_native_app_resize(app: ?*anyopaque, width: f32, height: f32, scale: f32, surface: ?*anyopaque) void {
-    embed.zero_native_app_resize(app, width, height, scale, surface);
-}
-
-pub export fn zero_native_app_touch(app: ?*anyopaque, id: u64, phase: c_int, x: f32, y: f32, pressure: f32) void {
-    embed.zero_native_app_touch(app, id, phase, x, y, pressure);
-}
-
-pub export fn zero_native_app_command(app: ?*anyopaque, name: ?[*]const u8, len: usize) void {
-    embed.zero_native_app_command(app, name, len);
-}
-
-pub export fn zero_native_app_frame(app: ?*anyopaque) void {
-    embed.zero_native_app_frame(app);
-}
-
-pub export fn zero_native_app_set_asset_root(app: ?*anyopaque, path: [*]const u8, len: usize) void {
-    embed.zero_native_app_set_asset_root(app, path, len);
-}
-
-pub export fn zero_native_app_set_asset_entry(app: ?*anyopaque, path: [*]const u8, len: usize) void {
-    embed.zero_native_app_set_asset_entry(app, path, len);
-}
-
-pub export fn zero_native_app_last_command_count(app: ?*anyopaque) usize {
-    return embed.zero_native_app_last_command_count(app);
-}
-
-pub export fn zero_native_app_last_command_name(app: ?*anyopaque) [*:0]const u8 {
-    return embed.zero_native_app_last_command_name(app);
-}
-
-pub export fn zero_native_app_last_error_name(app: ?*anyopaque) [*:0]const u8 {
-    return embed.zero_native_app_last_error_name(app);
 }

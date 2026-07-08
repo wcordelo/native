@@ -115,7 +115,7 @@ test "bundle recursively copies frontend asset trees" {
     const cwd = std.Io.Dir.cwd();
     cwd.createDirPath(std.testing.io, ".zig-cache/test-recursive-assets/src/assets") catch {};
     try cwd.writeFile(std.testing.io, .{ .sub_path = ".zig-cache/test-recursive-assets/src/index.html", .data = "<script src=\"/assets/app.js\"></script>" });
-    try cwd.writeFile(std.testing.io, .{ .sub_path = ".zig-cache/test-recursive-assets/src/assets/app.js", .data = "console.log('zero-native');" });
+    try cwd.writeFile(std.testing.io, .{ .sub_path = ".zig-cache/test-recursive-assets/src/assets/app.js", .data = "console.log('native-sdk');" });
 
     const result = try bundle(std.testing.allocator, std.testing.io, ".zig-cache/test-recursive-assets/src", ".zig-cache/test-recursive-assets/out");
 
@@ -124,5 +124,5 @@ test "bundle recursively copies frontend asset trees" {
     var file = try cwd.openFile(std.testing.io, ".zig-cache/test-recursive-assets/out/assets/app.js", .{});
     defer file.close(std.testing.io);
     const len = try file.readPositionalAll(std.testing.io, &buffer, 0);
-    try std.testing.expectEqualStrings("console.log('zero-native');", buffer[0..len]);
+    try std.testing.expectEqualStrings("console.log('native-sdk');", buffer[0..len]);
 }

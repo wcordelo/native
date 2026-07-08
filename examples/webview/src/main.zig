@@ -1,8 +1,8 @@
 const std = @import("std");
 const runner = @import("runner");
-const zero_native = @import("zero-native");
+const native_sdk = @import("native_sdk");
 
-pub const panic = std.debug.FullPanic(zero_native.debug.capturePanic);
+pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
 const html =
     \\<!doctype html>
@@ -23,7 +23,7 @@ const html =
     \\</head>
     \\<body>
     \\  <main>
-    \\    <h1>Hello from zero-native</h1>
+    \\    <h1>Hello from Native SDK</h1>
     \\    <p>A small Zig desktop shell around the system WebView with a secure native command bridge.</p>
     \\    <div class="actions">
     \\      <button id="ping" type="button">Call native.ping</button>
@@ -83,7 +83,7 @@ const html =
     \\      if (childWebView) show(await childWebView.setFrame({ x: 36, y: 36, width: 520, height: 320 }));
     \\    });
     \\    document.querySelector("#navigate-webview").addEventListener("click", async () => {
-    \\      if (childWebView) show(await childWebView.navigate("https://example.com/?zero-native=1"));
+    \\      if (childWebView) show(await childWebView.navigate("https://example.com/?native-sdk=1"));
     \\    });
     \\    document.querySelector("#close-webview").addEventListener("click", async () => {
     \\      if (childWebView) {
@@ -96,45 +96,45 @@ const html =
     \\</html>
 ;
 
-const app_permissions = [_][]const u8{zero_native.security.permission_window};
+const app_permissions = [_][]const u8{native_sdk.security.permission_window};
 const example_origins = [_][]const u8{ "zero://inline", "zero://app" };
-const bridge_policies = [_]zero_native.BridgeCommandPolicy{.{ .name = "native.ping" }};
-const window_permission = [_][]const u8{zero_native.security.permission_window};
-const builtin_policies = [_]zero_native.BridgeCommandPolicy{
-    .{ .name = "zero-native.window.list", .permissions = &window_permission, .origins = &example_origins },
-    .{ .name = "zero-native.window.create", .permissions = &window_permission, .origins = &example_origins },
-    .{ .name = "zero-native.window.focus", .permissions = &window_permission, .origins = &example_origins },
-    .{ .name = "zero-native.window.close", .permissions = &window_permission, .origins = &example_origins },
-    .{ .name = "zero-native.webview.create", .permissions = &window_permission, .origins = &example_origins },
-    .{ .name = "zero-native.webview.list", .permissions = &window_permission, .origins = &example_origins },
-    .{ .name = "zero-native.webview.setFrame", .permissions = &window_permission, .origins = &example_origins },
-    .{ .name = "zero-native.webview.navigate", .permissions = &window_permission, .origins = &example_origins },
-    .{ .name = "zero-native.webview.setZoom", .permissions = &window_permission, .origins = &example_origins },
-    .{ .name = "zero-native.webview.setLayer", .permissions = &window_permission, .origins = &example_origins },
-    .{ .name = "zero-native.webview.close", .permissions = &window_permission, .origins = &example_origins },
+const bridge_policies = [_]native_sdk.BridgeCommandPolicy{.{ .name = "native.ping" }};
+const window_permission = [_][]const u8{native_sdk.security.permission_window};
+const builtin_policies = [_]native_sdk.BridgeCommandPolicy{
+    .{ .name = "native-sdk.window.list", .permissions = &window_permission, .origins = &example_origins },
+    .{ .name = "native-sdk.window.create", .permissions = &window_permission, .origins = &example_origins },
+    .{ .name = "native-sdk.window.focus", .permissions = &window_permission, .origins = &example_origins },
+    .{ .name = "native-sdk.window.close", .permissions = &window_permission, .origins = &example_origins },
+    .{ .name = "native-sdk.webview.create", .permissions = &window_permission, .origins = &example_origins },
+    .{ .name = "native-sdk.webview.list", .permissions = &window_permission, .origins = &example_origins },
+    .{ .name = "native-sdk.webview.setFrame", .permissions = &window_permission, .origins = &example_origins },
+    .{ .name = "native-sdk.webview.navigate", .permissions = &window_permission, .origins = &example_origins },
+    .{ .name = "native-sdk.webview.setZoom", .permissions = &window_permission, .origins = &example_origins },
+    .{ .name = "native-sdk.webview.setLayer", .permissions = &window_permission, .origins = &example_origins },
+    .{ .name = "native-sdk.webview.close", .permissions = &window_permission, .origins = &example_origins },
 };
 
 const WebViewApp = struct {
     ping_count: u32 = 0,
-    bridge_handlers: [1]zero_native.BridgeHandler = undefined,
+    bridge_handlers: [1]native_sdk.BridgeHandler = undefined,
     env_map: *std.process.Environ.Map,
 
-    fn app(self: *@This()) zero_native.App {
-        return .{ .context = self, .name = "webview", .source = zero_native.WebViewSource.html(html), .source_fn = source };
+    fn app(self: *@This()) native_sdk.App {
+        return .{ .context = self, .name = "webview", .source = native_sdk.WebViewSource.html(html), .source_fn = source };
     }
 
-    fn source(context: *anyopaque) anyerror!zero_native.WebViewSource {
+    fn source(context: *anyopaque) anyerror!native_sdk.WebViewSource {
         const self: *@This() = @ptrCast(@alignCast(context));
-        if (self.env_map.get("ZERO_NATIVE_FRONTEND_URL") != null) {
-            return zero_native.frontend.sourceFromEnv(self.env_map, .{ .dist = "dist" });
+        if (self.env_map.get("NATIVE_SDK_FRONTEND_URL") != null) {
+            return native_sdk.frontend.sourceFromEnv(self.env_map, .{ .dist = "dist" });
         }
-        if (self.env_map.get("ZERO_NATIVE_FRONTEND_ASSETS") != null) {
-            return zero_native.frontend.productionSource(.{ .dist = "dist" });
+        if (self.env_map.get("NATIVE_SDK_FRONTEND_ASSETS") != null) {
+            return native_sdk.frontend.productionSource(.{ .dist = "dist" });
         }
-        return zero_native.WebViewSource.html(html);
+        return native_sdk.WebViewSource.html(html);
     }
 
-    fn bridge(self: *@This()) zero_native.BridgeDispatcher {
+    fn bridge(self: *@This()) native_sdk.BridgeDispatcher {
         self.bridge_handlers = .{.{ .name = "native.ping", .context = self, .invoke_fn = ping }};
         return .{
             .policy = .{ .enabled = true, .commands = &bridge_policies },
@@ -142,7 +142,7 @@ const WebViewApp = struct {
         };
     }
 
-    fn ping(context: *anyopaque, invocation: zero_native.bridge.Invocation, output: []u8) anyerror![]const u8 {
+    fn ping(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
         _ = invocation;
         const self: *@This() = @ptrCast(@alignCast(context));
         self.ping_count += 1;
@@ -154,9 +154,8 @@ pub fn main(init: std.process.Init) !void {
     var app = WebViewApp{ .env_map = init.environ_map };
     try runner.runWithOptions(app.app(), .{
         .app_name = "webview",
-        .window_title = "zero-native WebView",
-        .bundle_id = "dev.zero_native.webview",
-        .icon_path = "assets/icon.icns",
+        .window_title = "Native SDK WebView",
+        .bundle_id = "dev.native_sdk.webview",
         .bridge = app.bridge(),
         .builtin_bridge = .{ .enabled = true, .commands = &builtin_policies },
         .security = .{
@@ -164,6 +163,12 @@ pub fn main(init: std.process.Init) !void {
             .navigation = .{ .allowed_origins = &.{ "zero://inline", "zero://app", "https://example.com" } },
         },
     }, init);
+}
+
+test "inline html stays within the runtime window source budget" {
+    // An inline source past this budget fails window load at app_start and
+    // the main window comes up blank; catch the overflow at test time.
+    try std.testing.expect(html.len <= native_sdk.platform.max_window_source_bytes);
 }
 
 test "webview bridge returns native ping response" {

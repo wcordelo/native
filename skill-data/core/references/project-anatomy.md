@@ -1,10 +1,12 @@
 # Project Anatomy
 
-Use this when creating, orienting in, or restructuring a zero-native app.
+Use this when creating, orienting in, or restructuring a Native SDK app.
 
 ## Generated project files
 
-- `build.zig`: Zig build graph. Generated examples expose platform selection, trace mode, debug overlay, automation, JS bridge, web engine overrides, frontend install/build/dev steps, tests, and package steps.
+A zero-config app ships no build files at all — just `app.zon` + `src/` (+ `assets/`); the `native dev|test|build` verbs synthesize the build graph into `.native/build/` (gitignored). `build.zig`/`build.zig.zon` appear only in apps that own their build (`native eject`, the `--full` scaffold, or an expanded example):
+
+- `build.zig`: Zig build graph. Expanded scaffolds expose platform selection, trace mode, debug overlay, automation, JS bridge, web engine overrides, frontend install/build/dev steps, tests, and package steps.
 - `build.zig.zon`: Zig package manifest and dependency declaration.
 - `app.zon`: app manifest read by CLI/build/package/doctor tooling.
 - `src/main.zig`: app state, `app()` method, source resolver, optional bridge dispatcher, lifecycle callbacks.
@@ -22,7 +24,7 @@ Keep product-level metadata and policies in `app.zon`:
     .name = "my-app",
     .display_name = "My App",
     .version = "0.1.0",
-    .icons = .{ "assets/icon.icns" },
+    .icons = .{"assets/icon.png"},
     .platforms = .{ "macos", "linux" },
     .permissions = .{ "window" },
     .capabilities = .{ "webview", "js_bridge" },
@@ -59,8 +61,9 @@ Important manifest fields:
 
 - `id`: reverse-DNS bundle identifier. Used for bundle metadata and log/state paths.
 - `name`: short machine name.
-- `display_name`: human app name.
-- `version`: package and bundle version.
+- `display_name`: human app name — shown by the application menu, Dock, app switcher, and About panel in dev runs and packaged bundles alike.
+- `description`: optional one-line About-panel description (max 256 bytes, single line).
+- `version`: package and bundle version — also shown in the About panel.
 - `icons`: package resources.
 - `platforms`: package targets.
 - `permissions`: runtime grants checked by bridge and builtin commands.

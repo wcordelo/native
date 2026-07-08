@@ -1,8 +1,8 @@
 const std = @import("std");
 const runner = @import("runner");
-const zero_native = @import("zero-native");
+const native_sdk = @import("native_sdk");
 
-pub const panic = std.debug.FullPanic(zero_native.debug.capturePanic);
+pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
 const window_width: f32 = 1040;
 const window_height: f32 = 680;
@@ -104,7 +104,7 @@ const html =
     \\      if (window.zero && window.zero.views && window.zero.views.list) {
     \\        return window.zero.views.list();
     \\      }
-    \\      return window.zero.invoke("zero-native.view.list", null);
+    \\      return window.zero.invoke("native-sdk.view.list", null);
     \\    };
     \\    document.querySelector("#inspect").addEventListener("click", async () => {
     \\      try { show(await listViews()); } catch (error) { fail(error); }
@@ -114,13 +114,13 @@ const html =
     \\</html>
 ;
 
-const app_permissions = [_][]const u8{zero_native.security.permission_view};
+const app_permissions = [_][]const u8{native_sdk.security.permission_view};
 const bridge_origins = [_][]const u8{ "zero://inline", "zero://app" };
-const view_permission = [_][]const u8{zero_native.security.permission_view};
-const builtin_policies = [_]zero_native.BridgeCommandPolicy{
-    .{ .name = "zero-native.view.list", .permissions = &view_permission, .origins = &bridge_origins },
+const view_permission = [_][]const u8{native_sdk.security.permission_view};
+const builtin_policies = [_]native_sdk.BridgeCommandPolicy{
+    .{ .name = "native-sdk.view.list", .permissions = &view_permission, .origins = &bridge_origins },
 };
-const shell_views = [_]zero_native.ShellView{
+const shell_views = [_]native_sdk.ShellView{
     .{ .label = "toolbar", .kind = .toolbar, .edge = .top, .height = toolbar_height, .layer = 20, .role = "Toolbar" },
     .{ .label = "toolbar-title", .kind = .label, .parent = "toolbar", .x = 16, .y = 14, .width = 220, .height = 20, .layer = 21, .text = "Pipeline" },
     .{ .label = "body", .kind = .split, .fill = true, .axis = .row },
@@ -136,35 +136,35 @@ const shell_views = [_]zero_native.ShellView{
     .{ .label = "statusbar", .kind = .statusbar, .edge = .bottom, .height = statusbar_height, .layer = 20, .role = "Status" },
     .{ .label = "status-label", .kind = .label, .parent = "statusbar", .x = 14, .y = 8, .width = 560, .height = 18, .layer = 21, .text = "Ready." },
 };
-const shell_windows = [_]zero_native.ShellWindow{.{
+const shell_windows = [_]native_sdk.ShellWindow{.{
     .label = "main",
-    .title = "zero-native Native Panels",
+    .title = "Native SDK Native Panels",
     .width = window_width,
     .height = window_height,
     .views = &shell_views,
 }};
-const shell_scene: zero_native.ShellConfig = .{ .windows = &shell_windows };
+const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 
 const NativePanelsApp = struct {
     apply_count: u32 = 0,
-    last_source: zero_native.CommandSource = .runtime,
+    last_source: native_sdk.CommandSource = .runtime,
 
-    fn app(self: *@This()) zero_native.App {
+    fn app(self: *@This()) native_sdk.App {
         return .{
             .context = self,
             .name = "native-panels",
-            .source = zero_native.WebViewSource.html(html),
+            .source = native_sdk.WebViewSource.html(html),
             .scene_fn = scene,
             .event_fn = event,
         };
     }
 
-    fn scene(context: *anyopaque) anyerror!zero_native.ShellConfig {
+    fn scene(context: *anyopaque) anyerror!native_sdk.ShellConfig {
         _ = context;
         return shell_scene;
     }
 
-    fn event(context: *anyopaque, runtime: *zero_native.Runtime, event_value: zero_native.Event) anyerror!void {
+    fn event(context: *anyopaque, runtime: *native_sdk.Runtime, event_value: native_sdk.Event) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(context));
         switch (event_value) {
             .command => |command| {
@@ -172,11 +172,11 @@ const NativePanelsApp = struct {
                     try self.apply(runtime, command);
                 }
             },
-            .shortcut, .files_dropped, .lifecycle => {},
+            .appearance_changed, .shortcut, .timer, .effects_wake, .audio, .files_dropped, .gpu_surface_frame, .gpu_surface_resized, .gpu_surface_input, .canvas_widget_pointer, .canvas_widget_keyboard, .canvas_widget_scroll, .canvas_widget_file_drop, .canvas_widget_drag, .canvas_widget_context_menu, .canvas_widget_context_menu_request, .canvas_widget_dismiss, .canvas_widget_context_press, .canvas_widget_resize, .canvas_widget_change, .window_closed, .automation_provenance, .lifecycle => {},
         }
     }
 
-    fn apply(self: *@This(), runtime: *zero_native.Runtime, command: zero_native.CommandEvent) anyerror!void {
+    fn apply(self: *@This(), runtime: *native_sdk.Runtime, command: native_sdk.CommandEvent) anyerror!void {
         self.apply_count += 1;
         self.last_source = command.source;
         var status_buffer: [128]u8 = undefined;
@@ -189,10 +189,9 @@ pub fn main(init: std.process.Init) !void {
     var app = NativePanelsApp{};
     try runner.runWithOptions(app.app(), .{
         .app_name = "native-panels",
-        .window_title = "zero-native Native Panels",
-        .bundle_id = "dev.zero_native.native_panels",
-        .icon_path = "assets/icon.icns",
-        .default_frame = zero_native.geometry.RectF.init(0, 0, window_width, window_height),
+        .window_title = "Native SDK Native Panels",
+        .bundle_id = "dev.native_sdk.native_panels",
+        .default_frame = native_sdk.geometry.RectF.init(0, 0, window_width, window_height),
         .builtin_bridge = .{ .enabled = true, .commands = &builtin_policies },
         .js_window_api = true,
         .security = .{
@@ -203,8 +202,8 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "native panels compose split sidebar controls and web content" {
-    var harness: zero_native.TestHarness() = undefined;
-    harness.init(.{ .size = zero_native.geometry.SizeF.init(window_width, window_height) });
+    const harness = try native_sdk.TestHarness().create(std.testing.allocator, .{ .size = native_sdk.geometry.SizeF.init(window_width, window_height) });
+    defer harness.destroy(std.testing.allocator);
     harness.runtime.options.builtin_bridge = .{ .enabled = true, .commands = &builtin_policies };
     harness.runtime.options.js_window_api = true;
     harness.runtime.options.security = .{
@@ -215,17 +214,17 @@ test "native panels compose split sidebar controls and web content" {
     var app = NativePanelsApp{};
     try harness.start(app.app());
 
-    var views_buffer: [20]zero_native.ViewInfo = undefined;
+    var views_buffer: [20]native_sdk.ViewInfo = undefined;
     const views = harness.runtime.listViews(1, &views_buffer);
     const body = findView(views, "body").?;
     const navigator = findView(views, "navigator").?;
     const filters = findView(views, "filters").?;
     const content = findView(views, "main").?;
 
-    try std.testing.expectEqual(zero_native.ViewKind.split, body.kind);
-    try std.testing.expectEqual(zero_native.ViewKind.sidebar, navigator.kind);
-    try std.testing.expectEqual(zero_native.ViewKind.stack, filters.kind);
-    try std.testing.expectEqual(zero_native.ViewKind.webview, content.kind);
+    try std.testing.expectEqual(native_sdk.ViewKind.split, body.kind);
+    try std.testing.expectEqual(native_sdk.ViewKind.sidebar, navigator.kind);
+    try std.testing.expectEqual(native_sdk.ViewKind.stack, filters.kind);
+    try std.testing.expectEqual(native_sdk.ViewKind.webview, content.kind);
     try std.testing.expectEqualStrings("body", navigator.parent.?);
     try std.testing.expectEqualStrings("navigator", filters.parent.?);
     try std.testing.expectEqual(toolbar_height, body.frame.y);
@@ -238,10 +237,10 @@ test "native panels compose split sidebar controls and web content" {
         .view_label = "apply-filter",
     } });
     try std.testing.expectEqual(@as(u32, 1), app.apply_count);
-    try std.testing.expectEqual(zero_native.CommandSource.native_view, app.last_source);
+    try std.testing.expectEqual(native_sdk.CommandSource.native_view, app.last_source);
 
     try harness.runtime.dispatchPlatformEvent(app.app(), .{ .bridge_message = .{
-        .bytes = "{\"id\":\"1\",\"command\":\"zero-native.view.list\",\"payload\":null}",
+        .bytes = "{\"id\":\"1\",\"command\":\"native-sdk.view.list\",\"payload\":null}",
         .origin = "zero://inline",
         .window_id = 1,
         .webview_label = "main",
@@ -250,7 +249,7 @@ test "native panels compose split sidebar controls and web content" {
     try std.testing.expect(std.mem.indexOf(u8, harness.null_platform.lastBridgeResponse(), "\"navigator\"") != null);
 }
 
-fn findView(views: []const zero_native.ViewInfo, label: []const u8) ?zero_native.ViewInfo {
+fn findView(views: []const native_sdk.ViewInfo, label: []const u8) ?native_sdk.ViewInfo {
     for (views) |view| {
         if (std.mem.eql(u8, view.label, label)) return view;
     }

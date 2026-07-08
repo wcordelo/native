@@ -1,0 +1,1650 @@
+const support = @import("test_support.zig");
+const std = support.std;
+const geometry = support.geometry;
+const canvas = support.canvas;
+const drawing_model = support.drawing_model;
+const text_model = support.text_model;
+const render_model = support.render_model;
+const event_model = support.event_model;
+const equality_model = support.equality_model;
+const widget_runtime = support.widget_runtime;
+const Error = support.Error;
+const ObjectId = support.ObjectId;
+const ImageId = support.ImageId;
+const FontId = support.FontId;
+const default_sans_font_id = support.default_sans_font_id;
+const default_mono_font_id = support.default_mono_font_id;
+const default_sans_font_family = support.default_sans_font_family;
+const default_mono_font_family = support.default_mono_font_family;
+const default_glyph_atlas_cache_retention_frames = support.default_glyph_atlas_cache_retention_frames;
+const default_text_layout_cache_retention_frames = support.default_text_layout_cache_retention_frames;
+const Color = support.Color;
+const Affine = support.Affine;
+const Radius = support.Radius;
+const GradientStop = support.GradientStop;
+const LinearGradient = support.LinearGradient;
+const Fill = support.Fill;
+const Stroke = support.Stroke;
+const Clip = support.Clip;
+const FillRect = support.FillRect;
+const StrokeRect = support.StrokeRect;
+const FillRoundedRect = support.FillRoundedRect;
+const Line = support.Line;
+const PathVerb = support.PathVerb;
+const PathElement = support.PathElement;
+const FillPath = support.FillPath;
+const StrokePath = support.StrokePath;
+const ImageFit = support.ImageFit;
+const ImageSampling = support.ImageSampling;
+const DrawImage = support.DrawImage;
+const Shadow = support.Shadow;
+const Blur = support.Blur;
+const Glyph = support.Glyph;
+const GlyphAtlasKey = support.GlyphAtlasKey;
+const GlyphAtlasEntry = support.GlyphAtlasEntry;
+const GlyphAtlasPlan = support.GlyphAtlasPlan;
+const GlyphAtlasPlanner = support.GlyphAtlasPlanner;
+const GlyphAtlasCacheEntry = support.GlyphAtlasCacheEntry;
+const GlyphAtlasCacheActionKind = support.GlyphAtlasCacheActionKind;
+const GlyphAtlasCacheAction = support.GlyphAtlasCacheAction;
+const GlyphAtlasCachePlan = support.GlyphAtlasCachePlan;
+const GlyphAtlasCachePlanner = support.GlyphAtlasCachePlanner;
+const DrawText = support.DrawText;
+const TextWrap = support.TextWrap;
+const TextAlign = support.TextAlign;
+const TextLayoutOptions = support.TextLayoutOptions;
+const TextLine = support.TextLine;
+const TextLayout = support.TextLayout;
+const TextLayoutKey = support.TextLayoutKey;
+const TextLayoutPlan = support.TextLayoutPlan;
+const TextLayoutPlanSet = support.TextLayoutPlanSet;
+const TextLayoutPlanner = support.TextLayoutPlanner;
+const TextLayoutCacheEntry = support.TextLayoutCacheEntry;
+const TextLayoutCacheActionKind = support.TextLayoutCacheActionKind;
+const TextLayoutCacheAction = support.TextLayoutCacheAction;
+const TextLayoutCachePlan = support.TextLayoutCachePlan;
+const TextLayoutCachePlanner = support.TextLayoutCachePlanner;
+const TextRange = support.TextRange;
+const TextSelectionRect = support.TextSelectionRect;
+const TextSelection = support.TextSelection;
+const TextCaretDirection = support.TextCaretDirection;
+const TextCaretMove = support.TextCaretMove;
+const TextCompositionUpdate = support.TextCompositionUpdate;
+const TextInputEvent = support.TextInputEvent;
+const TextEditState = support.TextEditState;
+const CanvasCommand = support.CanvasCommand;
+const CommandRef = support.CommandRef;
+const DiffKind = support.DiffKind;
+const DiffChange = support.DiffChange;
+const Builder = support.Builder;
+const max_render_state_stack = support.max_render_state_stack;
+const RenderState = support.RenderState;
+const RenderCommand = support.RenderCommand;
+const CanvasRenderOverride = support.CanvasRenderOverride;
+const CanvasRenderAnimation = support.CanvasRenderAnimation;
+const applyRenderOverrides = support.applyRenderOverrides;
+const renderOverrideDirtyBounds = support.renderOverrideDirtyBounds;
+const RenderPlan = support.RenderPlan;
+const RenderPlanner = support.RenderPlanner;
+const RenderPipelineKind = support.RenderPipelineKind;
+const RenderBatch = support.RenderBatch;
+const RenderBatchPlanner = support.RenderBatchPlanner;
+const RenderBatchPlan = support.RenderBatchPlan;
+const RenderPipelineCacheEntry = support.RenderPipelineCacheEntry;
+const RenderPipelineCacheActionKind = support.RenderPipelineCacheActionKind;
+const RenderPipelineCacheAction = support.RenderPipelineCacheAction;
+const RenderPipelineCachePlanner = support.RenderPipelineCachePlanner;
+const RenderPipelineCachePlan = support.RenderPipelineCachePlan;
+const RenderPathGeometryKind = support.RenderPathGeometryKind;
+const RenderPathGeometry = support.RenderPathGeometry;
+const RenderPathGeometryPlan = support.RenderPathGeometryPlan;
+const RenderPathGeometryPlanner = support.RenderPathGeometryPlanner;
+const RenderPathGeometryKey = support.RenderPathGeometryKey;
+const RenderPathGeometryCacheEntry = support.RenderPathGeometryCacheEntry;
+const RenderPathGeometryCacheActionKind = support.RenderPathGeometryCacheActionKind;
+const RenderPathGeometryCacheAction = support.RenderPathGeometryCacheAction;
+const RenderPathGeometryCachePlan = support.RenderPathGeometryCachePlan;
+const RenderPathGeometryCachePlanner = support.RenderPathGeometryCachePlanner;
+const RenderImage = support.RenderImage;
+const RenderImagePlan = support.RenderImagePlan;
+const RenderImagePlanner = support.RenderImagePlanner;
+const RenderImageKey = support.RenderImageKey;
+const RenderImageCacheEntry = support.RenderImageCacheEntry;
+const RenderImageCacheActionKind = support.RenderImageCacheActionKind;
+const RenderImageCacheAction = support.RenderImageCacheAction;
+const RenderImageCachePlan = support.RenderImageCachePlan;
+const RenderImageCachePlanner = support.RenderImageCachePlanner;
+const RenderResourceKind = support.RenderResourceKind;
+const RenderResource = support.RenderResource;
+const RenderResourcePlan = support.RenderResourcePlan;
+const RenderResourcePlanner = support.RenderResourcePlanner;
+const RenderResourceKey = support.RenderResourceKey;
+const RenderResourceCacheEntry = support.RenderResourceCacheEntry;
+const RenderResourceCacheActionKind = support.RenderResourceCacheActionKind;
+const RenderResourceCacheAction = support.RenderResourceCacheAction;
+const RenderResourceCachePlan = support.RenderResourceCachePlan;
+const RenderResourceCachePlanner = support.RenderResourceCachePlanner;
+const RenderLayer = support.RenderLayer;
+const RenderLayerPlan = support.RenderLayerPlan;
+const RenderLayerPlanner = support.RenderLayerPlanner;
+const RenderLayerKey = support.RenderLayerKey;
+const RenderLayerCacheEntry = support.RenderLayerCacheEntry;
+const RenderLayerCacheActionKind = support.RenderLayerCacheActionKind;
+const RenderLayerCacheAction = support.RenderLayerCacheAction;
+const RenderLayerCachePlan = support.RenderLayerCachePlan;
+const RenderLayerCachePlanner = support.RenderLayerCachePlanner;
+const VisualEffectKind = support.VisualEffectKind;
+const VisualEffect = support.VisualEffect;
+const VisualEffectPlan = support.VisualEffectPlan;
+const VisualEffectPlanner = support.VisualEffectPlanner;
+const VisualEffectKey = support.VisualEffectKey;
+const VisualEffectCacheEntry = support.VisualEffectCacheEntry;
+const VisualEffectCacheActionKind = support.VisualEffectCacheActionKind;
+const VisualEffectCacheAction = support.VisualEffectCacheAction;
+const VisualEffectCachePlan = support.VisualEffectCachePlan;
+const VisualEffectCachePlanner = support.VisualEffectCachePlanner;
+const CanvasFrameOptions = support.CanvasFrameOptions;
+const CanvasFrameStorage = support.CanvasFrameStorage;
+const CanvasFrameBudget = support.CanvasFrameBudget;
+const CanvasFrameBudgetStatus = support.CanvasFrameBudgetStatus;
+const CanvasFrameDiagnostics = support.CanvasFrameDiagnostics;
+const CanvasFrameProfileRisk = support.CanvasFrameProfileRisk;
+const CanvasFrameProfile = support.CanvasFrameProfile;
+const CanvasRenderPass = support.CanvasRenderPass;
+const CanvasFrame = support.CanvasFrame;
+const buildCanvasFrame = support.buildCanvasFrame;
+const CanvasRenderPassLoadAction = support.CanvasRenderPassLoadAction;
+const RenderEncoderBeginPass = support.RenderEncoderBeginPass;
+const RenderEncoderCommand = support.RenderEncoderCommand;
+const RenderEncoderPlan = support.RenderEncoderPlan;
+const RenderEncoderPlanner = support.RenderEncoderPlanner;
+const CanvasGpuCommandKind = support.CanvasGpuCommandKind;
+const CanvasGpuRoundedRect = support.CanvasGpuRoundedRect;
+const CanvasGpuStrokeRect = support.CanvasGpuStrokeRect;
+const CanvasGpuLine = support.CanvasGpuLine;
+const CanvasGpuShape = support.CanvasGpuShape;
+const CanvasGpuPaint = support.CanvasGpuPaint;
+const CanvasGpuImage = support.CanvasGpuImage;
+const CanvasGpuText = support.CanvasGpuText;
+const CanvasGpuShadow = support.CanvasGpuShadow;
+const CanvasGpuBlur = support.CanvasGpuBlur;
+const CanvasGpuEffect = support.CanvasGpuEffect;
+const CanvasGpuCommand = support.CanvasGpuCommand;
+const CanvasGpuPacket = support.CanvasGpuPacket;
+const CanvasGpuPacketSummary = support.CanvasGpuPacketSummary;
+const CanvasGpuPacketPlanner = support.CanvasGpuPacketPlanner;
+const ReferenceImage = support.ReferenceImage;
+const ReferenceRenderSurface = support.ReferenceRenderSurface;
+const Density = support.Density;
+const Easing = support.Easing;
+const ColorScheme = support.ColorScheme;
+const ColorContrast = support.ColorContrast;
+const ThemeOptions = support.ThemeOptions;
+const ColorTokens = support.ColorTokens;
+const FontFamily = support.FontFamily;
+const TypographyTokens = support.TypographyTokens;
+const SpacingTokens = support.SpacingTokens;
+const RadiusTokens = support.RadiusTokens;
+const StrokeTokens = support.StrokeTokens;
+const ShadowToken = support.ShadowToken;
+const ShadowTokens = support.ShadowTokens;
+const BlurTokens = support.BlurTokens;
+const MotionDuration = support.MotionDuration;
+const MotionAnimationOptions = support.MotionAnimationOptions;
+const MotionTokens = support.MotionTokens;
+const SpringToken = support.SpringToken;
+const BlurTokenRef = support.BlurTokenRef;
+const ScrollPhysics = support.ScrollPhysics;
+const ScrollState = support.ScrollState;
+const VirtualListOptions = support.VirtualListOptions;
+const VirtualListRange = support.VirtualListRange;
+const virtualListRange = support.virtualListRange;
+const LayerTokens = support.LayerTokens;
+const PixelSnapTokens = support.PixelSnapTokens;
+const ControlVisualTokens = support.ControlVisualTokens;
+const ControlTokens = support.ControlTokens;
+const ColorTokenOverrides = support.ColorTokenOverrides;
+const TypographyTokenOverrides = support.TypographyTokenOverrides;
+const SpacingTokenOverrides = support.SpacingTokenOverrides;
+const RadiusTokenOverrides = support.RadiusTokenOverrides;
+const StrokeTokenOverrides = support.StrokeTokenOverrides;
+const ShadowTokenOverrides = support.ShadowTokenOverrides;
+const ShadowTokensOverrides = support.ShadowTokensOverrides;
+const BlurTokenOverrides = support.BlurTokenOverrides;
+const SpringTokenOverrides = support.SpringTokenOverrides;
+const MotionTokenOverrides = support.MotionTokenOverrides;
+const ScrollPhysicsOverrides = support.ScrollPhysicsOverrides;
+const LayerTokenOverrides = support.LayerTokenOverrides;
+const PixelSnapTokenOverrides = support.PixelSnapTokenOverrides;
+const ControlVisualTokenOverrides = support.ControlVisualTokenOverrides;
+const ControlTokenOverrides = support.ControlTokenOverrides;
+const DesignTokenOverrides = support.DesignTokenOverrides;
+const DesignTokens = support.DesignTokens;
+const WidgetKind = support.WidgetKind;
+const WidgetCursor = support.WidgetCursor;
+const WidgetState = support.WidgetState;
+const WidgetRenderState = support.WidgetRenderState;
+const WidgetMainAlignment = support.WidgetMainAlignment;
+const WidgetCrossAlignment = support.WidgetCrossAlignment;
+const WidgetLayoutStyle = support.WidgetLayoutStyle;
+const WidgetStyle = support.WidgetStyle;
+const WidgetVariant = support.WidgetVariant;
+const WidgetSize = support.WidgetSize;
+const WidgetRole = support.WidgetRole;
+const BuiltinComponentStyle = support.BuiltinComponentStyle;
+const BuiltinComponentKind = support.BuiltinComponentKind;
+const builtin_component_kinds = support.builtin_component_kinds;
+const builtin_component_names = support.builtin_component_names;
+const BuiltinComponentDescriptor = support.BuiltinComponentDescriptor;
+const builtinComponentCount = support.builtinComponentCount;
+const builtinComponentName = support.builtinComponentName;
+const builtinComponentDescriptor = support.builtinComponentDescriptor;
+const WidgetActions = support.WidgetActions;
+const WidgetSemantics = support.WidgetSemantics;
+const Widget = support.Widget;
+const BuiltinComponentOptions = support.BuiltinComponentOptions;
+const WidgetCommandPart = support.WidgetCommandPart;
+const BuiltinSurfacePlacementOptions = support.BuiltinSurfacePlacementOptions;
+const BuiltinSurfaceBackdropOptions = support.BuiltinSurfaceBackdropOptions;
+const BuiltinStatusBarOptions = support.BuiltinStatusBarOptions;
+const BuiltinSurfaceEnterAnimationOptions = support.BuiltinSurfaceEnterAnimationOptions;
+const builtinComponentWidget = support.builtinComponentWidget;
+const widgetCommandPartId = support.widgetCommandPartId;
+const builtinSurfaceBackdropWidget = support.builtinSurfaceBackdropWidget;
+const builtinStatusBarWidget = support.builtinStatusBarWidget;
+const builtinSurfaceFrame = support.builtinSurfaceFrame;
+const appendBuiltinSurfaceEnterAnimations = support.appendBuiltinSurfaceEnterAnimations;
+const builtinSurfaceEnterOffset = support.builtinSurfaceEnterOffset;
+const max_widget_depth = support.max_widget_depth;
+const max_widget_text_range_rects = support.max_widget_text_range_rects;
+const WidgetLayoutNode = support.WidgetLayoutNode;
+const WidgetHit = support.WidgetHit;
+const WidgetPointerPhase = support.WidgetPointerPhase;
+const WidgetPointerEvent = support.WidgetPointerEvent;
+const WidgetKeyboardPhase = support.WidgetKeyboardPhase;
+const WidgetKeyboardModifiers = support.WidgetKeyboardModifiers;
+const WidgetKeyboardEvent = support.WidgetKeyboardEvent;
+const WidgetControlIntentKind = support.WidgetControlIntentKind;
+const WidgetControlIntent = support.WidgetControlIntent;
+const WidgetSemanticAction = support.WidgetSemanticAction;
+const WidgetFileDropEvent = support.WidgetFileDropEvent;
+const WidgetDragEvent = support.WidgetDragEvent;
+const WidgetEventPhase = support.WidgetEventPhase;
+const WidgetEventRouteEntry = support.WidgetEventRouteEntry;
+const WidgetEventRoute = support.WidgetEventRoute;
+const WidgetKeyboardRoute = support.WidgetKeyboardRoute;
+const WidgetFocusDirection = support.WidgetFocusDirection;
+const WidgetFocusTarget = support.WidgetFocusTarget;
+const WidgetScrollMetrics = support.WidgetScrollMetrics;
+const WidgetListMetrics = support.WidgetListMetrics;
+const WidgetSemanticsNode = support.WidgetSemanticsNode;
+const WidgetInvalidationKind = support.WidgetInvalidationKind;
+const WidgetInvalidation = support.WidgetInvalidation;
+const widgetKeyboardControlIntent = support.widgetKeyboardControlIntent;
+const widgetSemanticControlIntent = support.widgetSemanticControlIntent;
+const widgetSemanticControlIntentWithActions = support.widgetSemanticControlIntentWithActions;
+const isWidgetActivationKey = support.isWidgetActivationKey;
+const widgetSliderKeyboardValue = support.widgetSliderKeyboardValue;
+const widgetScrollKeyboardIntent = support.widgetScrollKeyboardIntent;
+const widgetScrollKeyboardDelta = support.widgetScrollKeyboardDelta;
+const WidgetLayoutTree = support.WidgetLayoutTree;
+const DisplayList = support.DisplayList;
+const emitWidgetTree = support.emitWidgetTree;
+const layoutWidgetTree = support.layoutWidgetTree;
+const layoutWidgetTreeWithTokens = support.layoutWidgetTreeWithTokens;
+const layoutTextRun = support.layoutTextRun;
+const layoutTextRunPlan = support.layoutTextRunPlan;
+const layoutTextCaretRect = support.layoutTextCaretRect;
+const textCaretRectForLayout = support.textCaretRectForLayout;
+const layoutTextSelectionRects = support.layoutTextSelectionRects;
+const textSelectionRectsForLayout = support.textSelectionRectsForLayout;
+const layoutTextOffsetForPoint = support.layoutTextOffsetForPoint;
+const textOffsetForLayoutPoint = support.textOffsetForLayoutPoint;
+const applyTextInputEvent = support.applyTextInputEvent;
+const sampleCanvasRenderAnimations = support.sampleCanvasRenderAnimations;
+const emitWidgetLayout = support.emitWidgetLayout;
+const toggleWidgetKnobCommandId = support.toggleWidgetKnobCommandId;
+const toggleWidgetKnobTravel = support.toggleWidgetKnobTravel;
+const textSelectionForWidgetPoint = support.textSelectionForWidgetPoint;
+const textOffsetForWidgetPoint = support.textOffsetForWidgetPoint;
+const textInputViewportForWidget = support.textInputViewportForWidget;
+const textInputContentExtentForWidget = support.textInputContentExtentForWidget;
+const textInputMaxScrollOffsetForWidget = support.textInputMaxScrollOffsetForWidget;
+const clampedTextInputScrollOffsetForWidget = support.clampedTextInputScrollOffsetForWidget;
+const intrinsicWidgetSize = support.intrinsicWidgetSize;
+const cursorForWidgetHit = support.cursorForWidgetHit;
+const cursorForWidgetTarget = support.cursorForWidgetTarget;
+const WidgetTextGeometry = support.WidgetTextGeometry;
+const textGeometryForWidget = support.textGeometryForWidget;
+const virtualWidgetScrollContentExtent = support.virtualWidgetScrollContentExtent;
+const virtualWidgetScrollContentExtentWithTokens = support.virtualWidgetScrollContentExtentWithTokens;
+const writeCanvasGpuPacketJson = support.writeCanvasGpuPacketJson;
+const strokeBounds = support.strokeBounds;
+const shadowBounds = support.shadowBounds;
+const semanticActions = support.semanticActions;
+const defaultSemanticActions = support.defaultSemanticActions;
+const defaultFocusable = support.defaultFocusable;
+const textLineBounds = support.textLineBounds;
+const textBounds = support.textBounds;
+const estimateTextWidth = support.estimateTextWidth;
+const estimateTextWidthForFont = support.estimateTextWidthForFont;
+const estimateTextAdvanceForBytes = support.estimateTextAdvanceForBytes;
+const estimatedGlyphAdvance = support.estimatedGlyphAdvance;
+const snapTextSelection = support.snapTextSelection;
+const snapTextRange = support.snapTextRange;
+const nextTextOffset = support.nextTextOffset;
+const nextTextLineEnd = support.nextTextLineEnd;
+const isTextBreakByte = support.isTextBreakByte;
+const textLineRange = support.textLineRange;
+const textLineCaretX = support.textLineCaretX;
+const motionProgress = support.motionProgress;
+const renderImageFingerprint = support.renderImageFingerprint;
+const renderImageFingerprintForResource = support.renderImageFingerprintForResource;
+const commandsEqual = support.commandsEqual;
+const rectsEqual = support.rectsEqual;
+const optionalRectsEqual = support.optionalRectsEqual;
+const sizesEqual = support.sizesEqual;
+const insetsEqual = support.insetsEqual;
+const optionalColorsEqual = support.optionalColorsEqual;
+const radiiEqual = support.radiiEqual;
+const affinesEqual = support.affinesEqual;
+const optionalF32Equal = support.optionalF32Equal;
+const optionalTextSelectionsEqual = support.optionalTextSelectionsEqual;
+const optionalTextRangesEqual = support.optionalTextRangesEqual;
+const widgetPartId = support.widgetPartId;
+const colorWithAlpha = support.colorWithAlpha;
+const widgetControlHeight = support.widgetControlHeight;
+const textSelectionFillColor = support.textSelectionFillColor;
+const transparentColor = support.transparentColor;
+const expectRect = support.expectRect;
+const expectRectApprox = support.expectRectApprox;
+const expectPixelRgba8 = support.expectPixelRgba8;
+const expectVisiblePixel = support.expectVisiblePixel;
+const referenceSurfaceSignature = support.referenceSurfaceSignature;
+const expectLayoutFrame = support.expectLayoutFrame;
+const expectRouteEntry = support.expectRouteEntry;
+const expectFillColor = support.expectFillColor;
+const expectGpuPaintColor = support.expectGpuPaintColor;
+
+test "reference renderer clears and fills solid rect render pass" {
+    const commands = [_]CanvasCommand{.{ .fill_rect = .{
+        .id = 1,
+        .rect = geometry.RectF.init(1, 1, 2, 2),
+        .fill = .{ .color = Color.rgb8(255, 0, 0) },
+    } }};
+
+    var render_commands: [1]RenderCommand = undefined;
+    var render_batches: [1]RenderBatch = undefined;
+    var resources: [0]RenderResource = .{};
+    var resource_cache_entries: [0]RenderResourceCacheEntry = .{};
+    var resource_cache_actions: [0]RenderResourceCacheAction = .{};
+    var glyphs: [0]GlyphAtlasEntry = .{};
+    var changes: [0]DiffChange = .{};
+    const frame = try (DisplayList{ .commands = &commands }).framePlan(null, .{
+        .surface_size = geometry.SizeF.init(4, 4),
+    }, .{
+        .render_commands = &render_commands,
+        .render_batches = &render_batches,
+        .resources = &resources,
+        .resource_cache_entries = &resource_cache_entries,
+        .resource_cache_actions = &resource_cache_actions,
+        .glyph_atlas_entries = &glyphs,
+        .changes = &changes,
+    });
+
+    var pixels: [4 * 4 * 4]u8 = undefined;
+    const surface = try ReferenceRenderSurface.init(4, 4, &pixels);
+    try surface.renderPass(frame.renderPass(), Color.rgb8(0, 0, 0));
+    try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 0, 0);
+    try expectPixelRgba8(.{ 255, 0, 0, 255 }, surface, 1, 1);
+    try expectPixelRgba8(.{ 255, 0, 0, 255 }, surface, 2, 2);
+    try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 3, 3);
+
+    try surface.renderPass(.{}, Color.rgb8(255, 255, 255));
+    try expectPixelRgba8(.{ 255, 0, 0, 255 }, surface, 1, 1);
+}
+
+test "reference renderer applies render pass scale" {
+    const commands = [_]CanvasCommand{.{ .fill_rect = .{
+        .id = 1,
+        .rect = geometry.RectF.init(1, 1, 1, 1),
+        .fill = .{ .color = Color.rgb8(255, 0, 0) },
+    } }};
+
+    var render_commands: [1]RenderCommand = undefined;
+    var render_batches: [1]RenderBatch = undefined;
+    var resources: [0]RenderResource = .{};
+    var resource_cache_entries: [0]RenderResourceCacheEntry = .{};
+    var resource_cache_actions: [0]RenderResourceCacheAction = .{};
+    var glyphs: [0]GlyphAtlasEntry = .{};
+    var changes: [0]DiffChange = .{};
+    const frame = try (DisplayList{ .commands = &commands }).framePlan(null, .{
+        .surface_size = geometry.SizeF.init(2, 2),
+        .scale = 2,
+    }, .{
+        .render_commands = &render_commands,
+        .render_batches = &render_batches,
+        .resources = &resources,
+        .resource_cache_entries = &resource_cache_entries,
+        .resource_cache_actions = &resource_cache_actions,
+        .glyph_atlas_entries = &glyphs,
+        .changes = &changes,
+    });
+
+    var pixels: [4 * 4 * 4]u8 = undefined;
+    const surface = try ReferenceRenderSurface.init(4, 4, &pixels);
+    try surface.renderPass(frame.renderPass(), Color.rgb8(0, 0, 0));
+    try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 1, 1);
+    try expectPixelRgba8(.{ 255, 0, 0, 255 }, surface, 2, 2);
+    try expectPixelRgba8(.{ 255, 0, 0, 255 }, surface, 3, 3);
+}
+
+test "reference renderer applies render pass scissor on load" {
+    const commands = [_]RenderCommand{.{
+        .command = .{ .fill_rect = .{
+            .id = 1,
+            .rect = geometry.RectF.init(0, 0, 4, 4),
+            .fill = .{ .color = Color.rgb8(255, 0, 0) },
+        } },
+        .local_bounds = geometry.RectF.init(0, 0, 4, 4),
+        .bounds = geometry.RectF.init(0, 0, 4, 4),
+    }};
+
+    var pixels: [4 * 4 * 4]u8 = undefined;
+    const surface = try ReferenceRenderSurface.init(4, 4, &pixels);
+    surface.clear(Color.rgb8(0, 0, 255));
+    try surface.renderPass(.{
+        .dirty_bounds = geometry.RectF.init(1, 1, 2, 2),
+        .commands = &commands,
+    }, Color.rgb8(0, 0, 0));
+
+    try expectPixelRgba8(.{ 0, 0, 255, 255 }, surface, 0, 0);
+    try expectPixelRgba8(.{ 255, 0, 0, 255 }, surface, 1, 1);
+    try expectPixelRgba8(.{ 255, 0, 0, 255 }, surface, 2, 2);
+    try expectPixelRgba8(.{ 0, 0, 255, 255 }, surface, 3, 3);
+}
+
+test "reference renderer clears dirty rect on retained load" {
+    const commands = [_]RenderCommand{.{
+        .command = .{ .fill_rect = .{
+            .id = 1,
+            .rect = geometry.RectF.init(1, 1, 1, 1),
+            .fill = .{ .color = Color.rgb8(255, 0, 0) },
+        } },
+        .local_bounds = geometry.RectF.init(1, 1, 1, 1),
+        .bounds = geometry.RectF.init(1, 1, 1, 1),
+    }};
+
+    var pixels: [4 * 4 * 4]u8 = undefined;
+    const surface = try ReferenceRenderSurface.init(4, 4, &pixels);
+    surface.clear(Color.rgb8(0, 0, 255));
+    try surface.renderPass(.{
+        .dirty_bounds = geometry.RectF.init(1, 1, 2, 2),
+        .commands = &commands,
+    }, Color.rgb8(0, 0, 0));
+
+    try expectPixelRgba8(.{ 0, 0, 255, 255 }, surface, 0, 0);
+    try expectPixelRgba8(.{ 255, 0, 0, 255 }, surface, 1, 1);
+    try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 2, 2);
+    try expectPixelRgba8(.{ 0, 0, 255, 255 }, surface, 3, 3);
+}
+
+test "reference renderer captures Phase 2 primitive signature" {
+    const stops = [_]GradientStop{
+        .{ .offset = 0, .color = Color.rgb8(248, 250, 252) },
+        .{ .offset = 1, .color = Color.rgb8(48, 111, 237) },
+    };
+    const glyphs = [_]Glyph{
+        .{ .id = 1, .x = 0, .y = 0, .advance = 4 },
+        .{ .id = 2, .x = 5, .y = 0, .advance = 4 },
+    };
+    const image_pixels = [_]u8{
+        16,  185, 129, 255,
+        255, 255, 255, 255,
+        15,  23,  42,  255,
+        48,  111, 237, 255,
+    };
+    const images = [_]ReferenceImage{.{
+        .id = 7,
+        .width = 2,
+        .height = 2,
+        .pixels = &image_pixels,
+    }};
+    const commands = [_]CanvasCommand{
+        .{ .fill_rect = .{
+            .id = 1,
+            .rect = geometry.RectF.init(0, 0, 32, 24),
+            .fill = .{ .linear_gradient = .{ .start = geometry.PointF.init(0, 0), .end = geometry.PointF.init(32, 24), .stops = &stops } },
+        } },
+        .{ .shadow = .{
+            .id = 2,
+            .rect = geometry.RectF.init(4, 4, 18, 10),
+            .radius = Radius.all(3),
+            .offset = .{ .dx = 0, .dy = 2 },
+            .blur = 2,
+            .spread = 0,
+            .color = Color.rgba8(15, 23, 42, 64),
+        } },
+        .{ .push_clip = .{ .id = 3, .rect = geometry.RectF.init(2, 2, 28, 20), .radius = Radius.all(2) } },
+        .{ .push_opacity = 0.84 },
+        .{ .transform = Affine.translate(1, 1) },
+        .{ .fill_rounded_rect = .{
+            .id = 4,
+            .rect = geometry.RectF.init(4, 4, 18, 10),
+            .radius = Radius.all(3),
+            .fill = .{ .color = Color.rgb8(255, 255, 255) },
+        } },
+        .{ .stroke_rect = .{
+            .id = 5,
+            .rect = geometry.RectF.init(4, 4, 18, 10),
+            .radius = Radius.all(3),
+            .stroke = .{ .fill = .{ .color = Color.rgb8(15, 23, 42) }, .width = 1 },
+        } },
+        .{ .draw_image = .{
+            .id = 6,
+            .image_id = 7,
+            .dst = geometry.RectF.init(18, 5, 8, 8),
+            .fit = .cover,
+            .sampling = .nearest,
+        } },
+        .{ .draw_text = .{
+            .id = 7,
+            .font_id = 1,
+            .size = 4,
+            .origin = geometry.PointF.init(6, 18),
+            .color = Color.rgb8(15, 23, 42),
+            .text = "UI",
+            .glyphs = &glyphs,
+        } },
+        .pop_opacity,
+        .pop_clip,
+        .{ .blur = .{
+            .id = 8,
+            .rect = geometry.RectF.init(24, 2, 6, 6),
+            .radius = 1,
+        } },
+    };
+
+    var render_commands: [commands.len]RenderCommand = undefined;
+    var render_batches: [commands.len]RenderBatch = undefined;
+    var pipeline_cache_entries: [8]RenderPipelineCacheEntry = undefined;
+    var pipeline_cache_actions: [16]RenderPipelineCacheAction = undefined;
+    var layers: [commands.len]RenderLayer = undefined;
+    var layer_cache_entries: [commands.len]RenderLayerCacheEntry = undefined;
+    var layer_cache_actions: [commands.len * 2]RenderLayerCacheAction = undefined;
+    var resources: [8]RenderResource = undefined;
+    var resource_cache_entries: [8]RenderResourceCacheEntry = undefined;
+    var resource_cache_actions: [16]RenderResourceCacheAction = undefined;
+    var visual_effects: [4]VisualEffect = undefined;
+    var visual_effect_cache_entries: [4]VisualEffectCacheEntry = undefined;
+    var visual_effect_cache_actions: [8]VisualEffectCacheAction = undefined;
+    var glyph_atlas_entries: [8]GlyphAtlasEntry = undefined;
+    var glyph_cache_entries: [8]GlyphAtlasCacheEntry = undefined;
+    var glyph_cache_actions: [16]GlyphAtlasCacheAction = undefined;
+    var text_layout_plans: [4]TextLayoutPlan = undefined;
+    var text_layout_lines: [8]TextLine = undefined;
+    var text_layout_cache_entries: [4]TextLayoutCacheEntry = undefined;
+    var text_layout_cache_actions: [8]TextLayoutCacheAction = undefined;
+    var changes: [commands.len]DiffChange = undefined;
+    const frame = try (DisplayList{ .commands = &commands }).framePlan(null, .{
+        .surface_size = geometry.SizeF.init(32, 24),
+        .full_repaint = true,
+    }, .{
+        .render_commands = &render_commands,
+        .render_batches = &render_batches,
+        .pipeline_cache_entries = &pipeline_cache_entries,
+        .pipeline_cache_actions = &pipeline_cache_actions,
+        .layers = &layers,
+        .layer_cache_entries = &layer_cache_entries,
+        .layer_cache_actions = &layer_cache_actions,
+        .resources = &resources,
+        .resource_cache_entries = &resource_cache_entries,
+        .resource_cache_actions = &resource_cache_actions,
+        .visual_effects = &visual_effects,
+        .visual_effect_cache_entries = &visual_effect_cache_entries,
+        .visual_effect_cache_actions = &visual_effect_cache_actions,
+        .glyph_atlas_entries = &glyph_atlas_entries,
+        .glyph_atlas_cache_entries = &glyph_cache_entries,
+        .glyph_atlas_cache_actions = &glyph_cache_actions,
+        .text_layout_plans = &text_layout_plans,
+        .text_layout_lines = &text_layout_lines,
+        .text_layout_cache_entries = &text_layout_cache_entries,
+        .text_layout_cache_actions = &text_layout_cache_actions,
+        .changes = &changes,
+    });
+
+    try std.testing.expect(frame.requiresRender());
+    try std.testing.expect(frame.batch_plan.batchCount() >= 5);
+    try std.testing.expectEqual(@as(usize, 1), frame.layer_plan.opacityLayerCount());
+    try std.testing.expectEqual(@as(usize, 1), frame.layer_plan.clipLayerCount());
+    try std.testing.expectEqual(@as(usize, 2), frame.layer_plan.transformLayerCount());
+    try std.testing.expect(frame.resource_plan.resourceCount() >= 3);
+    try std.testing.expect(frame.visual_effect_plan.shadowCount() >= 1);
+    try std.testing.expect(frame.visual_effect_plan.blurCount() >= 1);
+    try std.testing.expectEqual(@as(usize, 2), frame.glyph_atlas_plan.entryCount());
+
+    var pixels: [32 * 24 * 4]u8 = undefined;
+    var scratch: [32 * 24 * 4]u8 = undefined;
+    const surface = (try ReferenceRenderSurface.initWithScratch(32, 24, &pixels, &scratch)).withImages(&images);
+    try surface.renderPass(frame.renderPass(), Color.rgb8(0, 0, 0));
+
+    try std.testing.expectEqual(@as(u64, 12197497484215834747), referenceSurfaceSignature(&pixels));
+    try expectVisiblePixel(surface.pixelRgba8(6, 6));
+    try expectVisiblePixel(surface.pixelRgba8(20, 8));
+    try expectVisiblePixel(surface.pixelRgba8(6, 16));
+}
+
+test "reference renderer applies clip transform and opacity" {
+    const commands = [_]CanvasCommand{
+        .{ .push_clip = .{ .rect = geometry.RectF.init(1, 1, 2, 2) } },
+        .{ .push_opacity = 0.5 },
+        .{ .transform = Affine.translate(1, 0) },
+        .{ .fill_rect = .{
+            .id = 1,
+            .rect = geometry.RectF.init(0, 0, 3, 3),
+            .fill = .{ .color = Color.rgb8(255, 0, 0) },
+        } },
+        .pop_opacity,
+        .pop_clip,
+    };
+
+    var render_commands: [1]RenderCommand = undefined;
+    var render_batches: [1]RenderBatch = undefined;
+    var resources: [0]RenderResource = .{};
+    var resource_cache_entries: [0]RenderResourceCacheEntry = .{};
+    var resource_cache_actions: [0]RenderResourceCacheAction = .{};
+    var glyphs: [0]GlyphAtlasEntry = .{};
+    var changes: [0]DiffChange = .{};
+    const frame = try (DisplayList{ .commands = &commands }).framePlan(null, .{
+        .surface_size = geometry.SizeF.init(4, 4),
+    }, .{
+        .render_commands = &render_commands,
+        .render_batches = &render_batches,
+        .resources = &resources,
+        .resource_cache_entries = &resource_cache_entries,
+        .resource_cache_actions = &resource_cache_actions,
+        .glyph_atlas_entries = &glyphs,
+        .changes = &changes,
+    });
+
+    var pixels: [4 * 4 * 4]u8 = undefined;
+    const surface = try ReferenceRenderSurface.init(4, 4, &pixels);
+    try surface.renderPass(frame.renderPass(), Color.rgb8(0, 0, 0));
+    try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 1, 0);
+    try expectPixelRgba8(.{ 128, 0, 0, 255 }, surface, 1, 1);
+    try expectPixelRgba8(.{ 128, 0, 0, 255 }, surface, 2, 2);
+    try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 3, 3);
+}
+
+test "reference renderer samples transformed clipped linear gradients" {
+    const stops = [_]GradientStop{
+        .{ .offset = 0, .color = Color.rgb8(255, 0, 0) },
+        .{ .offset = 1, .color = Color.rgb8(0, 0, 255) },
+    };
+    const commands = [_]CanvasCommand{
+        .{ .push_clip = .{ .rect = geometry.RectF.init(2, 0, 1, 1) } },
+        .{ .transform = Affine.translate(1, 0) },
+        .{ .fill_rect = .{
+            .id = 1,
+            .rect = geometry.RectF.init(0, 0, 2, 1),
+            .fill = .{ .linear_gradient = .{
+                .start = geometry.PointF.init(0, 0),
+                .end = geometry.PointF.init(2, 0),
+                .stops = &stops,
+            } },
+        } },
+        .pop_clip,
+    };
+
+    var render_commands: [1]RenderCommand = undefined;
+    var render_batches: [1]RenderBatch = undefined;
+    var resources: [1]RenderResource = undefined;
+    var resource_cache_entries: [1]RenderResourceCacheEntry = undefined;
+    var resource_cache_actions: [1]RenderResourceCacheAction = undefined;
+    var glyphs: [0]GlyphAtlasEntry = .{};
+    var changes: [0]DiffChange = .{};
+    const frame = try (DisplayList{ .commands = &commands }).framePlan(null, .{
+        .surface_size = geometry.SizeF.init(4, 1),
+    }, .{
+        .render_commands = &render_commands,
+        .render_batches = &render_batches,
+        .resources = &resources,
+        .resource_cache_entries = &resource_cache_entries,
+        .resource_cache_actions = &resource_cache_actions,
+        .glyph_atlas_entries = &glyphs,
+        .changes = &changes,
+    });
+
+    var pixels: [4 * 1 * 4]u8 = undefined;
+    const surface = try ReferenceRenderSurface.init(4, 1, &pixels);
+    try surface.renderPass(frame.renderPass(), Color.rgb8(0, 0, 0));
+
+    try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 0, 0);
+    try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 1, 0);
+    try expectPixelRgba8(.{ 137, 0, 225, 255 }, surface, 2, 0);
+    try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 3, 0);
+}
+
+test "reference renderer draws stroked lines" {
+    const commands = [_]CanvasCommand{.{ .draw_line = .{
+        .id = 1,
+        .from = geometry.PointF.init(0.5, 1.5),
+        .to = geometry.PointF.init(2.5, 1.5),
+        .stroke = .{ .fill = .{ .color = Color.rgb8(255, 0, 0) }, .width = 1 },
+    } }};
+
+    var render_commands: [1]RenderCommand = undefined;
+    var render_batches: [1]RenderBatch = undefined;
+    var resources: [0]RenderResource = .{};
+    var resource_cache_entries: [0]RenderResourceCacheEntry = .{};
+    var resource_cache_actions: [0]RenderResourceCacheAction = .{};
+    var glyphs: [0]GlyphAtlasEntry = .{};
+    var changes: [0]DiffChange = .{};
+    const frame = try (DisplayList{ .commands = &commands }).framePlan(null, .{
+        .surface_size = geometry.SizeF.init(4, 3),
+    }, .{
+        .render_commands = &render_commands,
+        .render_batches = &render_batches,
+        .resources = &resources,
+        .resource_cache_entries = &resource_cache_entries,
+        .resource_cache_actions = &resource_cache_actions,
+        .glyph_atlas_entries = &glyphs,
+        .changes = &changes,
+    });
+
+    var pixels: [4 * 3 * 4]u8 = undefined;
+    const surface = try ReferenceRenderSurface.init(4, 3, &pixels);
+    try surface.renderPass(frame.renderPass(), Color.rgb8(0, 0, 0));
+
+    try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 1, 0);
+    try expectPixelRgba8(.{ 255, 0, 0, 255 }, surface, 0, 1);
+    try expectPixelRgba8(.{ 255, 0, 0, 255 }, surface, 1, 1);
+    try expectPixelRgba8(.{ 255, 0, 0, 255 }, surface, 2, 1);
+    try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 3, 1);
+    try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 1, 2);
+}
+
+test "reference renderer fills closed paths" {
+    const elements = [_]PathElement{
+        .{ .verb = .move_to, .points = .{ geometry.PointF.init(1, 1), geometry.PointF.zero(), geometry.PointF.zero() } },
+        .{ .verb = .line_to, .points = .{ geometry.PointF.init(3, 1), geometry.PointF.zero(), geometry.PointF.zero() } },
+        .{ .verb = .line_to, .points = .{ geometry.PointF.init(3, 3), geometry.PointF.zero(), geometry.PointF.zero() } },
+        .{ .verb = .line_to, .points = .{ geometry.PointF.init(1, 3), geometry.PointF.zero(), geometry.PointF.zero() } },
+        .{ .verb = .close },
+    };
+    const commands = [_]CanvasCommand{.{ .fill_path = .{
+        .id = 1,
+        .elements = &elements,
+        .fill = .{ .color = Color.rgb8(255, 0, 0) },
+    } }};
+
+    var render_commands: [1]RenderCommand = undefined;
+    var render_batches: [1]RenderBatch = undefined;
+    var resources: [0]RenderResource = .{};
+    var resource_cache_entries: [0]RenderResourceCacheEntry = .{};
+    var resource_cache_actions: [0]RenderResourceCacheAction = .{};
+    var glyphs: [0]GlyphAtlasEntry = .{};
+    var changes: [0]DiffChange = .{};
+    const frame = try (DisplayList{ .commands = &commands }).framePlan(null, .{
+        .surface_size = geometry.SizeF.init(4, 4),
+    }, .{
+        .render_commands = &render_commands,
+        .render_batches = &render_batches,
+        .resources = &resources,
+        .resource_cache_entries = &resource_cache_entries,
+        .resource_cache_actions = &resource_cache_actions,
+        .glyph_atlas_entries = &glyphs,
+        .changes = &changes,
+    });
+
+    var pixels: [4 * 4 * 4]u8 = undefined;
+    const surface = try ReferenceRenderSurface.init(4, 4, &pixels);
+    try surface.renderPass(frame.renderPass(), Color.rgb8(0, 0, 0));
+
+    try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 0, 0);
+    try expectPixelRgba8(.{ 255, 0, 0, 255 }, surface, 1, 1);
+    try expectPixelRgba8(.{ 255, 0, 0, 255 }, surface, 2, 2);
+    try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 3, 3);
+}
+
+test "reference renderer strokes paths: butt caps end at the segment, round caps extend it" {
+    // One horizontal unit-width segment, rendered once per cap shape.
+    // The end pixels (0,1) and (2,1) are where the caps live: the butt
+    // cap stops at the endpoint (the segment covers exactly half of each
+    // end pixel — 128 after coverage rounding), while the round cap
+    // bulges a half-width semicircle past it (75% coverage per the
+    // anti-aliased vector core). Interior and off-stroke pixels are
+    // cap-independent.
+    const cases = [_]struct { cap: canvas.LineCap, end_coverage: u8 }{
+        .{ .cap = .butt, .end_coverage = 128 },
+        .{ .cap = .round, .end_coverage = 191 },
+    };
+    for (cases) |case| {
+        const elements = [_]PathElement{
+            .{ .verb = .move_to, .points = .{ geometry.PointF.init(0.5, 1.5), geometry.PointF.zero(), geometry.PointF.zero() } },
+            .{ .verb = .line_to, .points = .{ geometry.PointF.init(2.5, 1.5), geometry.PointF.zero(), geometry.PointF.zero() } },
+        };
+        const commands = [_]CanvasCommand{.{ .stroke_path = .{
+            .id = 1,
+            .elements = &elements,
+            .stroke = .{ .fill = .{ .color = Color.rgb8(255, 0, 0) }, .width = 1 },
+            .cap = case.cap,
+        } }};
+
+        var render_commands: [1]RenderCommand = undefined;
+        var render_batches: [1]RenderBatch = undefined;
+        var resources: [0]RenderResource = .{};
+        var resource_cache_entries: [0]RenderResourceCacheEntry = .{};
+        var resource_cache_actions: [0]RenderResourceCacheAction = .{};
+        var glyphs: [0]GlyphAtlasEntry = .{};
+        var changes: [0]DiffChange = .{};
+        const frame = try (DisplayList{ .commands = &commands }).framePlan(null, .{
+            .surface_size = geometry.SizeF.init(4, 3),
+        }, .{
+            .render_commands = &render_commands,
+            .render_batches = &render_batches,
+            .resources = &resources,
+            .resource_cache_entries = &resource_cache_entries,
+            .resource_cache_actions = &resource_cache_actions,
+            .glyph_atlas_entries = &glyphs,
+            .changes = &changes,
+        });
+
+        var pixels: [4 * 3 * 4]u8 = undefined;
+        const surface = try ReferenceRenderSurface.init(4, 3, &pixels);
+        try surface.renderPass(frame.renderPass(), Color.rgb8(0, 0, 0));
+
+        try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 1, 0);
+        try expectPixelRgba8(.{ case.end_coverage, 0, 0, 255 }, surface, 0, 1);
+        try expectPixelRgba8(.{ 255, 0, 0, 255 }, surface, 1, 1);
+        try expectPixelRgba8(.{ case.end_coverage, 0, 0, 255 }, surface, 2, 1);
+        try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 3, 1);
+    }
+}
+
+test "reference renderer draws soft shadows" {
+    const commands = [_]CanvasCommand{.{ .shadow = .{
+        .id = 1,
+        .rect = geometry.RectF.init(1, 1, 2, 2),
+        .blur = 1,
+        .color = Color.rgba8(0, 0, 0, 128),
+    } }};
+
+    var render_commands: [1]RenderCommand = undefined;
+    var render_batches: [1]RenderBatch = undefined;
+    var resources: [1]RenderResource = undefined;
+    var resource_cache_entries: [1]RenderResourceCacheEntry = undefined;
+    var resource_cache_actions: [1]RenderResourceCacheAction = undefined;
+    var glyphs: [0]GlyphAtlasEntry = .{};
+    var changes: [0]DiffChange = .{};
+    const frame = try (DisplayList{ .commands = &commands }).framePlan(null, .{
+        .surface_size = geometry.SizeF.init(4, 4),
+    }, .{
+        .render_commands = &render_commands,
+        .render_batches = &render_batches,
+        .resources = &resources,
+        .resource_cache_entries = &resource_cache_entries,
+        .resource_cache_actions = &resource_cache_actions,
+        .glyph_atlas_entries = &glyphs,
+        .changes = &changes,
+    });
+
+    var pixels: [4 * 4 * 4]u8 = undefined;
+    const surface = try ReferenceRenderSurface.init(4, 4, &pixels);
+    try surface.renderPass(frame.renderPass(), Color.rgba8(0, 0, 0, 0));
+
+    try expectPixelRgba8(.{ 0, 0, 0, 27 }, surface, 0, 0);
+    try expectPixelRgba8(.{ 0, 0, 0, 64 }, surface, 0, 1);
+    try expectPixelRgba8(.{ 0, 0, 0, 128 }, surface, 1, 1);
+    try expectPixelRgba8(.{ 0, 0, 0, 64 }, surface, 3, 2);
+}
+
+test "reference renderer blurs with caller scratch storage" {
+    const commands = [_]CanvasCommand{
+        .{ .fill_rect = .{
+            .id = 1,
+            .rect = geometry.RectF.init(0, 0, 1, 1),
+            .fill = .{ .color = Color.rgb8(255, 0, 0) },
+        } },
+        .{ .fill_rect = .{
+            .id = 2,
+            .rect = geometry.RectF.init(2, 0, 1, 1),
+            .fill = .{ .color = Color.rgb8(0, 0, 255) },
+        } },
+        .{ .blur = .{
+            .id = 3,
+            .rect = geometry.RectF.init(0, 0, 3, 1),
+            .radius = 1,
+        } },
+    };
+
+    var render_commands: [3]RenderCommand = undefined;
+    var render_batches: [3]RenderBatch = undefined;
+    var resources: [1]RenderResource = undefined;
+    var resource_cache_entries: [1]RenderResourceCacheEntry = undefined;
+    var resource_cache_actions: [1]RenderResourceCacheAction = undefined;
+    var glyphs: [0]GlyphAtlasEntry = .{};
+    var changes: [0]DiffChange = .{};
+    const frame = try (DisplayList{ .commands = &commands }).framePlan(null, .{
+        .surface_size = geometry.SizeF.init(3, 1),
+    }, .{
+        .render_commands = &render_commands,
+        .render_batches = &render_batches,
+        .resources = &resources,
+        .resource_cache_entries = &resource_cache_entries,
+        .resource_cache_actions = &resource_cache_actions,
+        .glyph_atlas_entries = &glyphs,
+        .changes = &changes,
+    });
+
+    var pixels: [3 * 1 * 4]u8 = undefined;
+    var scratch: [3 * 1 * 4]u8 = undefined;
+    const surface = try ReferenceRenderSurface.initWithScratch(3, 1, &pixels, &scratch);
+    try surface.renderPass(frame.renderPass(), Color.rgb8(0, 0, 0));
+
+    try expectPixelRgba8(.{ 159, 0, 0, 255 }, surface, 0, 0);
+    try expectPixelRgba8(.{ 70, 0, 70, 255 }, surface, 1, 0);
+    try expectPixelRgba8(.{ 0, 0, 159, 255 }, surface, 2, 0);
+}
+
+test "reference renderer render memo replays byte-identical pixels" {
+    // The render memo is pure memoization: a render with a cold memo, a
+    // render that HITS the memo, and a render with no memo at all must
+    // produce the same bytes — determinism is the law, the memo only
+    // moves time. A content change under the memoized layers must miss
+    // and land on the unmemoized bytes for the NEW content. The scene
+    // carries every memoized command kind: a base fill, a backdrop blur,
+    // a translucent wash fill, a drop shadow, and a rounded surface fill
+    // (the modal-dialog stack in miniature).
+    const Frame = struct {
+        commands: [5]CanvasCommand,
+        render_commands: [5]RenderCommand,
+        render_batches: [5]RenderBatch,
+        resources: [8]RenderResource,
+        resource_cache_entries: [8]RenderResourceCacheEntry,
+        resource_cache_actions: [8]RenderResourceCacheAction,
+        glyphs: [0]GlyphAtlasEntry,
+        changes: [0]DiffChange,
+
+        fn render(self: *@This(), base: Color, pixels: []u8, scratch: []u8, memo: ?*canvas.ReferenceRenderMemo) !void {
+            self.commands = .{
+                .{ .fill_rect = .{
+                    .id = 1,
+                    .rect = geometry.RectF.init(0, 0, 8, 8),
+                    .fill = .{ .color = base },
+                } },
+                .{ .blur = .{
+                    .id = 2,
+                    .rect = geometry.RectF.init(0, 0, 8, 8),
+                    .radius = 1,
+                } },
+                .{ .fill_rect = .{
+                    .id = 3,
+                    .rect = geometry.RectF.init(0, 0, 8, 8),
+                    .fill = .{ .color = Color.rgba8(0, 0, 0, 26) },
+                } },
+                .{ .shadow = .{
+                    .id = 4,
+                    .rect = geometry.RectF.init(2, 2, 4, 4),
+                    .blur = 2,
+                    .color = Color.rgba8(0, 0, 0, 128),
+                } },
+                .{ .fill_rounded_rect = .{
+                    .id = 5,
+                    .rect = geometry.RectF.init(2, 2, 4, 4),
+                    .radius = Radius.all(1),
+                    .fill = .{ .color = Color.rgb8(240, 240, 240) },
+                } },
+            };
+            const frame = try (DisplayList{ .commands = &self.commands }).framePlan(null, .{
+                .surface_size = geometry.SizeF.init(8, 8),
+            }, .{
+                .render_commands = &self.render_commands,
+                .render_batches = &self.render_batches,
+                .resources = &self.resources,
+                .resource_cache_entries = &self.resource_cache_entries,
+                .resource_cache_actions = &self.resource_cache_actions,
+                .glyph_atlas_entries = &self.glyphs,
+                .changes = &self.changes,
+            });
+            const surface = (try ReferenceRenderSurface.initWithScratch(8, 8, pixels, scratch)).withRenderMemo(memo);
+            try surface.renderPass(frame.renderPass(), Color.rgb8(0, 0, 0));
+        }
+    };
+    var frame: Frame = undefined;
+
+    var memo = canvas.ReferenceRenderMemo.init(std.testing.allocator);
+    defer memo.deinit();
+    // The production threshold skips small rects; the test surface is
+    // tiny, so memoize everything to exercise all four command kinds.
+    memo.min_pixels = 0;
+
+    var baseline: [8 * 8 * 4]u8 = undefined;
+    var pixels: [8 * 8 * 4]u8 = undefined;
+    var scratch: [8 * 8 * 4]u8 = undefined;
+
+    const red = Color.rgb8(255, 0, 0);
+    try frame.render(red, &baseline, &scratch, null);
+
+    // Cold memo: all five commands miss and compute — same bytes as
+    // unmemoized.
+    try frame.render(red, &pixels, &scratch, &memo);
+    try std.testing.expectEqual(@as(u64, 0), memo.hits);
+    try std.testing.expectEqual(@as(u64, 5), memo.misses);
+    try std.testing.expectEqualSlices(u8, &baseline, &pixels);
+
+    // Warm memo: every command hits — replayed bytes must be identical
+    // too.
+    try frame.render(red, &pixels, &scratch, &memo);
+    try std.testing.expectEqual(@as(u64, 5), memo.hits);
+    try std.testing.expectEqual(@as(u64, 5), memo.misses);
+    try std.testing.expectEqualSlices(u8, &baseline, &pixels);
+
+    // Changed content at the bottom of the stack: every layer above it
+    // reads different source bytes, so all five must MISS (stale pixels
+    // would be wrong) and match the unmemoized render of the new
+    // content.
+    const green = Color.rgb8(0, 255, 0);
+    var changed_baseline: [8 * 8 * 4]u8 = undefined;
+    try frame.render(green, &changed_baseline, &scratch, null);
+    try frame.render(green, &pixels, &scratch, &memo);
+    try std.testing.expectEqual(@as(u64, 5), memo.hits);
+    try std.testing.expectEqual(@as(u64, 10), memo.misses);
+    try std.testing.expectEqualSlices(u8, &changed_baseline, &pixels);
+}
+
+test "reference renderer blurs transparent colors without dark fringes" {
+    const commands = [_]CanvasCommand{
+        .{ .fill_rect = .{
+            .id = 1,
+            .rect = geometry.RectF.init(0, 0, 1, 1),
+            .fill = .{ .color = Color.rgba8(255, 0, 0, 128) },
+        } },
+        .{ .blur = .{
+            .id = 2,
+            .rect = geometry.RectF.init(0, 0, 3, 1),
+            .radius = 1,
+        } },
+    };
+
+    var render_commands: [2]RenderCommand = undefined;
+    var render_batches: [2]RenderBatch = undefined;
+    var resources: [1]RenderResource = undefined;
+    var resource_cache_entries: [1]RenderResourceCacheEntry = undefined;
+    var resource_cache_actions: [1]RenderResourceCacheAction = undefined;
+    var glyphs: [0]GlyphAtlasEntry = .{};
+    var changes: [0]DiffChange = .{};
+    const frame = try (DisplayList{ .commands = &commands }).framePlan(null, .{
+        .surface_size = geometry.SizeF.init(3, 1),
+    }, .{
+        .render_commands = &render_commands,
+        .render_batches = &render_batches,
+        .resources = &resources,
+        .resource_cache_entries = &resource_cache_entries,
+        .resource_cache_actions = &resource_cache_actions,
+        .glyph_atlas_entries = &glyphs,
+        .changes = &changes,
+    });
+
+    var pixels: [3 * 1 * 4]u8 = undefined;
+    var scratch: [3 * 1 * 4]u8 = undefined;
+    const surface = try ReferenceRenderSurface.initWithScratch(3, 1, &pixels, &scratch);
+    try surface.renderPass(frame.renderPass(), Color.rgba8(0, 0, 0, 0));
+
+    try expectPixelRgba8(.{ 255, 0, 0, 80 }, surface, 0, 0);
+    try expectPixelRgba8(.{ 255, 0, 0, 35 }, surface, 1, 0);
+    try expectPixelRgba8(.{ 0, 0, 0, 0 }, surface, 2, 0);
+}
+
+test "reference renderer draws proxy text runs" {
+    const commands = [_]CanvasCommand{.{ .draw_text = .{
+        .id = 1,
+        .size = 2,
+        .origin = geometry.PointF.init(1, 3),
+        .color = Color.rgb8(255, 0, 0),
+        .text = "A B",
+    } }};
+
+    var render_commands: [1]RenderCommand = undefined;
+    var render_batches: [1]RenderBatch = undefined;
+    var resources: [1]RenderResource = undefined;
+    var resource_cache_entries: [1]RenderResourceCacheEntry = undefined;
+    var resource_cache_actions: [1]RenderResourceCacheAction = undefined;
+    var glyphs: [3]GlyphAtlasEntry = undefined;
+    var glyph_cache_entries: [3]GlyphAtlasCacheEntry = undefined;
+    var glyph_cache_actions: [3]GlyphAtlasCacheAction = undefined;
+    var changes: [0]DiffChange = .{};
+    const frame = try (DisplayList{ .commands = &commands }).framePlan(null, .{
+        .surface_size = geometry.SizeF.init(5, 4),
+    }, .{
+        .render_commands = &render_commands,
+        .render_batches = &render_batches,
+        .resources = &resources,
+        .resource_cache_entries = &resource_cache_entries,
+        .resource_cache_actions = &resource_cache_actions,
+        .glyph_atlas_entries = &glyphs,
+        .glyph_atlas_cache_entries = &glyph_cache_entries,
+        .glyph_atlas_cache_actions = &glyph_cache_actions,
+        .changes = &changes,
+    });
+
+    var pixels: [5 * 4 * 4]u8 = undefined;
+    const surface = try ReferenceRenderSurface.init(5, 4, &pixels);
+    try surface.renderPass(frame.renderPass(), Color.rgb8(0, 0, 0));
+
+    // Real Geist outlines walk estimator advances: 'A' inks column 1,
+    // the space keeps column 2 empty, 'B' inks column 3 and ends inside
+    // its estimator box (column 4 stays background). Values are exact
+    // 2px-em anti-aliased coverage.
+    try expectPixelRgba8(.{ 39, 0, 0, 255 }, surface, 1, 1);
+    try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 2, 1);
+    try expectPixelRgba8(.{ 72, 0, 0, 255 }, surface, 3, 1);
+    try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 4, 1);
+    try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 1, 3);
+}
+
+test "reference renderer advances proxy text by utf8 scalars" {
+    const commands = [_]CanvasCommand{.{ .draw_text = .{
+        .id = 1,
+        .size = 2,
+        .origin = geometry.PointF.init(1, 3),
+        .color = Color.rgb8(255, 0, 0),
+        .text = "é B",
+    } }};
+
+    var render_commands: [1]RenderCommand = undefined;
+    var render_batches: [1]RenderBatch = undefined;
+    var resources: [1]RenderResource = undefined;
+    var resource_cache_entries: [1]RenderResourceCacheEntry = undefined;
+    var resource_cache_actions: [1]RenderResourceCacheAction = undefined;
+    var glyphs: [4]GlyphAtlasEntry = undefined;
+    var glyph_cache_entries: [4]GlyphAtlasCacheEntry = undefined;
+    var glyph_cache_actions: [4]GlyphAtlasCacheAction = undefined;
+    var changes: [0]DiffChange = .{};
+    const frame = try (DisplayList{ .commands = &commands }).framePlan(null, .{
+        .surface_size = geometry.SizeF.init(5, 4),
+    }, .{
+        .render_commands = &render_commands,
+        .render_batches = &render_batches,
+        .resources = &resources,
+        .resource_cache_entries = &resource_cache_entries,
+        .resource_cache_actions = &resource_cache_actions,
+        .glyph_atlas_entries = &glyphs,
+        .glyph_atlas_cache_entries = &glyph_cache_entries,
+        .glyph_atlas_cache_actions = &glyph_cache_actions,
+        .changes = &changes,
+    });
+
+    var pixels: [5 * 4 * 4]u8 = undefined;
+    const surface = try ReferenceRenderSurface.init(5, 4, &pixels);
+    try surface.renderPass(frame.renderPass(), Color.rgb8(0, 0, 0));
+
+    // Real outlines walking the face's real advances: the composite
+    // 'e-acute' inks column 1 (11 at this row; its accent shows stronger
+    // one row down) and 'B' lands one scalar advance later — é now
+    // measures its true 0.567 em, so 'B' starts a third of a pixel
+    // earlier than under the old flat multibyte estimate but still
+    // proves multi-byte input advances once per scalar, not per byte.
+    try expectPixelRgba8(.{ 11, 0, 0, 255 }, surface, 1, 1);
+    try expectPixelRgba8(.{ 23, 0, 0, 255 }, surface, 2, 1);
+    try expectPixelRgba8(.{ 49, 0, 0, 255 }, surface, 3, 1);
+    try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 4, 1);
+}
+
+test "reference renderer inks mono runs with the bundled mono face" {
+    // Mono runs ink the bundled Geist Mono outlines at the 0.6 em pitch
+    // layout charges. Before the mono face landed, mono ids borrowed the
+    // proportional sans outlines centered in the cell: narrow 'i' floated
+    // in gulfs while wide 'M' (~0.83 em) overflowed its cell into the
+    // next glyph. At size 20 the cell is 12 px; the mono 'i' is designed
+    // for the cell (serif base, ~9.6 px of ink) and 'M' stays inside its
+    // own 12 px column.
+    const size: f32 = 20;
+    const cell: usize = 12; // 0.6 em at size 20
+    const commands = [_]CanvasCommand{.{ .draw_text = .{
+        .id = 1,
+        .font_id = default_mono_font_id,
+        .size = size,
+        .origin = geometry.PointF.init(0, 20),
+        .color = Color.rgb8(255, 0, 0),
+        .text = "iM",
+    } }};
+
+    var render_commands: [1]RenderCommand = undefined;
+    var render_batches: [1]RenderBatch = undefined;
+    var resources: [1]RenderResource = undefined;
+    var resource_cache_entries: [1]RenderResourceCacheEntry = undefined;
+    var resource_cache_actions: [1]RenderResourceCacheAction = undefined;
+    var glyphs: [2]GlyphAtlasEntry = undefined;
+    var glyph_cache_entries: [2]GlyphAtlasCacheEntry = undefined;
+    var glyph_cache_actions: [2]GlyphAtlasCacheAction = undefined;
+    var changes: [0]DiffChange = .{};
+    const frame = try (DisplayList{ .commands = &commands }).framePlan(null, .{
+        .surface_size = geometry.SizeF.init(26, 24),
+    }, .{
+        .render_commands = &render_commands,
+        .render_batches = &render_batches,
+        .resources = &resources,
+        .resource_cache_entries = &resource_cache_entries,
+        .resource_cache_actions = &resource_cache_actions,
+        .glyph_atlas_entries = &glyphs,
+        .glyph_atlas_cache_entries = &glyph_cache_entries,
+        .glyph_atlas_cache_actions = &glyph_cache_actions,
+        .changes = &changes,
+    });
+
+    var pixels: [26 * 24 * 4]u8 = undefined;
+    const surface = try ReferenceRenderSurface.init(26, 24, &pixels);
+    try surface.renderPass(frame.renderPass(), Color.rgb8(0, 0, 0));
+
+    // Per-cell ink extents: any red coverage in a column marks it inked.
+    var ink_width: [2]usize = .{ 0, 0 };
+    for (0..2) |cell_index| {
+        const cell_start = cell_index * cell;
+        var first_ink: ?usize = null;
+        var last_ink: usize = 0;
+        for (cell_start..cell_start + cell) |x| {
+            var inked = false;
+            for (0..24) |y| {
+                if (pixels[(y * 26 + x) * 4] != 0) {
+                    inked = true;
+                    break;
+                }
+            }
+            if (inked) {
+                if (first_ink == null) first_ink = x - cell_start;
+                last_ink = x - cell_start;
+            }
+        }
+        const first = first_ink orelse return error.TestUnexpectedResult;
+        ink_width[cell_index] = last_ink + 1 - first;
+    }
+    // The mono 'i' fills most of its fixed cell (the centered sans 'i'
+    // inked ~4.5 px; the mono design carries a serif base of ~9.6 px).
+    try std.testing.expect(ink_width[0] >= 8);
+    // 'M' inks wide but INSIDE its own cell: with the sans outlines it
+    // overflowed 0.83 em of ink into the pixels past both cells.
+    try std.testing.expect(ink_width[1] >= 8);
+    for (2 * cell..26) |x| {
+        for (0..24) |y| {
+            try std.testing.expectEqual(@as(u8, 0), pixels[(y * 26 + x) * 4]);
+        }
+    }
+}
+
+test "reference renderer applies shaped glyph y offsets" {
+    const shaped_glyphs = [_]Glyph{.{ .id = 1, .x = 0, .y = 1, .advance = 1 }};
+    const commands = [_]CanvasCommand{.{ .draw_text = .{
+        .id = 1,
+        .font_id = 2,
+        .size = 2,
+        .origin = geometry.PointF.init(1, 3),
+        .color = Color.rgb8(255, 0, 0),
+        .glyphs = &shaped_glyphs,
+    } }};
+
+    var render_commands: [1]RenderCommand = undefined;
+    var render_batches: [1]RenderBatch = undefined;
+    var resources: [1]RenderResource = undefined;
+    var resource_cache_entries: [1]RenderResourceCacheEntry = undefined;
+    var resource_cache_actions: [1]RenderResourceCacheAction = undefined;
+    var glyphs: [1]GlyphAtlasEntry = undefined;
+    var glyph_cache_entries: [1]GlyphAtlasCacheEntry = undefined;
+    var glyph_cache_actions: [1]GlyphAtlasCacheAction = undefined;
+    var changes: [0]DiffChange = .{};
+    const frame = try (DisplayList{ .commands = &commands }).framePlan(null, .{
+        .surface_size = geometry.SizeF.init(4, 5),
+    }, .{
+        .render_commands = &render_commands,
+        .render_batches = &render_batches,
+        .resources = &resources,
+        .resource_cache_entries = &resource_cache_entries,
+        .resource_cache_actions = &resource_cache_actions,
+        .glyph_atlas_entries = &glyphs,
+        .glyph_atlas_cache_entries = &glyph_cache_entries,
+        .glyph_atlas_cache_actions = &glyph_cache_actions,
+        .changes = &changes,
+    });
+
+    var pixels: [4 * 5 * 4]u8 = undefined;
+    const surface = try ReferenceRenderSurface.init(4, 5, &pixels);
+    try surface.renderPass(frame.renderPass(), Color.rgb8(0, 0, 0));
+
+    try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 1, 1);
+    try expectPixelRgba8(.{ 255, 0, 0, 255 }, surface, 1, 2);
+    try expectPixelRgba8(.{ 255, 0, 0, 255 }, surface, 1, 3);
+}
+
+test "reference renderer draws image resources" {
+    const commands = [_]CanvasCommand{.{ .draw_image = .{
+        .id = 1,
+        .image_id = 42,
+        .dst = geometry.RectF.init(0, 0, 4, 4),
+        .fit = .contain,
+    } }};
+    const image_pixels = [_]u8{
+        255, 0, 0,   255,
+        0,   0, 255, 255,
+    };
+    const images = [_]ReferenceImage{.{
+        .id = 42,
+        .width = 2,
+        .height = 1,
+        .pixels = &image_pixels,
+    }};
+
+    var render_commands: [1]RenderCommand = undefined;
+    var render_batches: [1]RenderBatch = undefined;
+    var resources: [1]RenderResource = undefined;
+    var resource_cache_entries: [1]RenderResourceCacheEntry = undefined;
+    var resource_cache_actions: [1]RenderResourceCacheAction = undefined;
+    var glyphs: [0]GlyphAtlasEntry = .{};
+    var changes: [0]DiffChange = .{};
+    const frame = try (DisplayList{ .commands = &commands }).framePlan(null, .{
+        .surface_size = geometry.SizeF.init(4, 4),
+    }, .{
+        .render_commands = &render_commands,
+        .render_batches = &render_batches,
+        .resources = &resources,
+        .resource_cache_entries = &resource_cache_entries,
+        .resource_cache_actions = &resource_cache_actions,
+        .glyph_atlas_entries = &glyphs,
+        .changes = &changes,
+    });
+
+    var pixels: [4 * 4 * 4]u8 = undefined;
+    const surface = (try ReferenceRenderSurface.init(4, 4, &pixels)).withImages(&images);
+    try surface.renderPass(frame.renderPass(), Color.rgb8(0, 0, 0));
+
+    try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 0, 0);
+    try expectPixelRgba8(.{ 255, 0, 0, 255 }, surface, 0, 1);
+    try expectPixelRgba8(.{ 225, 0, 137, 255 }, surface, 1, 1);
+    try expectPixelRgba8(.{ 137, 0, 225, 255 }, surface, 2, 1);
+    try expectPixelRgba8(.{ 0, 0, 255, 255 }, surface, 3, 2);
+    try expectPixelRgba8(.{ 0, 0, 0, 255 }, surface, 0, 3);
+}
+
+test "reference renderer bilinear-filters scaled images" {
+    const commands = [_]CanvasCommand{.{ .draw_image = .{
+        .id = 1,
+        .image_id = 42,
+        .dst = geometry.RectF.init(0, 0, 4, 4),
+    } }};
+    const image_pixels = [_]u8{
+        255, 0,   0,   255,
+        0,   255, 0,   255,
+        0,   0,   255, 255,
+        255, 255, 255, 255,
+    };
+    const images = [_]ReferenceImage{.{
+        .id = 42,
+        .width = 2,
+        .height = 2,
+        .pixels = &image_pixels,
+    }};
+
+    var render_commands: [1]RenderCommand = undefined;
+    var render_batches: [1]RenderBatch = undefined;
+    var resources: [1]RenderResource = undefined;
+    var resource_cache_entries: [1]RenderResourceCacheEntry = undefined;
+    var resource_cache_actions: [1]RenderResourceCacheAction = undefined;
+    var glyphs: [0]GlyphAtlasEntry = .{};
+    var changes: [0]DiffChange = .{};
+    const frame = try (DisplayList{ .commands = &commands }).framePlan(null, .{
+        .surface_size = geometry.SizeF.init(4, 4),
+    }, .{
+        .render_commands = &render_commands,
+        .render_batches = &render_batches,
+        .resources = &resources,
+        .resource_cache_entries = &resource_cache_entries,
+        .resource_cache_actions = &resource_cache_actions,
+        .glyph_atlas_entries = &glyphs,
+        .changes = &changes,
+    });
+
+    var pixels: [4 * 4 * 4]u8 = undefined;
+    const surface = (try ReferenceRenderSurface.init(4, 4, &pixels)).withImages(&images);
+    try surface.renderPass(frame.renderPass(), Color.rgb8(0, 0, 0));
+
+    try expectPixelRgba8(.{ 255, 0, 0, 255 }, surface, 0, 0);
+    try expectPixelRgba8(.{ 207, 137, 137, 255 }, surface, 1, 1);
+    try expectPixelRgba8(.{ 207, 225, 225, 255 }, surface, 2, 2);
+    try expectPixelRgba8(.{ 255, 255, 255, 255 }, surface, 3, 3);
+}
+
+test "reference renderer nearest-filters scaled images" {
+    const commands = [_]CanvasCommand{.{ .draw_image = .{
+        .id = 1,
+        .image_id = 42,
+        .dst = geometry.RectF.init(0, 0, 4, 4),
+        .sampling = .nearest,
+    } }};
+    const image_pixels = [_]u8{
+        255, 0,   0,   255,
+        0,   255, 0,   255,
+        0,   0,   255, 255,
+        255, 255, 255, 255,
+    };
+    const images = [_]ReferenceImage{.{
+        .id = 42,
+        .width = 2,
+        .height = 2,
+        .pixels = &image_pixels,
+    }};
+
+    var render_commands: [1]RenderCommand = undefined;
+    var render_batches: [1]RenderBatch = undefined;
+    var resources: [1]RenderResource = undefined;
+    var resource_cache_entries: [1]RenderResourceCacheEntry = undefined;
+    var resource_cache_actions: [1]RenderResourceCacheAction = undefined;
+    var glyphs: [0]GlyphAtlasEntry = .{};
+    var changes: [0]DiffChange = .{};
+    const frame = try (DisplayList{ .commands = &commands }).framePlan(null, .{
+        .surface_size = geometry.SizeF.init(4, 4),
+    }, .{
+        .render_commands = &render_commands,
+        .render_batches = &render_batches,
+        .resources = &resources,
+        .resource_cache_entries = &resource_cache_entries,
+        .resource_cache_actions = &resource_cache_actions,
+        .glyph_atlas_entries = &glyphs,
+        .changes = &changes,
+    });
+
+    var pixels: [4 * 4 * 4]u8 = undefined;
+    const surface = (try ReferenceRenderSurface.init(4, 4, &pixels)).withImages(&images);
+    try surface.renderPass(frame.renderPass(), Color.rgb8(0, 0, 0));
+
+    try expectPixelRgba8(.{ 255, 0, 0, 255 }, surface, 0, 0);
+    try expectPixelRgba8(.{ 255, 0, 0, 255 }, surface, 1, 1);
+    try expectPixelRgba8(.{ 255, 255, 255, 255 }, surface, 2, 2);
+    try expectPixelRgba8(.{ 255, 255, 255, 255 }, surface, 3, 3);
+}
+
+test "reference renderer filters scaled image alpha premultiplied" {
+    const commands = [_]CanvasCommand{.{ .draw_image = .{
+        .id = 1,
+        .image_id = 42,
+        .dst = geometry.RectF.init(0, 0, 4, 1),
+    } }};
+    const image_pixels = [_]u8{
+        255, 0, 0,   255,
+        0,   0, 255, 0,
+    };
+    const images = [_]ReferenceImage{.{
+        .id = 42,
+        .width = 2,
+        .height = 1,
+        .pixels = &image_pixels,
+    }};
+
+    var render_commands: [1]RenderCommand = undefined;
+    var render_batches: [1]RenderBatch = undefined;
+    var resources: [1]RenderResource = undefined;
+    var resource_cache_entries: [1]RenderResourceCacheEntry = undefined;
+    var resource_cache_actions: [1]RenderResourceCacheAction = undefined;
+    var glyphs: [0]GlyphAtlasEntry = .{};
+    var changes: [0]DiffChange = .{};
+    const frame = try (DisplayList{ .commands = &commands }).framePlan(null, .{
+        .surface_size = geometry.SizeF.init(4, 1),
+    }, .{
+        .render_commands = &render_commands,
+        .render_batches = &render_batches,
+        .resources = &resources,
+        .resource_cache_entries = &resource_cache_entries,
+        .resource_cache_actions = &resource_cache_actions,
+        .glyph_atlas_entries = &glyphs,
+        .changes = &changes,
+    });
+
+    var pixels: [4 * 1 * 4]u8 = undefined;
+    const surface = (try ReferenceRenderSurface.init(4, 1, &pixels)).withImages(&images);
+    try surface.renderPass(frame.renderPass(), Color.rgba8(0, 0, 0, 0));
+
+    try expectPixelRgba8(.{ 255, 0, 0, 255 }, surface, 0, 0);
+    try expectPixelRgba8(.{ 255, 0, 0, 191 }, surface, 1, 0);
+    try expectPixelRgba8(.{ 255, 0, 0, 64 }, surface, 2, 0);
+    try expectPixelRgba8(.{ 0, 0, 0, 0 }, surface, 3, 0);
+}
+
+test "reference renderer skips absent images and rejects corrupt ones" {
+    const commands = [_]CanvasCommand{.{ .draw_image = .{
+        .id = 1,
+        .image_id = 42,
+        .dst = geometry.RectF.init(0, 0, 2, 2),
+    } }};
+
+    var render_commands: [1]RenderCommand = undefined;
+    var render_batches: [1]RenderBatch = undefined;
+    var resources: [1]RenderResource = undefined;
+    var resource_cache_entries: [1]RenderResourceCacheEntry = undefined;
+    var resource_cache_actions: [1]RenderResourceCacheAction = undefined;
+    var glyphs: [0]GlyphAtlasEntry = .{};
+    var changes: [0]DiffChange = .{};
+    const frame = try (DisplayList{ .commands = &commands }).framePlan(null, .{
+        .surface_size = geometry.SizeF.init(2, 2),
+    }, .{
+        .render_commands = &render_commands,
+        .render_batches = &render_batches,
+        .resources = &resources,
+        .resource_cache_entries = &resource_cache_entries,
+        .resource_cache_actions = &resource_cache_actions,
+        .glyph_atlas_entries = &glyphs,
+        .changes = &changes,
+    });
+
+    // An id with no matching resource is a legitimate transient state
+    // (runtime-registered image mid-fetch or just unregistered): the draw
+    // skips, presentation succeeds, the clear color shows through.
+    var pixels: [2 * 2 * 4]u8 = undefined;
+    const surface = try ReferenceRenderSurface.init(2, 2, &pixels);
+    try surface.renderPass(frame.renderPass(), Color.rgb8(7, 8, 9));
+    try expectPixelRgba8(.{ 7, 8, 9, 255 }, surface, 0, 0);
+    try expectPixelRgba8(.{ 7, 8, 9, 255 }, surface, 1, 1);
+
+    // A PRESENT resource with an undersized pixel buffer is corrupt, not
+    // transient: still a loud error.
+    const corrupt_pixels = [_]u8{ 255, 0, 0, 255 };
+    const corrupt = [_]ReferenceImage{.{ .id = 42, .width = 2, .height = 2, .pixels = &corrupt_pixels }};
+    const corrupt_surface = (try ReferenceRenderSurface.init(2, 2, &pixels)).withImages(&corrupt);
+    try std.testing.expectError(error.ReferenceRenderUnsupportedCommand, corrupt_surface.renderPass(frame.renderPass(), Color.rgb8(0, 0, 0)));
+}
+
+test "reference renderer scale-once image panels replay byte-identical samples at any position with the same phase" {
+    // The scaled-image panel is pure memoization: at integer device
+    // alignment a destination pixel's sample depends only on its offset
+    // inside the destination rect, so the panel must produce the same
+    // bytes as direct sampling — cold, warm, AND after the draw moves to
+    // a different integer position (the position-independence that makes
+    // scrolling grids cheap). Fractional alignment must bypass the panel
+    // entirely, and changed image content must miss.
+    const Scene = struct {
+        fn render(dst: geometry.RectF, images: []const ReferenceImage, pixels: []u8, memo: ?*canvas.ReferenceRenderMemo) !void {
+            const commands = [_]CanvasCommand{.{ .draw_image = .{
+                .id = 1,
+                .image_id = 7,
+                .dst = dst,
+                .fit = .cover,
+                .sampling = .linear,
+                .radius = Radius.all(2),
+            } }};
+            var render_commands: [1]RenderCommand = undefined;
+            const plan = try (DisplayList{ .commands = &commands }).renderPlan(&render_commands);
+            const surface = (try ReferenceRenderSurface.init(32, 32, pixels)).withImages(images).withRenderMemo(memo);
+            try surface.renderPass(.{
+                .surface_size = geometry.SizeF.init(32, 32),
+                .scale = 1,
+                .full_repaint = true,
+                .commands = plan.commands,
+            }, Color.rgb8(9, 12, 20));
+        }
+    };
+
+    var image_pixels: [8 * 8 * 4]u8 = undefined;
+    for (&image_pixels, 0..) |*byte, index| byte.* = @intCast((index * 37 + 11) % 256);
+    for (0..8 * 8) |pixel| image_pixels[pixel * 4 + 3] = 255;
+    const images = [_]ReferenceImage{.{ .id = 7, .width = 8, .height = 8, .pixels = &image_pixels }};
+
+    var memo = canvas.ReferenceRenderMemo.init(std.testing.allocator);
+    defer memo.deinit();
+    // The production threshold skips small draws; the test panel is
+    // tiny, so cache everything.
+    memo.min_pixels = 0;
+
+    var baseline: [32 * 32 * 4]u8 = undefined;
+    var pixels: [32 * 32 * 4]u8 = undefined;
+
+    // Cold panel: one miss, bytes equal the unmemoized render.
+    const first_rect = geometry.RectF.init(2, 3, 16, 16);
+    try Scene.render(first_rect, &images, &baseline, null);
+    try Scene.render(first_rect, &images, &pixels, &memo);
+    try std.testing.expectEqual(@as(u64, 0), memo.image_scale_hits);
+    try std.testing.expectEqual(@as(u64, 1), memo.image_scale_misses);
+    try std.testing.expectEqualSlices(u8, &baseline, &pixels);
+
+    // Warm panel at the same position.
+    try Scene.render(first_rect, &images, &pixels, &memo);
+    try std.testing.expectEqual(@as(u64, 1), memo.image_scale_hits);
+    try std.testing.expectEqualSlices(u8, &baseline, &pixels);
+
+    // Moved to a different INTEGER position: still a hit (the panel is
+    // position-independent), and still byte-identical to the direct
+    // render at the new position.
+    const moved_rect = geometry.RectF.init(11, 9, 16, 16);
+    try Scene.render(moved_rect, &images, &baseline, null);
+    try Scene.render(moved_rect, &images, &pixels, &memo);
+    try std.testing.expectEqual(@as(u64, 2), memo.image_scale_hits);
+    try std.testing.expectEqual(@as(u64, 1), memo.image_scale_misses);
+    try std.testing.expectEqualSlices(u8, &baseline, &pixels);
+
+    // A FRACTIONAL position keys a different subpixel phase: a fresh
+    // panel fills (miss) and its bytes still equal direct sampling.
+    const fractional_rect = geometry.RectF.init(2.5, 3.25, 16, 16);
+    try Scene.render(fractional_rect, &images, &baseline, null);
+    try Scene.render(fractional_rect, &images, &pixels, &memo);
+    try std.testing.expectEqual(@as(u64, 2), memo.image_scale_hits);
+    try std.testing.expectEqual(@as(u64, 2), memo.image_scale_misses);
+    try std.testing.expectEqualSlices(u8, &baseline, &pixels);
+
+    // Moved by WHOLE pixels from the fractional position (same phase):
+    // a hit, byte-identical at the new position.
+    const fractional_moved = geometry.RectF.init(6.5, 8.25, 16, 16);
+    try Scene.render(fractional_moved, &images, &baseline, null);
+    try Scene.render(fractional_moved, &images, &pixels, &memo);
+    try std.testing.expectEqual(@as(u64, 3), memo.image_scale_hits);
+    try std.testing.expectEqual(@as(u64, 2), memo.image_scale_misses);
+    try std.testing.expectEqualSlices(u8, &baseline, &pixels);
+
+    // Changed image content under the same id: the content hash moves,
+    // so the draw misses and matches the direct render of the new
+    // pixels.
+    var changed_pixels: [8 * 8 * 4]u8 = undefined;
+    for (&changed_pixels, 0..) |*byte, index| byte.* = @intCast((index * 53 + 5) % 256);
+    for (0..8 * 8) |pixel| changed_pixels[pixel * 4 + 3] = 255;
+    const changed_images = [_]ReferenceImage{.{ .id = 7, .width = 8, .height = 8, .pixels = &changed_pixels }};
+    try Scene.render(first_rect, &changed_images, &baseline, null);
+    try Scene.render(first_rect, &changed_images, &pixels, &memo);
+    try std.testing.expectEqual(@as(u64, 3), memo.image_scale_hits);
+    try std.testing.expectEqual(@as(u64, 3), memo.image_scale_misses);
+    try std.testing.expectEqualSlices(u8, &baseline, &pixels);
+}

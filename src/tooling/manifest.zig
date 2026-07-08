@@ -1,4 +1,5 @@
 const std = @import("std");
+const app_icon_tool = @import("app_icon");
 const app_manifest = @import("app_manifest");
 const diagnostics = @import("diagnostics");
 const raw_manifest = @import("raw_manifest.zig");
@@ -13,6 +14,9 @@ pub const Metadata = struct {
     id: []const u8,
     name: []const u8,
     display_name: ?[]const u8 = null,
+    /// One human-facing sentence about the app: the About panel credits
+    /// line on macOS. Optional — absent means no credits line.
+    description: ?[]const u8 = null,
     version: []const u8,
     icons: []const []const u8 = &.{},
     platforms: []const []const u8 = &.{},
@@ -20,6 +24,11 @@ pub const Metadata = struct {
     capabilities: []const []const u8 = &.{},
     bridge_commands: []const BridgeCommandMetadata = &.{},
     web_engine: []const u8 = "system",
+    /// The built-in theme pack the app selects (`theme = "geist"`).
+    /// Optional — absent keeps the house register. Validated against
+    /// the known pack names so a typo is a check error, never a silent
+    /// default-theme fallback.
+    theme: ?[]const u8 = null,
     cef: web_engine_tool.CefConfig = .{},
     frontend: ?FrontendMetadata = null,
     security: SecurityMetadata = .{},
@@ -39,6 +48,8 @@ pub const Metadata = struct {
         allocator.free(self.id);
         allocator.free(self.name);
         if (self.display_name) |value| allocator.free(value);
+        if (self.description) |value| allocator.free(value);
+        if (self.theme) |value| allocator.free(value);
         allocator.free(self.version);
         allocator.free(self.web_engine);
         allocator.free(self.cef.dir);
@@ -78,12 +89,14 @@ pub const Metadata = struct {
         for (self.windows) |window| {
             allocator.free(window.label);
             if (window.title) |title| allocator.free(title);
+            allocator.free(window.titlebar);
         }
         if (self.windows.len > 0) allocator.free(self.windows);
         for (self.shell.windows) |window| {
             allocator.free(window.label);
             if (window.title) |title| allocator.free(title);
             allocator.free(window.restore_policy);
+            allocator.free(window.titlebar);
             for (window.views) |view| {
                 allocator.free(view.label);
                 allocator.free(view.kind);
@@ -95,10 +108,26 @@ pub const Metadata = struct {
                 if (view.url) |url| allocator.free(url);
                 if (view.text) |text| allocator.free(text);
                 if (view.command) |command| allocator.free(command);
+                if (view.gpu_backend) |gpu_backend| allocator.free(gpu_backend);
+                if (view.gpu_pixel_format) |gpu_pixel_format| allocator.free(gpu_pixel_format);
+                if (view.gpu_present_mode) |gpu_present_mode| allocator.free(gpu_present_mode);
+                if (view.gpu_alpha_mode) |gpu_alpha_mode| allocator.free(gpu_alpha_mode);
+                if (view.gpu_color_space) |gpu_color_space| allocator.free(gpu_color_space);
             }
             if (window.views.len > 0) allocator.free(window.views);
         }
         if (self.shell.windows.len > 0) allocator.free(self.shell.windows);
+        for (self.shell.chrome.tabs) |tab| {
+            allocator.free(tab.id);
+            allocator.free(tab.label);
+            allocator.free(tab.icon);
+        }
+        if (self.shell.chrome.tabs.len > 0) allocator.free(self.shell.chrome.tabs);
+        if (self.shell.chrome.primary_action) |action| {
+            allocator.free(action.id);
+            allocator.free(action.label);
+            allocator.free(action.icon);
+        }
         for (self.commands) |command| {
             allocator.free(command.id);
             allocator.free(command.title);
@@ -154,11 +183,33 @@ pub const WindowMetadata = struct {
     height: f32 = 480,
     x: ?f32 = null,
     y: ?f32 = null,
+    resizable: bool = true,
     restore_state: bool = true,
+    titlebar: []const u8 = "standard",
+    min_width: f32 = 0,
+    min_height: f32 = 0,
 };
 
 pub const ShellMetadata = struct {
     windows: []const ShellWindowMetadata = &.{},
+    chrome: ShellChromeMetadata = .{},
+};
+
+pub const ShellChromeMetadata = struct {
+    tabs: []const ShellTabMetadata = &.{},
+    primary_action: ?ShellPrimaryActionMetadata = null,
+};
+
+pub const ShellTabMetadata = struct {
+    id: []const u8,
+    label: []const u8,
+    icon: []const u8 = "",
+};
+
+pub const ShellPrimaryActionMetadata = struct {
+    id: []const u8,
+    label: []const u8,
+    icon: []const u8 = "",
 };
 
 pub const ShellWindowMetadata = struct {
@@ -171,6 +222,9 @@ pub const ShellWindowMetadata = struct {
     resizable: bool = true,
     restore_state: bool = true,
     restore_policy: []const u8 = "clamp_to_visible_screen",
+    titlebar: []const u8 = "standard",
+    min_width: f32 = 0,
+    min_height: f32 = 0,
     views: []const ShellViewMetadata = &.{},
 };
 
@@ -197,6 +251,12 @@ pub const ShellViewMetadata = struct {
     url: ?[]const u8 = null,
     text: ?[]const u8 = null,
     command: ?[]const u8 = null,
+    gpu_backend: ?[]const u8 = null,
+    gpu_pixel_format: ?[]const u8 = null,
+    gpu_present_mode: ?[]const u8 = null,
+    gpu_alpha_mode: ?[]const u8 = null,
+    gpu_color_space: ?[]const u8 = null,
+    gpu_vsync: ?bool = null,
 };
 
 pub const ShortcutMetadata = struct {
@@ -291,10 +351,28 @@ pub fn validateFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
     const source = try readFile(allocator, io, path);
     defer allocator.free(source);
 
-    const metadata = parseText(allocator, source) catch return .{ .ok = false, .message = "app.zon metadata could not be parsed" };
+    const metadata = parseText(allocator, source) catch return .{
+        .ok = false,
+        .message = zonParseFailureMessage(allocator, source) orelse "app.zon metadata could not be parsed",
+    };
     defer metadata.deinit(allocator);
 
+    if (metadata.description) |description| {
+        app_manifest.validateDescription(description) catch return .{
+            .ok = false,
+            .message = "app.zon description is invalid - it must be one non-empty line of at most 256 bytes with no control characters (it becomes the About panel credits line)",
+        };
+    }
+    if (metadata.theme) |theme_name| {
+        if (!isKnownThemePack(theme_name)) return .{
+            .ok = false,
+            .message = "app.zon theme is invalid - expected one of: house, geist",
+        };
+    }
     validateIconPaths(metadata.icons) catch return .{ .ok = false, .message = "app.zon icons are invalid" };
+    if (try checkIconSources(allocator, io, std.fs.path.dirname(path) orelse ".", metadata.icons)) |icon_message| {
+        return .{ .ok = false, .message = icon_message };
+    }
     const permissions = parsePermissions(allocator, metadata.permissions) catch return .{ .ok = false, .message = "app.zon permissions are invalid" };
     defer allocator.free(permissions);
     const capabilities = parseCapabilities(allocator, metadata.capabilities) catch return .{ .ok = false, .message = "app.zon capabilities are invalid" };
@@ -306,7 +384,7 @@ pub fn validateFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
     }
     const frontend = if (metadata.frontend) |frontend_value| convertFrontend(frontend_value) else null;
     const security = convertSecurity(metadata.security) catch return .{ .ok = false, .message = "app.zon security policy is invalid" };
-    const windows = try convertWindows(allocator, metadata.windows);
+    const windows = convertWindows(allocator, metadata.windows) catch return .{ .ok = false, .message = "app.zon windows are invalid" };
     defer allocator.free(windows);
     const shell = parseShell(allocator, metadata.shell) catch return .{ .ok = false, .message = "app.zon shell is invalid" };
     defer deinitParsedShell(allocator, shell);
@@ -325,7 +403,7 @@ pub fn validateFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
     defer allocator.free(platform_settings);
 
     const manifest: app_manifest.Manifest = .{
-        .identity = .{ .id = metadata.id, .name = metadata.name, .display_name = metadata.display_name },
+        .identity = .{ .id = metadata.id, .name = metadata.name, .display_name = metadata.display_name, .description = metadata.description },
         .version = parseVersion(metadata.version) catch return .{ .ok = false, .message = "app.zon version is invalid" },
         .permissions = permissions,
         .capabilities = capabilities,
@@ -347,6 +425,29 @@ pub fn validateFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
     return .{ .ok = true, .message = "app.zon is valid" };
 }
 
+/// Re-parse a failed manifest with std.zon diagnostics enabled so the
+/// message names the line and column instead of a bare "could not be
+/// parsed". Returns null when no diagnostic could be produced; the
+/// (allocated) message intentionally lives until process exit.
+fn zonParseFailureMessage(allocator: std.mem.Allocator, source: []const u8) ?[]const u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const source_z = scratch.dupeZ(u8, source) catch return null;
+    var diag: std.zon.parse.Diagnostics = .{};
+    defer diag.deinit(scratch);
+    @setEvalBranchQuota(2000);
+    if (std.zon.parse.fromSliceAlloc(RawManifest, scratch, source_z, &diag, .{})) |_| {
+        return null;
+    } else |_| {
+        const rendered = std.fmt.allocPrint(scratch, "{f}", .{&diag}) catch return null;
+        const first_line_end = std.mem.indexOfScalar(u8, rendered, '\n') orelse rendered.len;
+        const first_line = std.mem.trim(u8, rendered[0..first_line_end], " \n");
+        if (first_line.len == 0) return null;
+        return std.fmt.allocPrint(allocator, "app.zon could not be parsed - {s}", .{first_line}) catch null;
+    }
+}
+
 pub fn readMetadata(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Metadata {
     const source = try readFile(allocator, io, path);
     defer allocator.free(source);
@@ -364,6 +465,8 @@ pub fn parseText(allocator: std.mem.Allocator, source: []const u8) !Metadata {
         .id = try allocator.dupe(u8, raw.id),
         .name = try allocator.dupe(u8, raw.name),
         .display_name = if (raw.display_name) |value| try allocator.dupe(u8, value) else null,
+        .description = if (raw.description) |value| try allocator.dupe(u8, value) else null,
+        .theme = if (raw.theme) |value| try allocator.dupe(u8, value) else null,
         .version = try allocator.dupe(u8, raw.version),
         .icons = try duplicateStringList(allocator, raw.icons),
         .platforms = try duplicateStringList(allocator, raw.platforms),
@@ -456,14 +559,44 @@ fn convertRawWindows(allocator: std.mem.Allocator, windows: []const RawWindow) !
             .height = window.height,
             .x = window.x,
             .y = window.y,
+            .resizable = window.resizable,
             .restore_state = window.restore_state,
+            .titlebar = try allocator.dupe(u8, window.titlebar),
+            .min_width = window.min_width,
+            .min_height = window.min_height,
         };
     }
     return converted;
 }
 
 fn convertRawShell(allocator: std.mem.Allocator, shell: RawShell) !ShellMetadata {
-    return .{ .windows = try convertRawShellWindows(allocator, shell.windows) };
+    return .{
+        .windows = try convertRawShellWindows(allocator, shell.windows),
+        .chrome = try convertRawShellChrome(allocator, shell.chrome),
+    };
+}
+
+fn convertRawShellChrome(allocator: std.mem.Allocator, chrome: raw_manifest.RawShellChrome) !ShellChromeMetadata {
+    var converted: ShellChromeMetadata = .{};
+    if (chrome.tabs.len > 0) {
+        const tabs = try allocator.alloc(ShellTabMetadata, chrome.tabs.len);
+        for (chrome.tabs, 0..) |tab, index| {
+            tabs[index] = .{
+                .id = try allocator.dupe(u8, tab.id),
+                .label = try allocator.dupe(u8, tab.label),
+                .icon = try allocator.dupe(u8, tab.icon),
+            };
+        }
+        converted.tabs = tabs;
+    }
+    if (chrome.primary_action) |action| {
+        converted.primary_action = .{
+            .id = try allocator.dupe(u8, action.id),
+            .label = try allocator.dupe(u8, action.label),
+            .icon = try allocator.dupe(u8, action.icon),
+        };
+    }
+    return converted;
 }
 
 fn convertRawShellWindows(allocator: std.mem.Allocator, windows: []const RawShellWindow) ![]const ShellWindowMetadata {
@@ -480,6 +613,9 @@ fn convertRawShellWindows(allocator: std.mem.Allocator, windows: []const RawShel
             .resizable = window.resizable,
             .restore_state = window.restore_state,
             .restore_policy = try allocator.dupe(u8, window.restore_policy),
+            .titlebar = try allocator.dupe(u8, window.titlebar),
+            .min_width = window.min_width,
+            .min_height = window.min_height,
             .views = try convertRawShellViews(allocator, window.views),
         };
     }
@@ -513,6 +649,12 @@ fn convertRawShellViews(allocator: std.mem.Allocator, views: []const RawShellVie
             .url = try duplicateOptionalString(allocator, view.url),
             .text = try duplicateOptionalString(allocator, view.text),
             .command = try duplicateOptionalString(allocator, view.command),
+            .gpu_backend = try duplicateOptionalString(allocator, view.gpu_backend),
+            .gpu_pixel_format = try duplicateOptionalString(allocator, view.gpu_pixel_format),
+            .gpu_present_mode = try duplicateOptionalString(allocator, view.gpu_present_mode),
+            .gpu_alpha_mode = try duplicateOptionalString(allocator, view.gpu_alpha_mode),
+            .gpu_color_space = try duplicateOptionalString(allocator, view.gpu_color_space),
+            .gpu_vsync = view.gpu_vsync,
         };
     }
     return converted;
@@ -616,7 +758,7 @@ pub fn parseVersion(value: []const u8) !app_manifest.Version {
 
 pub fn printDiagnostic(result: ValidationResult) void {
     const severity: diagnostics.Severity = if (result.ok) .info else .@"error";
-    var buffer: [256]u8 = undefined;
+    var buffer: [1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
     diagnostics.formatShort(.{ .severity = severity, .code = diagnostics.code("manifest", if (result.ok) "valid" else "invalid"), .message = result.message }, &writer) catch return;
     std.debug.print("{s}\n", .{writer.buffered()});
@@ -659,6 +801,7 @@ fn convertSecurity(security: SecurityMetadata) !app_manifest.SecurityConfig {
 fn convertWindows(allocator: std.mem.Allocator, windows: []const WindowMetadata) ![]const app_manifest.Window {
     if (windows.len == 0) return &.{};
     const converted = try allocator.alloc(app_manifest.Window, windows.len);
+    errdefer allocator.free(converted);
     for (windows, 0..) |window, index| {
         converted[index] = .{
             .label = window.label,
@@ -667,14 +810,20 @@ fn convertWindows(allocator: std.mem.Allocator, windows: []const WindowMetadata)
             .height = window.height,
             .x = window.x,
             .y = window.y,
+            .resizable = window.resizable,
             .restore_state = window.restore_state,
+            .titlebar = try parseTitlebarStyle(window.titlebar),
+            .min_width = try parseWindowMinSize(window.min_width),
+            .min_height = try parseWindowMinSize(window.min_height),
         };
     }
     return converted;
 }
 
 fn parseShell(allocator: std.mem.Allocator, shell: ShellMetadata) !app_manifest.ShellConfig {
-    if (shell.windows.len == 0) return .{};
+    const chrome = try parseShellChrome(allocator, shell.chrome);
+    errdefer if (chrome.tabs.len > 0) allocator.free(chrome.tabs);
+    if (shell.windows.len == 0) return .{ .chrome = chrome };
     const windows = try allocator.alloc(app_manifest.ShellWindow, shell.windows.len);
     errdefer allocator.free(windows);
     var initialized: usize = 0;
@@ -684,6 +833,12 @@ fn parseShell(allocator: std.mem.Allocator, shell: ShellMetadata) !app_manifest.
         }
     }
     for (shell.windows, 0..) |window, index| {
+        // Parse the fallible scalar fields BEFORE allocating the views
+        // slice, so a bad policy/titlebar string cannot leak it.
+        const restore_policy = try parseRestorePolicy(window.restore_policy);
+        const titlebar = try parseTitlebarStyle(window.titlebar);
+        const min_width = try parseWindowMinSize(window.min_width);
+        const min_height = try parseWindowMinSize(window.min_height);
         const views = try parseShellViews(allocator, window.views);
         windows[index] = .{
             .label = window.label,
@@ -694,12 +849,35 @@ fn parseShell(allocator: std.mem.Allocator, shell: ShellMetadata) !app_manifest.
             .y = window.y,
             .resizable = window.resizable,
             .restore_state = window.restore_state,
-            .restore_policy = try parseRestorePolicy(window.restore_policy),
+            .restore_policy = restore_policy,
+            .titlebar = titlebar,
+            .min_width = min_width,
+            .min_height = min_height,
             .views = views,
         };
         initialized += 1;
     }
-    return .{ .windows = windows };
+    return .{ .windows = windows, .chrome = chrome };
+}
+
+/// Declared platform chrome from app.zon metadata: the strings pass
+/// through (Metadata owns them, exactly like window/view labels); only
+/// the tabs slice is parse-owned. Structural rules live in
+/// `app_manifest.validateShellChrome`, which `parseShell`'s caller runs
+/// over the whole shell.
+fn parseShellChrome(allocator: std.mem.Allocator, chrome: ShellChromeMetadata) !app_manifest.ShellChrome {
+    var parsed: app_manifest.ShellChrome = .{};
+    if (chrome.tabs.len > 0) {
+        const tabs = try allocator.alloc(app_manifest.ShellTab, chrome.tabs.len);
+        for (chrome.tabs, 0..) |tab, index| {
+            tabs[index] = .{ .id = tab.id, .label = tab.label, .icon = tab.icon };
+        }
+        parsed.tabs = tabs;
+    }
+    if (chrome.primary_action) |action| {
+        parsed.primary_action = .{ .id = action.id, .label = action.label, .icon = action.icon };
+    }
+    return parsed;
 }
 
 fn parseShellViews(allocator: std.mem.Allocator, values: []const ShellViewMetadata) ![]const app_manifest.ShellView {
@@ -730,6 +908,12 @@ fn parseShellViews(allocator: std.mem.Allocator, values: []const ShellViewMetada
             .url = view.url,
             .text = view.text,
             .command = view.command,
+            .gpu_backend = if (view.gpu_backend) |value| try parseGpuSurfaceBackend(value) else null,
+            .gpu_pixel_format = if (view.gpu_pixel_format) |value| try parseGpuSurfacePixelFormat(value) else null,
+            .gpu_present_mode = if (view.gpu_present_mode) |value| try parseGpuSurfacePresentMode(value) else null,
+            .gpu_alpha_mode = if (view.gpu_alpha_mode) |value| try parseGpuSurfaceAlphaMode(value) else null,
+            .gpu_color_space = if (view.gpu_color_space) |value| try parseGpuSurfaceColorSpace(value) else null,
+            .gpu_vsync = view.gpu_vsync,
         };
     }
     return views;
@@ -740,6 +924,7 @@ fn deinitParsedShell(allocator: std.mem.Allocator, shell: app_manifest.ShellConf
         if (window.views.len > 0) allocator.free(window.views);
     }
     if (shell.windows.len > 0) allocator.free(shell.windows);
+    if (shell.chrome.tabs.len > 0) allocator.free(shell.chrome.tabs);
 }
 
 fn deinitParsedMenus(allocator: std.mem.Allocator, menus: []const app_manifest.Menu) void {
@@ -749,6 +934,18 @@ fn deinitParsedMenus(allocator: std.mem.Allocator, menus: []const app_manifest.M
     if (menus.len > 0) allocator.free(menus);
 }
 
+/// The built-in theme pack names, kept in step with the canvas
+/// `ThemePack` enum (tooling deliberately does not link the canvas
+/// module; the runner re-validates at comptime, so a drift here shows
+/// up as a build error in the app, never a silently shipped typo).
+fn isKnownThemePack(name: []const u8) bool {
+    const known = [_][]const u8{ "house", "geist" };
+    for (known) |candidate| {
+        if (std.mem.eql(u8, name, candidate)) return true;
+    }
+    return false;
+}
+
 fn validateIconPaths(icons: []const []const u8) !void {
     for (icons, 0..) |icon, index| {
         try validateRelativePath(icon);
@@ -756,6 +953,51 @@ fn validateIconPaths(icons: []const []const u8) !void {
             if (std.mem.eql(u8, previous, icon)) return error.DuplicateIcon;
         }
     }
+}
+
+/// The app-icon teaching checks `native validate` and `native check`
+/// share with packaging (same messages, no packaging): every `.icons`
+/// entry must be a generatable source (.png/.svg) or a prebuilt
+/// container (.icns/.ico), and a source file that exists must decode to
+/// a square image. A missing file is packaging's problem (it warns and
+/// falls back); an undersized source prints the upscaling warning
+/// without failing validation. Returns the error message or null when
+/// the icons pass. The returned message is allocated and intentionally
+/// lives until process exit (same policy as `zonParseFailureMessage`).
+fn checkIconSources(allocator: std.mem.Allocator, io: std.Io, manifest_dir: []const u8, icons: []const []const u8) !?[]const u8 {
+    for (icons) |icon_path| {
+        const is_prebuilt = app_icon_tool.pathHasExtension(icon_path, ".icns") or
+            app_icon_tool.pathHasExtension(icon_path, ".ico");
+        const kind = app_icon_tool.sourceKindForPath(icon_path) orelse {
+            if (is_prebuilt) continue;
+            var buffer: [512]u8 = undefined;
+            return try allocator.dupe(u8, app_icon_tool.formatBadExtensionMessage(&buffer, icon_path));
+        };
+
+        const resolved = try std.fs.path.join(allocator, &.{ manifest_dir, icon_path });
+        defer allocator.free(resolved);
+        const bytes = readFile(allocator, io, resolved) catch continue;
+        defer allocator.free(bytes);
+        switch (try app_icon_tool.loadSource(allocator, bytes, kind)) {
+            .ok => |loaded| {
+                var source = loaded;
+                defer source.deinit(allocator);
+                if (kind == .png and source.width < app_icon_tool.min_recommended_source_size) {
+                    var buffer: [512]u8 = undefined;
+                    std.debug.print("{s}\n", .{app_icon_tool.formatSmallSourceMessage(&buffer, icon_path, source.width, source.height)});
+                }
+            },
+            .issue => |issue| {
+                var buffer: [512]u8 = undefined;
+                const message = switch (issue) {
+                    .not_square => |dims| app_icon_tool.formatNotSquareMessage(&buffer, icon_path, dims.width, dims.height),
+                    .unsupported => app_icon_tool.formatUnsupportedMessage(&buffer, icon_path),
+                };
+                return try allocator.dupe(u8, message);
+            },
+        }
+    }
+    return null;
 }
 
 fn parseCapabilities(allocator: std.mem.Allocator, values: []const []const u8) ![]const app_manifest.Capability {
@@ -797,6 +1039,7 @@ fn parseCapability(value: []const u8) !app_manifest.Capability {
     if (std.mem.eql(u8, value, "webview")) return .webview;
     if (std.mem.eql(u8, value, "js_bridge")) return .js_bridge;
     if (std.mem.eql(u8, value, "native_views")) return .native_views;
+    if (std.mem.eql(u8, value, "gpu_surfaces")) return .gpu_surfaces;
     if (std.mem.eql(u8, value, "menus")) return .menus;
     if (std.mem.eql(u8, value, "shortcuts")) return .shortcuts;
     if (std.mem.eql(u8, value, "tray")) return .tray;
@@ -983,6 +1226,22 @@ fn parseRestorePolicy(value: []const u8) !app_manifest.WindowRestorePolicy {
     return error.InvalidWindowRestorePolicy;
 }
 
+fn parseTitlebarStyle(value: []const u8) !app_manifest.WindowTitlebarStyle {
+    if (std.mem.eql(u8, value, "standard")) return .standard;
+    if (std.mem.eql(u8, value, "hidden_inset")) return .hidden_inset;
+    if (std.mem.eql(u8, value, "hidden_inset_tall")) return .hidden_inset_tall;
+    if (std.mem.eql(u8, value, "chromeless")) return .chromeless;
+    return error.InvalidWindowTitlebarStyle;
+}
+
+/// Same validation posture as the titlebar style: a min-size floor the
+/// host cannot honor (negative or non-finite) is a manifest error, not
+/// a silent clamp. 0 is the "no floor" sentinel.
+fn parseWindowMinSize(value: f32) !f32 {
+    if (!std.math.isFinite(value) or value < 0) return error.InvalidWindowMinSize;
+    return value;
+}
+
 fn parseViewKind(value: []const u8) !app_manifest.ViewKind {
     if (std.mem.eql(u8, value, "webview")) return .webview;
     if (std.mem.eql(u8, value, "toolbar")) return .toolbar;
@@ -1003,6 +1262,39 @@ fn parseViewKind(value: []const u8) !app_manifest.ViewKind {
     if (std.mem.eql(u8, value, "spacer")) return .spacer;
     if (std.mem.eql(u8, value, "gpu_surface")) return .gpu_surface;
     if (std.mem.eql(u8, value, "progress_indicator")) return .progress_indicator;
+    return error.InvalidViewKind;
+}
+
+fn parseGpuSurfaceBackend(value: []const u8) !app_manifest.GpuSurfaceBackend {
+    if (std.mem.eql(u8, value, "none")) return .none;
+    if (std.mem.eql(u8, value, "metal")) return .metal;
+    if (std.mem.eql(u8, value, "software")) return .software;
+    return error.InvalidViewKind;
+}
+
+fn parseGpuSurfacePixelFormat(value: []const u8) !app_manifest.GpuSurfacePixelFormat {
+    if (std.mem.eql(u8, value, "none")) return .none;
+    if (std.mem.eql(u8, value, "bgra8_unorm")) return .bgra8_unorm;
+    return error.InvalidViewKind;
+}
+
+fn parseGpuSurfacePresentMode(value: []const u8) !app_manifest.GpuSurfacePresentMode {
+    if (std.mem.eql(u8, value, "none")) return .none;
+    if (std.mem.eql(u8, value, "timer")) return .timer;
+    return error.InvalidViewKind;
+}
+
+fn parseGpuSurfaceAlphaMode(value: []const u8) !app_manifest.GpuSurfaceAlphaMode {
+    if (std.mem.eql(u8, value, "none")) return .none;
+    if (std.mem.eql(u8, value, "opaque")) return .@"opaque";
+    if (std.mem.eql(u8, value, "premultiplied")) return .premultiplied;
+    return error.InvalidViewKind;
+}
+
+fn parseGpuSurfaceColorSpace(value: []const u8) !app_manifest.GpuSurfaceColorSpace {
+    if (std.mem.eql(u8, value, "none")) return .none;
+    if (std.mem.eql(u8, value, "srgb")) return .srgb;
+    if (std.mem.eql(u8, value, "display_p3")) return .display_p3;
     return error.InvalidViewKind;
 }
 
@@ -1057,11 +1349,12 @@ test "manifest metadata parser reads identity version and lists" {
         \\  .id = "com.example.app",
         \\  .name = "example",
         \\  .display_name = "Example App",
+        \\  .description = "An example app for the manifest parser.",
         \\  .version = "1.2.3",
         \\  .icons = .{ "assets/icon.png" },
         \\  .platforms = .{ "macos", "linux" },
         \\  .capabilities = .{
-        \\    "native_module", "webview", "js_bridge", "native_views", "menus", "shortcuts", "tray",
+        \\    "native_module", "webview", "js_bridge", "native_views", "gpu_surfaces", "menus", "shortcuts", "tray",
         \\    "dialog", "credentials", "file_drops", "file_associations", "url_schemes",
         \\    "open_url", "reveal_path", "recent_documents", "app_activation_events",
         \\  },
@@ -1098,27 +1391,30 @@ test "manifest metadata parser reads identity version and lists" {
     try std.testing.expectEqualStrings("com.example.app", metadata.id);
     try std.testing.expectEqualStrings("example", metadata.name);
     try std.testing.expectEqualStrings("Example App", metadata.displayName());
+    try std.testing.expectEqualStrings("An example app for the manifest parser.", metadata.description.?);
     try std.testing.expectEqualStrings("1.2.3", metadata.version);
     try std.testing.expectEqualStrings("assets/icon.png", metadata.icons[0]);
     try std.testing.expectEqualStrings("linux", metadata.platforms[1]);
     try std.testing.expectEqualStrings("webview", metadata.capabilities[1]);
     try std.testing.expectEqualStrings("native_views", metadata.capabilities[3]);
-    try std.testing.expectEqualStrings("dialog", metadata.capabilities[7]);
-    try std.testing.expectEqualStrings("file_drops", metadata.capabilities[9]);
-    try std.testing.expectEqualStrings("url_schemes", metadata.capabilities[11]);
+    try std.testing.expectEqualStrings("gpu_surfaces", metadata.capabilities[4]);
+    try std.testing.expectEqualStrings("dialog", metadata.capabilities[8]);
+    try std.testing.expectEqualStrings("file_drops", metadata.capabilities[10]);
+    try std.testing.expectEqualStrings("url_schemes", metadata.capabilities[12]);
     const parsed_capabilities = try parseCapabilities(std.testing.allocator, metadata.capabilities);
     defer std.testing.allocator.free(parsed_capabilities);
     try std.testing.expectEqual(app_manifest.CapabilityKind.native_views, parsed_capabilities[3].kind());
-    try std.testing.expectEqual(app_manifest.CapabilityKind.menus, parsed_capabilities[4].kind());
-    try std.testing.expectEqual(app_manifest.CapabilityKind.shortcuts, parsed_capabilities[5].kind());
-    try std.testing.expectEqual(app_manifest.CapabilityKind.tray, parsed_capabilities[6].kind());
-    try std.testing.expectEqual(app_manifest.CapabilityKind.file_drops, parsed_capabilities[9].kind());
-    try std.testing.expectEqual(app_manifest.CapabilityKind.file_associations, parsed_capabilities[10].kind());
-    try std.testing.expectEqual(app_manifest.CapabilityKind.url_schemes, parsed_capabilities[11].kind());
-    try std.testing.expectEqual(app_manifest.CapabilityKind.open_url, parsed_capabilities[12].kind());
-    try std.testing.expectEqual(app_manifest.CapabilityKind.reveal_path, parsed_capabilities[13].kind());
-    try std.testing.expectEqual(app_manifest.CapabilityKind.recent_documents, parsed_capabilities[14].kind());
-    try std.testing.expectEqual(app_manifest.CapabilityKind.app_activation_events, parsed_capabilities[15].kind());
+    try std.testing.expectEqual(app_manifest.CapabilityKind.gpu_surfaces, parsed_capabilities[4].kind());
+    try std.testing.expectEqual(app_manifest.CapabilityKind.menus, parsed_capabilities[5].kind());
+    try std.testing.expectEqual(app_manifest.CapabilityKind.shortcuts, parsed_capabilities[6].kind());
+    try std.testing.expectEqual(app_manifest.CapabilityKind.tray, parsed_capabilities[7].kind());
+    try std.testing.expectEqual(app_manifest.CapabilityKind.file_drops, parsed_capabilities[10].kind());
+    try std.testing.expectEqual(app_manifest.CapabilityKind.file_associations, parsed_capabilities[11].kind());
+    try std.testing.expectEqual(app_manifest.CapabilityKind.url_schemes, parsed_capabilities[12].kind());
+    try std.testing.expectEqual(app_manifest.CapabilityKind.open_url, parsed_capabilities[13].kind());
+    try std.testing.expectEqual(app_manifest.CapabilityKind.reveal_path, parsed_capabilities[14].kind());
+    try std.testing.expectEqual(app_manifest.CapabilityKind.recent_documents, parsed_capabilities[15].kind());
+    try std.testing.expectEqual(app_manifest.CapabilityKind.app_activation_events, parsed_capabilities[16].kind());
     try std.testing.expectEqualStrings("native.ping", metadata.bridge_commands[0].name);
     try std.testing.expectEqualStrings("app.refresh", metadata.commands[0].id);
     try std.testing.expectEqualStrings("Refresh", metadata.commands[0].title);
@@ -1195,6 +1491,49 @@ test "manifest metadata parser reads structured security policy" {
     try std.testing.expectEqualStrings("https://example.com/*", metadata.security.navigation.external_links.allowed_urls[0]);
 }
 
+test "manifest metadata parser reads declared platform chrome" {
+    const metadata = try parseText(std.testing.allocator,
+        \\.{
+        \\  .id = "com.example.app",
+        \\  .name = "example",
+        \\  .version = "1.2.3",
+        \\  .shell = .{
+        \\    .chrome = .{
+        \\      .tabs = .{
+        \\        .{ .id = "tabs.home", .label = "Home", .icon = "menu" },
+        \\        .{ .id = "tabs.settings", .label = "Settings", .icon = "settings" },
+        \\      },
+        \\      .primary_action = .{ .id = "action.new", .label = "New", .icon = "plus" },
+        \\    },
+        \\    .windows = .{
+        \\      .{
+        \\        .label = "main",
+        \\        .views = .{
+        \\          .{ .label = "content", .kind = "webview", .url = "zero://app/index.html", .fill = true },
+        \\        },
+        \\      },
+        \\    },
+        \\  },
+        \\}
+    );
+    defer metadata.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), metadata.shell.chrome.tabs.len);
+    try std.testing.expectEqualStrings("tabs.home", metadata.shell.chrome.tabs[0].id);
+    try std.testing.expectEqualStrings("Home", metadata.shell.chrome.tabs[0].label);
+    try std.testing.expectEqualStrings("menu", metadata.shell.chrome.tabs[0].icon);
+    try std.testing.expectEqualStrings("action.new", metadata.shell.chrome.primary_action.?.id);
+
+    // The parsed shell carries the declaration through to the shared
+    // manifest validation, which accepts it whole.
+    const shell = try parseShell(std.testing.allocator, metadata.shell);
+    defer deinitParsedShell(std.testing.allocator, shell);
+    try std.testing.expectEqual(@as(usize, 2), shell.chrome.tabs.len);
+    try std.testing.expectEqualStrings("tabs.settings", shell.chrome.tabs[1].id);
+    try std.testing.expectEqualStrings("plus", shell.chrome.primary_action.?.icon);
+    try app_manifest.validateShellChrome(shell.chrome);
+}
+
 test "manifest metadata parser reads shell windows and views" {
     const metadata = try parseText(std.testing.allocator,
         \\.{
@@ -1219,6 +1558,7 @@ test "manifest metadata parser reads shell windows and views" {
         \\          .{ .label = "mode", .kind = "segmented_control", .parent = "toolbar", .text = "List|Grid", .command = "app.view.mode" },
         \\          .{ .label = "syncing", .kind = "progress_indicator", .parent = "toolbar", .role = "Syncing" },
         \\          .{ .label = "nav-row", .kind = "list_item", .parent = "toolbar-stack", .text = "Inbox", .command = "app.open.inbox" },
+        \\          .{ .label = "canvas", .kind = "gpu_surface", .gpu_backend = "metal", .gpu_pixel_format = "bgra8_unorm", .gpu_present_mode = "timer", .gpu_alpha_mode = "opaque", .gpu_color_space = "srgb", .gpu_vsync = true },
         \\        },
         \\      },
         \\    },
@@ -1244,6 +1584,13 @@ test "manifest metadata parser reads shell windows and views" {
     try std.testing.expectEqualStrings("segmented_control", metadata.shell.windows[0].views[6].kind);
     try std.testing.expectEqualStrings("progress_indicator", metadata.shell.windows[0].views[7].kind);
     try std.testing.expectEqualStrings("list_item", metadata.shell.windows[0].views[8].kind);
+    try std.testing.expectEqualStrings("gpu_surface", metadata.shell.windows[0].views[9].kind);
+    try std.testing.expectEqualStrings("metal", metadata.shell.windows[0].views[9].gpu_backend.?);
+    try std.testing.expectEqualStrings("bgra8_unorm", metadata.shell.windows[0].views[9].gpu_pixel_format.?);
+    try std.testing.expectEqualStrings("timer", metadata.shell.windows[0].views[9].gpu_present_mode.?);
+    try std.testing.expectEqualStrings("opaque", metadata.shell.windows[0].views[9].gpu_alpha_mode.?);
+    try std.testing.expectEqualStrings("srgb", metadata.shell.windows[0].views[9].gpu_color_space.?);
+    try std.testing.expect(metadata.shell.windows[0].views[9].gpu_vsync.?);
 
     const shell = try parseShell(std.testing.allocator, metadata.shell);
     defer deinitParsedShell(std.testing.allocator, shell);
@@ -1259,12 +1606,134 @@ test "manifest metadata parser reads shell windows and views" {
     try std.testing.expectEqual(app_manifest.ViewKind.segmented_control, shell.windows[0].views[6].kind);
     try std.testing.expectEqual(app_manifest.ViewKind.progress_indicator, shell.windows[0].views[7].kind);
     try std.testing.expectEqual(app_manifest.ViewKind.list_item, shell.windows[0].views[8].kind);
+    try std.testing.expectEqual(app_manifest.ViewKind.gpu_surface, shell.windows[0].views[9].kind);
+    try std.testing.expectEqual(app_manifest.GpuSurfaceBackend.metal, shell.windows[0].views[9].gpu_backend.?);
+    try std.testing.expectEqual(app_manifest.GpuSurfacePixelFormat.bgra8_unorm, shell.windows[0].views[9].gpu_pixel_format.?);
+    try std.testing.expectEqual(app_manifest.GpuSurfacePresentMode.timer, shell.windows[0].views[9].gpu_present_mode.?);
+    try std.testing.expectEqual(app_manifest.GpuSurfaceAlphaMode.@"opaque", shell.windows[0].views[9].gpu_alpha_mode.?);
+    try std.testing.expectEqual(app_manifest.GpuSurfaceColorSpace.srgb, shell.windows[0].views[9].gpu_color_space.?);
+    try std.testing.expect(shell.windows[0].views[9].gpu_vsync.?);
     try std.testing.expectEqual(app_manifest.ShellEdge.top, shell.windows[0].views[0].edge.?);
     try app_manifest.validateManifest(.{
         .identity = .{ .id = metadata.id, .name = metadata.name },
         .version = try parseVersion(metadata.version),
         .shell = shell,
     });
+}
+
+test "manifest parser reads window titlebar styles" {
+    const metadata = try parseText(std.testing.allocator,
+        \\.{
+        \\  .id = "com.example.app",
+        \\  .name = "example",
+        \\  .version = "1.2.3",
+        \\  .windows = .{
+        \\    .{ .label = "main", .resizable = false, .titlebar = "hidden_inset" },
+        \\    .{ .label = "tall", .titlebar = "hidden_inset_tall" },
+        \\    .{ .label = "skinned", .titlebar = "chromeless" },
+        \\  },
+        \\  .shell = .{
+        \\    .windows = .{
+        \\      .{ .label = "scene", .titlebar = "hidden_inset_tall", .views = .{ .{ .label = "content", .kind = "webview", .url = "zero://app/index.html" } } },
+        \\    },
+        \\  },
+        \\}
+    );
+    defer metadata.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("hidden_inset", metadata.windows[0].titlebar);
+    try std.testing.expect(!metadata.windows[0].resizable);
+    try std.testing.expectEqualStrings("hidden_inset_tall", metadata.windows[1].titlebar);
+    try std.testing.expectEqualStrings("chromeless", metadata.windows[2].titlebar);
+    try std.testing.expectEqualStrings("hidden_inset_tall", metadata.shell.windows[0].titlebar);
+
+    const windows = try convertWindows(std.testing.allocator, metadata.windows);
+    defer std.testing.allocator.free(windows);
+    try std.testing.expectEqual(app_manifest.WindowTitlebarStyle.hidden_inset, windows[0].titlebar);
+    try std.testing.expect(!windows[0].resizable);
+    try std.testing.expectEqual(app_manifest.WindowTitlebarStyle.hidden_inset_tall, windows[1].titlebar);
+    try std.testing.expectEqual(app_manifest.WindowTitlebarStyle.chromeless, windows[2].titlebar);
+
+    const shell = try parseShell(std.testing.allocator, metadata.shell);
+    defer deinitParsedShell(std.testing.allocator, shell);
+    try std.testing.expectEqual(app_manifest.WindowTitlebarStyle.hidden_inset_tall, shell.windows[0].titlebar);
+}
+
+test "manifest parser reads window min sizes" {
+    const metadata = try parseText(std.testing.allocator,
+        \\.{
+        \\  .id = "com.example.app",
+        \\  .name = "example",
+        \\  .version = "1.2.3",
+        \\  .windows = .{
+        \\    .{ .label = "main", .min_width = 596, .min_height = 420 },
+        \\  },
+        \\  .shell = .{
+        \\    .windows = .{
+        \\      .{ .label = "scene", .min_width = 596, .min_height = 420, .views = .{ .{ .label = "content", .kind = "webview", .url = "zero://app/index.html" } } },
+        \\    },
+        \\  },
+        \\}
+    );
+    defer metadata.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(f32, 596), metadata.windows[0].min_width);
+    try std.testing.expectEqual(@as(f32, 420), metadata.windows[0].min_height);
+    try std.testing.expectEqual(@as(f32, 596), metadata.shell.windows[0].min_width);
+
+    const windows = try convertWindows(std.testing.allocator, metadata.windows);
+    defer std.testing.allocator.free(windows);
+    try std.testing.expectEqual(@as(f32, 596), windows[0].min_width);
+    try std.testing.expectEqual(@as(f32, 420), windows[0].min_height);
+
+    const shell = try parseShell(std.testing.allocator, metadata.shell);
+    defer deinitParsedShell(std.testing.allocator, shell);
+    try std.testing.expectEqual(@as(f32, 596), shell.windows[0].min_width);
+    try std.testing.expectEqual(@as(f32, 420), shell.windows[0].min_height);
+}
+
+test "manifest parser rejects negative window min sizes" {
+    const metadata = try parseText(std.testing.allocator,
+        \\.{
+        \\  .id = "com.example.app",
+        \\  .name = "example",
+        \\  .version = "1.2.3",
+        \\  .windows = .{
+        \\    .{ .label = "main", .min_width = -1 },
+        \\  },
+        \\  .shell = .{
+        \\    .windows = .{
+        \\      .{ .label = "scene", .min_height = -20, .views = .{ .{ .label = "content", .kind = "webview", .url = "zero://app/index.html" } } },
+        \\    },
+        \\  },
+        \\}
+    );
+    defer metadata.deinit(std.testing.allocator);
+
+    try std.testing.expectError(error.InvalidWindowMinSize, convertWindows(std.testing.allocator, metadata.windows));
+    try std.testing.expectError(error.InvalidWindowMinSize, parseShell(std.testing.allocator, metadata.shell));
+}
+
+test "manifest parser rejects unknown window titlebar style" {
+    const metadata = try parseText(std.testing.allocator,
+        \\.{
+        \\  .id = "com.example.app",
+        \\  .name = "example",
+        \\  .version = "1.2.3",
+        \\  .windows = .{
+        \\    .{ .label = "main", .titlebar = "transparent" },
+        \\  },
+        \\  .shell = .{
+        \\    .windows = .{
+        \\      .{ .label = "scene", .titlebar = "frameless", .views = .{ .{ .label = "content", .kind = "webview", .url = "zero://app/index.html" } } },
+        \\    },
+        \\  },
+        \\}
+    );
+    defer metadata.deinit(std.testing.allocator);
+
+    try std.testing.expectError(error.InvalidWindowTitlebarStyle, convertWindows(std.testing.allocator, metadata.windows));
+    try std.testing.expectError(error.InvalidWindowTitlebarStyle, parseShell(std.testing.allocator, metadata.shell));
 }
 
 test "manifest parser rejects invalid shell view kind" {
@@ -1342,4 +1811,129 @@ test "manifest metadata parser reads frontend config" {
     try std.testing.expectEqualStrings("http://127.0.0.1:5173/", metadata.frontend.?.dev.?.url);
     try std.testing.expectEqualStrings("npm", metadata.frontend.?.dev.?.command[0]);
     try std.testing.expectEqual(@as(u32, 12000), metadata.frontend.?.dev.?.timeout_ms);
+}
+
+test "validate surfaces the non-square icon teaching error with dimensions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var cwd = std.Io.Dir.cwd();
+    const root = ".zig-cache/test-validate-icon-nonsquare";
+    try cwd.deleteTree(std.testing.io, root);
+    defer cwd.deleteTree(std.testing.io, root) catch {};
+    try cwd.createDirPath(std.testing.io, root ++ "/assets");
+
+    // A 6x4 white PNG source.
+    const pixels = try gpa.alloc(u8, 6 * 4 * 4);
+    @memset(pixels, 255);
+    const encoded = try app_icon_tool.encodePng(gpa, pixels, 6, 4);
+    try cwd.writeFile(std.testing.io, .{ .sub_path = root ++ "/assets/icon.png", .data = encoded });
+    try cwd.writeFile(std.testing.io, .{ .sub_path = root ++ "/app.zon", .data =
+        \\.{
+        \\  .id = "dev.example.app",
+        \\  .name = "demo",
+        \\  .version = "1.0.0",
+        \\  .icons = .{"assets/icon.png"},
+        \\}
+    });
+
+    const result = try validateFile(gpa, std.testing.io, root ++ "/app.zon");
+    try std.testing.expect(!result.ok);
+    try std.testing.expect(std.mem.indexOf(u8, result.message, "6x4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.message, "square") != null);
+}
+
+test "validate rejects unsupported icon extensions naming the accepted forms" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var cwd = std.Io.Dir.cwd();
+    const root = ".zig-cache/test-validate-icon-ext";
+    try cwd.deleteTree(std.testing.io, root);
+    defer cwd.deleteTree(std.testing.io, root) catch {};
+    try cwd.createDirPath(std.testing.io, root);
+    try cwd.writeFile(std.testing.io, .{ .sub_path = root ++ "/app.zon", .data =
+        \\.{
+        \\  .id = "dev.example.app",
+        \\  .name = "demo",
+        \\  .version = "1.0.0",
+        \\  .icons = .{"assets/icon.jpg"},
+        \\}
+    });
+
+    const result = try validateFile(gpa, std.testing.io, root ++ "/app.zon");
+    try std.testing.expect(!result.ok);
+    try std.testing.expect(std.mem.indexOf(u8, result.message, ".png") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.message, ".svg") != null);
+}
+
+test "validate reports an unreadable icon source naming the accepted forms" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var cwd = std.Io.Dir.cwd();
+    const root = ".zig-cache/test-validate-icon-bad";
+    try cwd.deleteTree(std.testing.io, root);
+    defer cwd.deleteTree(std.testing.io, root) catch {};
+    try cwd.createDirPath(std.testing.io, root ++ "/assets");
+    try cwd.writeFile(std.testing.io, .{ .sub_path = root ++ "/assets/icon.png", .data = "this is not a png" });
+    try cwd.writeFile(std.testing.io, .{ .sub_path = root ++ "/app.zon", .data =
+        \\.{
+        \\  .id = "dev.example.app",
+        \\  .name = "demo",
+        \\  .version = "1.0.0",
+        \\  .icons = .{"assets/icon.png"},
+        \\}
+    });
+
+    const result = try validateFile(gpa, std.testing.io, root ++ "/app.zon");
+    try std.testing.expect(!result.ok);
+    try std.testing.expect(std.mem.indexOf(u8, result.message, "could not be read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.message, ".png") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.message, ".svg") != null);
+}
+
+test "validate accepts a square icon source and prebuilt containers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var cwd = std.Io.Dir.cwd();
+    const root = ".zig-cache/test-validate-icon-ok";
+    try cwd.deleteTree(std.testing.io, root);
+    defer cwd.deleteTree(std.testing.io, root) catch {};
+    try cwd.createDirPath(std.testing.io, root ++ "/assets");
+
+    const pixels = try gpa.alloc(u8, 600 * 600 * 4);
+    @memset(pixels, 128);
+    const encoded = try app_icon_tool.encodePng(gpa, pixels, 600, 600);
+    try cwd.writeFile(std.testing.io, .{ .sub_path = root ++ "/assets/icon.png", .data = encoded });
+    try cwd.writeFile(std.testing.io, .{ .sub_path = root ++ "/app.zon", .data =
+        \\.{
+        \\  .id = "dev.example.app",
+        \\  .name = "demo",
+        \\  .version = "1.0.0",
+        \\  .icons = .{ "assets/icon.png", "assets/prebuilt.icns", "assets/prebuilt.ico" },
+        \\}
+    });
+
+    const result = try validateFile(gpa, std.testing.io, root ++ "/app.zon");
+    try std.testing.expect(result.ok);
+}
+
+test "manifest validates the theme pack name" {
+    const metadata = try parseText(std.testing.allocator,
+        \\.{
+        \\  .id = "com.example.app",
+        \\  .name = "example",
+        \\  .version = "1.0.0",
+        \\  .theme = "geist",
+        \\}
+    );
+    defer metadata.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("geist", metadata.theme.?);
+    // The known-pack check is the tooling half of the contract; the
+    // runner re-validates the same names at comptime in the app build.
+    try std.testing.expect(isKnownThemePack("house"));
+    try std.testing.expect(isKnownThemePack("geist"));
+    try std.testing.expect(!isKnownThemePack("neon"));
 }

@@ -1,6 +1,6 @@
 # CEF Vendor Layout
 
-Chromium mode uses CEF as the bundled engine backend. zero-native does not vendor CEF binaries in git.
+Chromium mode uses CEF as the bundled engine backend. The Native SDK does not vendor CEF binaries in git.
 
 CEF runtime archives are platform-specific. The default install directory is selected from the host platform:
 
@@ -13,10 +13,10 @@ Windows: third_party/cef/windows
 Install the default macOS CEF runtime with:
 
 ```sh
-zero-native cef install
+native cef install
 ```
 
-The default installer downloads zero-native's prepared runtime from GitHub Releases. It already includes `libcef_dll_wrapper.a`, so app developers do not need CMake.
+The default installer downloads Native SDK's prepared runtime from GitHub Releases. It already includes `libcef_dll_wrapper.a`, so app developers do not need CMake.
 
 Expected layouts:
 
@@ -44,28 +44,28 @@ third_party/cef/windows/
 Use a custom location with:
 
 ```sh
-zero-native cef install --dir /path/to/cef
+native cef install --dir /path/to/cef
 zig build run-webview -Dcef-dir=/path/to/cef
 ```
 
 Advanced users can install from official CEF archives and build the wrapper locally:
 
 ```sh
-zero-native cef install --source official --allow-build-tools --dir /path/to/cef
+native cef install --source official --allow-build-tools --dir /path/to/cef
 ```
 
-Core maintainers can build CEF itself from source before a prepared zero-native release exists, or when testing a new CEF branch:
+Core maintainers can build CEF itself from source before a prepared Native SDK release exists, or when testing a new CEF branch:
 
 ```sh
 tools/cef/build-from-source.sh --platform macosarm64 --cef-branch <branch> --output zig-out/cef
 ```
 
-That script uses CEF's `automate-git.py`, `depot_tools`, CMake, and the platform compiler toolchain to produce the same `zero-native-cef-<version>-<platform>.tar.gz` asset uploaded by the CEF runtime release workflow. This is a maintainer path only; app developers should use `zero-native cef install`.
+That script uses CEF's `automate-git.py`, `depot_tools`, CMake, and the platform compiler toolchain to produce the same `native-sdk-cef-<version>-<platform>.tar.gz` asset uploaded by the CEF runtime release workflow. This is a maintainer path only; app developers should use `native cef install`.
 
 Verify the layout before building with:
 
 ```sh
-zero-native doctor --manifest app.zon --cef-dir /path/to/cef
+native doctor --manifest app.zon --cef-dir /path/to/cef
 ```
 
 For local development, the build can opt into installing CEF automatically:

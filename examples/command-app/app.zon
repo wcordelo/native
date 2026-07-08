@@ -1,9 +1,8 @@
 .{
-    .id = "dev.zero_native.command_app",
+    .id = "dev.native_sdk.command_app",
     .name = "command-app",
     .display_name = "Command App",
     .version = "0.1.0",
-    .icons = .{ "assets/icon.icns" },
     .platforms = .{ "macos", "linux" },
     .permissions = .{ "command" },
     .capabilities = .{ "webview", "js_bridge", "native_views", "menus", "shortcuts", "tray" },
@@ -25,7 +24,7 @@
         .windows = .{
             .{
                 .label = "main",
-                .title = "zero-native Command App",
+                .title = "Native SDK Command App",
                 .width = 860,
                 .height = 560,
                 .restore_policy = "center_on_primary",

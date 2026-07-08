@@ -104,7 +104,7 @@ pub fn reportForCurrentHost() platform_info.DoctorReport {
             platform_info.DoctorCheck.ok("codesign", "codesign is available for macOS signing (ad-hoc or identity)"),
             platform_info.DoctorCheck.ok("notarytool", "xcrun notarytool is available for macOS notarization"),
             platform_info.DoctorCheck.ok("hdiutil", "hdiutil is available for macOS .dmg creation"),
-            platform_info.DoctorCheck.ok("iconutil", "iconutil is available for .icns generation from .iconset"),
+            platform_info.DoctorCheck.ok("app-icon", "app icon generation (.icns, .ico, PNG size sets) is built into `native package` - one square assets/icon.png or .svg source, no external tools"),
             platform_info.DoctorCheck.ok("ios-static-lib", "Use `zig build lib -Dtarget=aarch64-ios` to build the iOS static library"),
             platform_info.DoctorCheck.ok("android-static-lib", "Use `zig build lib -Dtarget=aarch64-linux-android` to build the Android static library"),
         };
@@ -147,7 +147,6 @@ pub fn reportForCurrentHostWithProbe(
         try addPathCheck(buffers, io, probe, "codesign", "/usr/bin/codesign", "codesign is available for macOS signing", "codesign was not found");
         try addCommandCheck(buffers, allocator, io, probe, "notarytool", &.{ "xcrun", "notarytool", "--help" }, "xcrun notarytool is available for notarization", "xcrun notarytool was not found");
         try addPathCheck(buffers, io, probe, "hdiutil", "/usr/bin/hdiutil", "hdiutil is available for macOS .dmg creation", "hdiutil was not found");
-        try addPathCheck(buffers, io, probe, "iconutil", "/usr/bin/iconutil", "iconutil is available for .icns generation", "iconutil was not found");
     } else {
         try buffers.add("codesign", .unsupported, "macOS signing checks only run on macOS hosts", .{});
     }
@@ -155,6 +154,11 @@ pub fn reportForCurrentHostWithProbe(
         try addCommandCheck(buffers, allocator, io, probe, "webview-system", &.{ "pkg-config", "--exists", "webkitgtk-6.0" }, "WebKitGTK 6.0 system WebView backend is available", "WebKitGTK 6.0 was not found (install libwebkitgtk-6.0-dev or webkitgtk-6.0)");
         try addCommandCheck(buffers, allocator, io, probe, "webkitgtk", &.{ "pkg-config", "--exists", "webkitgtk-6.0" }, "WebKitGTK 6.0 development libraries are available", "WebKitGTK 6.0 was not found (install libwebkitgtk-6.0-dev or webkitgtk-6.0)");
         try addCommandCheck(buffers, allocator, io, probe, "gtk4", &.{ "pkg-config", "--exists", "gtk4" }, "GTK4 development libraries are available", "GTK4 was not found (install libgtk-4-dev or gtk4)");
+    } else if (target.os == .windows) {
+        // The Windows system engine is the OS WebView2 runtime, loaded by
+        // apps at run time; the Evergreen runtime registers this client id
+        // in the registry (per-machine or per-user).
+        try addCommandCheck(buffers, allocator, io, probe, "webview-system", &.{ "reg", "query", "HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}", "/v", "pv" }, "WebView2 system WebView runtime is installed", "WebView2 runtime was not found (install the Evergreen WebView2 Runtime)");
     } else if (target.os != .macos) {
         try buffers.add("webview-system", .unsupported, "system WebView backend is not wired for this host yet", .{});
     }
@@ -174,12 +178,21 @@ pub fn reportForCurrentHostWithProbe(
     const cef_platform = cef.Platform.current() catch null;
     if (cef_platform == null) {
         try buffers.add("webview-chromium", .unsupported, "Chromium/CEF backend is not wired for this host", .{});
+    } else if (target.os == .windows) {
+        // The Windows CEF host is a placeholder: build and package
+        // tooling reject the chromium engine on Windows until CEF browser
+        // creation is wired, so report it honestly instead of implying an
+        // available backend.
+        try buffers.add("webview-chromium", .unsupported, "Chromium/CEF desktop engine is not wired on Windows yet; the system engine (WebView2) is the Windows backend", .{});
     } else if (resolved_engine.engine == .chromium) {
         const cef_dir = if (resolved_engine.cef_dir.len == 0) cef_platform.?.defaultDir() else resolved_engine.cef_dir;
         try addCefLayoutCheck(buffers, io, probe, cef_platform.?, cef_dir);
     } else {
         try buffers.add("webview-chromium", .available, "Chromium backend is available; configure app.zon or pass --web-engine chromium to check CEF", .{});
     }
+    // Icon generation needs no host tool anywhere: the pipeline (PNG/SVG
+    // source -> .icns/.ico/PNG size sets) is built into the CLI itself.
+    try buffers.add("app-icon", .available, "app icon generation (.icns, .ico, PNG size sets) is built into `native package` - one square assets/icon.png or .svg source, no external tools", .{});
     try buffers.add("ios-static-lib", .available, "Use `zig build lib -Dtarget=aarch64-ios` to build the iOS static library", .{});
     try buffers.add("android-static-lib", .available, "Use `zig build lib -Dtarget=aarch64-linux-android` to build the Android static library", .{});
 
@@ -207,7 +220,7 @@ fn envRecords(env_map: *std.process.Environ.Map, buffers: *ReportBuffers) []cons
 }
 
 fn addLogPathCheck(buffers: *ReportBuffers, env_map: *std.process.Environ.Map) !void {
-    const paths = debug.resolveLogPaths(&buffers.log_paths, "dev.zero_native.app", debug.envFromMap(env_map), env_map.get("ZERO_NATIVE_LOG_DIR")) catch |err| {
+    const paths = debug.resolveLogPaths(&buffers.log_paths, "dev.native_sdk.app", debug.envFromMap(env_map), env_map.get("NATIVE_SDK_LOG_DIR")) catch |err| {
         return buffers.add("log-path", .missing, "log directory could not be resolved: {s}", .{@errorName(err)});
     };
     try buffers.add("log-path", .available, "runtime logs will be written to {s}", .{paths.log_file});
@@ -266,7 +279,7 @@ fn addCefLayoutCheck(buffers: *ReportBuffers, io: std.Io, probe: Probe, platform
             return buffers.add("webview-chromium", .missing, "CEF path is too long under {s}", .{cef_dir});
         };
         if (!probe.pathExists(io, path)) {
-            return buffers.add("webview-chromium", .missing, "CEF is missing {s}; run `zero-native cef install --dir {s}`", .{ entry.path, cef_dir });
+            return buffers.add("webview-chromium", .missing, "CEF is missing {s}; run `native cef install --dir {s}`", .{ entry.path, cef_dir });
         }
     }
     try buffers.add("webview-chromium", .available, "CEF layout is ready at {s}", .{cef_dir});

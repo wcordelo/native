@@ -1,8 +1,8 @@
 const std = @import("std");
 const runner = @import("runner");
-const zero_native = @import("zero-native");
+const native_sdk = @import("native_sdk");
 
-pub const panic = std.debug.FullPanic(zero_native.debug.capturePanic);
+pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
 const window_width: f32 = 1100;
 const window_height: f32 = 760;
@@ -11,7 +11,7 @@ const sidebar_width: f32 = 240;
 const statusbar_height: f32 = 40;
 const preview_label = "preview";
 const preview_url = "zero://inline";
-const preview_frame = zero_native.geometry.RectF.init(520, 96, 320, 220);
+const preview_frame = native_sdk.geometry.RectF.init(520, 96, 320, 220);
 
 const html =
     \\<!doctype html>
@@ -115,7 +115,7 @@ const html =
     \\      if (window.zero && window.zero.commands && window.zero.commands.invoke) {
     \\        return window.zero.commands.invoke(name);
     \\      }
-    \\      return window.zero.invoke("zero-native.command.invoke", { name });
+    \\      return window.zero.invoke("native-sdk.command.invoke", { name });
     \\    };
     \\    document.querySelector("#refresh").addEventListener("click", async () => {
     \\      try { show(await invokeCommand("app.refresh")); } catch (error) { fail(error); }
@@ -131,16 +131,16 @@ const html =
     \\</html>
 ;
 
-const app_permissions = [_][]const u8{ zero_native.security.permission_command, zero_native.security.permission_view };
+const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view };
 const bridge_origins = [_][]const u8{ "zero://inline", "zero://app" };
-const command_permission = [_][]const u8{zero_native.security.permission_command};
-const view_permission = [_][]const u8{zero_native.security.permission_view};
-const builtin_policies = [_]zero_native.BridgeCommandPolicy{
-    .{ .name = "zero-native.command.invoke", .permissions = &command_permission, .origins = &bridge_origins },
-    .{ .name = "zero-native.command.list", .permissions = &command_permission, .origins = &bridge_origins },
-    .{ .name = "zero-native.view.list", .permissions = &view_permission, .origins = &bridge_origins },
+const command_permission = [_][]const u8{native_sdk.security.permission_command};
+const view_permission = [_][]const u8{native_sdk.security.permission_view};
+const builtin_policies = [_]native_sdk.BridgeCommandPolicy{
+    .{ .name = "native-sdk.command.invoke", .permissions = &command_permission, .origins = &bridge_origins },
+    .{ .name = "native-sdk.command.list", .permissions = &command_permission, .origins = &bridge_origins },
+    .{ .name = "native-sdk.view.list", .permissions = &view_permission, .origins = &bridge_origins },
 };
-const shell_views = [_]zero_native.ShellView{
+const shell_views = [_]native_sdk.ShellView{
     .{ .label = "toolbar", .kind = .toolbar, .edge = .top, .height = toolbar_height, .layer = 20, .role = "Toolbar" },
     .{ .label = "refresh-button", .kind = .button, .parent = "toolbar", .x = 12, .y = 10, .width = 88, .height = 30, .layer = 21, .accessibility_label = "Refresh workspace", .text = "Refresh", .command = "app.refresh" },
     .{ .label = "palette-button", .kind = .button, .parent = "toolbar", .x = 108, .y = 10, .width = 132, .height = 30, .layer = 21, .text = "Command" },
@@ -159,36 +159,36 @@ const shell_views = [_]zero_native.ShellView{
     .{ .label = "statusbar", .kind = .statusbar, .edge = .bottom, .height = statusbar_height, .layer = 20, .role = "Status" },
     .{ .label = "status-label", .kind = .label, .parent = "statusbar", .x = 16, .y = 11, .width = 520, .height = 18, .layer = 21, .text = "Ready. Press Cmd-R or use the WebView button." },
 };
-const shell_windows = [_]zero_native.ShellWindow{.{
+const shell_windows = [_]native_sdk.ShellWindow{.{
     .label = "main",
-    .title = "zero-native Native Shell",
+    .title = "Native SDK Native Shell",
     .width = window_width,
     .height = window_height,
     .views = &shell_views,
 }};
-const shell_scene: zero_native.ShellConfig = .{ .windows = &shell_windows };
+const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 
 const NativeShellApp = struct {
     refresh_count: u32 = 0,
-    last_command_source: zero_native.CommandSource = .runtime,
+    last_command_source: native_sdk.CommandSource = .runtime,
     preview_open: bool = false,
 
-    fn app(self: *@This()) zero_native.App {
+    fn app(self: *@This()) native_sdk.App {
         return .{
             .context = self,
             .name = "native-shell",
-            .source = zero_native.WebViewSource.html(html),
+            .source = native_sdk.WebViewSource.html(html),
             .scene_fn = scene,
             .event_fn = event,
         };
     }
 
-    fn scene(context: *anyopaque) anyerror!zero_native.ShellConfig {
+    fn scene(context: *anyopaque) anyerror!native_sdk.ShellConfig {
         _ = context;
         return shell_scene;
     }
 
-    fn event(context: *anyopaque, runtime: *zero_native.Runtime, event_value: zero_native.Event) anyerror!void {
+    fn event(context: *anyopaque, runtime: *native_sdk.Runtime, event_value: native_sdk.Event) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(context));
         switch (event_value) {
             .command => |command| {
@@ -200,11 +200,11 @@ const NativeShellApp = struct {
                     try self.closePreview(runtime);
                 }
             },
-            .shortcut, .files_dropped, .lifecycle => {},
+            .appearance_changed, .shortcut, .timer, .effects_wake, .audio, .files_dropped, .gpu_surface_frame, .gpu_surface_resized, .gpu_surface_input, .canvas_widget_pointer, .canvas_widget_keyboard, .canvas_widget_scroll, .canvas_widget_file_drop, .canvas_widget_drag, .canvas_widget_context_menu, .canvas_widget_context_menu_request, .canvas_widget_dismiss, .canvas_widget_context_press, .canvas_widget_resize, .canvas_widget_change, .window_closed, .automation_provenance, .lifecycle => {},
         }
     }
 
-    fn refresh(self: *@This(), runtime: *zero_native.Runtime, source: zero_native.CommandSource) anyerror!void {
+    fn refresh(self: *@This(), runtime: *native_sdk.Runtime, source: native_sdk.CommandSource) anyerror!void {
         self.refresh_count += 1;
         self.last_command_source = source;
         var status_buffer: [128]u8 = undefined;
@@ -212,7 +212,7 @@ const NativeShellApp = struct {
         try self.setStatus(runtime, status);
     }
 
-    fn openPreview(self: *@This(), runtime: *zero_native.Runtime) anyerror!void {
+    fn openPreview(self: *@This(), runtime: *native_sdk.Runtime) anyerror!void {
         if (!self.preview_open) {
             _ = try runtime.createView(.{
                 .window_id = 1,
@@ -227,7 +227,7 @@ const NativeShellApp = struct {
         try self.setStatus(runtime, "Preview WebView open.");
     }
 
-    fn closePreview(self: *@This(), runtime: *zero_native.Runtime) anyerror!void {
+    fn closePreview(self: *@This(), runtime: *native_sdk.Runtime) anyerror!void {
         if (self.preview_open) {
             try runtime.closeView(1, preview_label);
             self.preview_open = false;
@@ -235,7 +235,7 @@ const NativeShellApp = struct {
         try self.setStatus(runtime, "Preview WebView closed.");
     }
 
-    fn setStatus(self: *@This(), runtime: *zero_native.Runtime, status: []const u8) anyerror!void {
+    fn setStatus(self: *@This(), runtime: *native_sdk.Runtime, status: []const u8) anyerror!void {
         _ = self;
         _ = try runtime.updateView(1, "status-label", .{ .text = status });
     }
@@ -245,10 +245,9 @@ pub fn main(init: std.process.Init) !void {
     var app = NativeShellApp{};
     try runner.runWithOptions(app.app(), .{
         .app_name = "native-shell",
-        .window_title = "zero-native Native Shell",
-        .bundle_id = "dev.zero_native.native_shell",
-        .icon_path = "assets/icon.icns",
-        .default_frame = zero_native.geometry.RectF.init(0, 0, window_width, window_height),
+        .window_title = "Native SDK Native Shell",
+        .bundle_id = "dev.native_sdk.native_shell",
+        .default_frame = native_sdk.geometry.RectF.init(0, 0, window_width, window_height),
         .builtin_bridge = .{ .enabled = true, .commands = &builtin_policies },
         .js_window_api = true,
         .security = .{
@@ -259,12 +258,12 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "native shell starts with native chrome views" {
-    var harness: zero_native.TestHarness() = undefined;
-    harness.init(.{ .size = zero_native.geometry.SizeF.init(window_width, window_height) });
+    const harness = try native_sdk.TestHarness().create(std.testing.allocator, .{ .size = native_sdk.geometry.SizeF.init(window_width, window_height) });
+    defer harness.destroy(std.testing.allocator);
     var app = NativeShellApp{};
     try harness.start(app.app());
 
-    var views_buffer: [20]zero_native.ViewInfo = undefined;
+    var views_buffer: [20]native_sdk.ViewInfo = undefined;
     const views = harness.runtime.listViews(1, &views_buffer);
     try std.testing.expect(containsView(views, "toolbar", .toolbar));
     try std.testing.expect(containsView(views, "refresh-icon", .icon_button));
@@ -283,14 +282,14 @@ test "native shell starts with native chrome views" {
         .view_label = "refresh-button",
     } });
     try std.testing.expectEqual(@as(u32, 1), app.refresh_count);
-    try std.testing.expectEqual(zero_native.CommandSource.toolbar, app.last_command_source);
+    try std.testing.expectEqual(native_sdk.CommandSource.toolbar, app.last_command_source);
 
     try harness.runtime.dispatchPlatformEvent(app.app(), .{ .menu_command = .{
         .name = "app.refresh",
         .window_id = 1,
     } });
     try std.testing.expectEqual(@as(u32, 2), app.refresh_count);
-    try std.testing.expectEqual(zero_native.CommandSource.menu, app.last_command_source);
+    try std.testing.expectEqual(native_sdk.CommandSource.menu, app.last_command_source);
 
     try harness.runtime.dispatchPlatformEvent(app.app(), .{ .shortcut = .{
         .id = "app.refresh",
@@ -299,7 +298,7 @@ test "native shell starts with native chrome views" {
         .modifiers = .{ .primary = true },
     } });
     try std.testing.expectEqual(@as(u32, 3), app.refresh_count);
-    try std.testing.expectEqual(zero_native.CommandSource.shortcut, app.last_command_source);
+    try std.testing.expectEqual(native_sdk.CommandSource.shortcut, app.last_command_source);
 
     try harness.runtime.dispatchPlatformEvent(app.app(), .{ .menu_command = .{
         .name = "app.preview.open",
@@ -318,7 +317,7 @@ test "native shell starts with native chrome views" {
     try std.testing.expect(!containsView(closed_views, preview_label, .webview));
 }
 
-fn containsView(views: []const zero_native.ViewInfo, label: []const u8, kind: zero_native.ViewKind) bool {
+fn containsView(views: []const native_sdk.ViewInfo, label: []const u8, kind: native_sdk.ViewKind) bool {
     for (views) |view| {
         if (std.mem.eql(u8, view.label, label) and view.kind == kind) return true;
     }

@@ -1,12 +1,25 @@
 .DS_Store
 .zig-cache/
 zig-out/
+# CLI-generated build graph for zero-config apps (the examples here) — the
+# same entry `native init` writes into a new app's .gitignore.
+.native/
 
-# Native binaries in zero-native npm package (built by CI or locally)
-packages/zero-native/bin/zero-native-*
-packages/zero-native/src/
-packages/zero-native/skills/
-packages/zero-native/skill-data/
+# Native binaries in the @native-sdk/cli npm packages (built by CI or locally)
+packages/native-sdk/bin/native-sdk-*
+packages/native-sdk/npm/*/bin/
+# SDK payload mirrored into the npm package at pack time (copy-framework.js)
+packages/native-sdk/src/
+packages/native-sdk/skills/
+packages/native-sdk/skill-data/
+packages/native-sdk/build/
+packages/native-sdk/build.zig
+packages/native-sdk/build.zig.zon
+packages/native-sdk/app.zon
+packages/native-sdk/LICENSE
+# npm pack output
+packages/native-sdk/*.tgz
+packages/native-sdk/npm/*/*.tgz
 
 # Downloaded/prepared CEF runtimes are large local artifacts.
 third_party/cef/macos/
@@ -18,3 +31,4 @@ third_party/cef/linux/
 
 # TypeScript build info (generated)
 docs/tsconfig.tsbuildinfo
+.claude/

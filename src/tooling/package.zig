@@ -1,10 +1,22 @@
 const std = @import("std");
+const android_tool = @import("android.zig");
+const app_icon_tool = @import("app_icon");
 const assets_tool = @import("assets.zig");
 const cef = @import("cef.zig");
 const codesign = @import("codesign.zig");
 const diagnostics = @import("diagnostics");
+const ios_tool = @import("ios.zig");
 const manifest_tool = @import("manifest.zig");
 const web_engine_tool = @import("web_engine.zig");
+const xcodeproj_tool = @import("xcodeproj.zig");
+
+/// The SDK's default app icon (kept in sync by `zig build generate-icon`):
+/// what a bundle ships when app.zon configures no usable icon at all, so
+/// a fresh package is never a text placeholder pretending to be an icon.
+const default_icon_icns = @embedFile("default_icon.icns");
+/// The same default as a PNG source, for targets whose icons re-render
+/// from a square source (the iOS asset catalog).
+const default_icon_png = @embedFile("default_icon.png");
 
 pub const PackageTarget = enum {
     macos,
@@ -56,6 +68,12 @@ pub const PackageOptions = struct {
     cef_dir: []const u8 = web_engine_tool.default_cef_dir,
     signing: SigningConfig = .{},
     archive: bool = false,
+    /// The process environment, when the caller has one (the CLI). The
+    /// Android artifact probes it for the SDK/NDK toolchain to assemble
+    /// the debug APK; without it the generated project is still complete
+    /// and the assembly is skipped with a notice — which also keeps
+    /// package unit tests hermetic.
+    env_map: ?*std.process.Environ.Map = null,
 };
 
 pub const PackageStats = struct {
@@ -120,8 +138,8 @@ pub fn printDiagnostic(stats: PackageStats) void {
 
 pub fn createLocalPackage(io: std.Io, output_path: []const u8) !PackageStats {
     const metadata: manifest_tool.Metadata = .{
-        .id = "dev.zero_native.local",
-        .name = "zero-native-local",
+        .id = "dev.native_sdk.local",
+        .name = "native-sdk-local",
         .version = "0.1.0",
     };
     return createMacosApp(std.heap.page_allocator, io, .{
@@ -153,8 +171,8 @@ pub fn createMacosApp(allocator: std.mem.Allocator, io: std.Io, options: Package
     defer allocator.free(info_plist);
     try writeFile(package_dir, io, "Contents/Info.plist", info_plist);
     try writeFile(package_dir, io, "Contents/PkgInfo", "APPL????");
-    try writeFile(package_dir, io, "Contents/Resources/README.txt", "Unsigned local zero-native macOS app bundle.\n");
-    const assets_output = try assetOutputPath(allocator, options.output_path, "Contents/Resources", options);
+    try writeFile(package_dir, io, "Contents/Resources/README.txt", "Unsigned local Native SDK macOS app bundle.\n");
+    const assets_output = try macosAssetOutputPath(allocator, options);
     defer allocator.free(assets_output);
     const bundle_stats = try assets_tool.bundle(allocator, io, options.assets_dir, assets_output);
     try copyMacosIcon(allocator, io, package_dir, options);
@@ -174,42 +192,6 @@ pub fn createMacosApp(allocator: std.mem.Allocator, io: std.Io, options: Package
         .asset_count = bundle_stats.asset_count,
         .web_engine = options.web_engine,
     };
-}
-
-pub fn createIosSkeleton(io: std.Io, output_path: []const u8) !PackageStats {
-    var cwd = std.Io.Dir.cwd();
-    try cwd.createDirPath(io, output_path);
-    var dir = try cwd.openDir(io, output_path, .{});
-    defer dir.close(io);
-    try dir.createDirPath(io, "Libraries");
-    try dir.createDirPath(io, "zero-nativeHost");
-    try writeFile(dir, io, "README.md", iosReadme());
-    try writeFile(dir, io, "Info.plist", iosInfoPlist());
-    try writeFile(dir, io, "zero-nativeHost/ZeroNativeShellConfig.swift", iosDefaultShellConfig());
-    try writeFile(dir, io, "zero-nativeHost/ZeroNativeHostViewController.swift", iosViewController());
-    try writeFile(dir, io, "zero-nativeHost/zero_native.h", embedHeader());
-    return .{ .path = output_path, .target = .ios };
-}
-
-pub fn createAndroidSkeleton(io: std.Io, output_path: []const u8) !PackageStats {
-    var cwd = std.Io.Dir.cwd();
-    try cwd.createDirPath(io, output_path);
-    var dir = try cwd.openDir(io, output_path, .{});
-    defer dir.close(io);
-    try dir.createDirPath(io, "app/src/main/java/dev/zero_native");
-    try dir.createDirPath(io, "app/src/main/cpp/lib");
-    try dir.createDirPath(io, "app/src/main/res/values");
-    try writeFile(dir, io, "README.md", androidReadme());
-    try writeFile(dir, io, "settings.gradle", "pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }\ndependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }\nrootProject.name = 'zero-nativeHost'\ninclude ':app'\n");
-    try writeFile(dir, io, "app/build.gradle", androidBuildGradle());
-    try writeFile(dir, io, "app/src/main/AndroidManifest.xml", androidManifest());
-    try writeFile(dir, io, "app/src/main/java/dev/zero_native/ZeroNativeShellConfig.kt", androidDefaultShellConfig());
-    try writeFile(dir, io, "app/src/main/java/dev/zero_native/MainActivity.kt", androidActivity());
-    try writeFile(dir, io, "app/src/main/cpp/CMakeLists.txt", androidCMakeLists());
-    try writeFile(dir, io, "app/src/main/cpp/zero_native_jni.c", androidJni());
-    try writeFile(dir, io, "app/src/main/cpp/zero_native.h", embedHeader());
-    try writeFile(dir, io, "app/src/main/res/values/styles.xml", androidStyles());
-    return .{ .path = output_path, .target = .android };
 }
 
 fn createDesktopArtifact(allocator: std.mem.Allocator, io: std.Io, options: PackageOptions) !PackageStats {
@@ -254,14 +236,15 @@ fn createDesktopArtifact(allocator: std.mem.Allocator, io: std.Io, options: Pack
             defer allocator.free(mime_path);
             try writeFile(dir, io, mime_path, mime_info);
         }
-        if (options.metadata.icons.len > 0) {
-            copyFileToDir(allocator, io, dir, options.metadata.icons[0], "share/icons/app-icon.png") catch {};
+        try writeLinuxIcons(allocator, io, dir, options.metadata);
+    } else if (options.target == .windows) {
+        try writeWindowsIcon(allocator, io, dir, options.metadata);
+        if (hasRegistrationMetadata(options.metadata)) {
+            try dir.createDirPath(io, "install");
+            const registry_script = try windowsRegistrationScript(allocator, options.metadata, executable_name);
+            defer allocator.free(registry_script);
+            try writeFile(dir, io, "install/register-file-types.ps1", registry_script);
         }
-    } else if (options.target == .windows and hasRegistrationMetadata(options.metadata)) {
-        try dir.createDirPath(io, "install");
-        const registry_script = try windowsRegistrationScript(allocator, options.metadata, executable_name);
-        defer allocator.free(registry_script);
-        try writeFile(dir, io, "install/register-file-types.ps1", registry_script);
     }
     if (options.web_engine == .chromium) {
         const cef_platform = cefPlatformForTarget(options.target) orelse return error.UnsupportedWebEngine;
@@ -272,47 +255,222 @@ fn createDesktopArtifact(allocator: std.mem.Allocator, io: std.Io, options: Pack
     return .{ .path = options.output_path, .artifact_name = std.fs.path.basename(options.output_path), .target = options.target, .asset_count = bundle_stats.asset_count, .web_engine = options.web_engine };
 }
 
+/// The iOS host tier: a COMPLETE Xcode project the user never edits —
+/// the toolkit-owned UIKit host sources, the generated Info.plist and
+/// asset catalog, the bundled app assets, and the embed static library,
+/// tied together by a deterministic project file (xcodeproj.zig) so
+/// `xcodebuild archive` works with zero edits. Everything app-specific
+/// comes from app.zon. Code signing stays manual, like macOS
+/// notarization.
 fn createIosArtifact(allocator: std.mem.Allocator, io: std.Io, options: PackageOptions) !PackageStats {
-    _ = try createIosSkeleton(io, options.output_path);
-    var dir = try std.Io.Dir.cwd().openDir(io, options.output_path, .{});
+    var cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, options.output_path);
+    var dir = try cwd.openDir(io, options.output_path, .{});
     defer dir.close(io);
-    try dir.createDirPath(io, "Libraries");
-    const info_plist = try iosInfoPlistForMetadata(allocator, options.metadata);
+
+    // iOS bundle identifiers allow only alphanumerics, hyphens, and
+    // periods; underscores in app.zon ids normalize to hyphens (the
+    // mirror of the Android hyphen-to-underscore mapping).
+    const bundle_id = try ios_tool.bundleIdAlloc(allocator, options.metadata.id);
+    defer allocator.free(bundle_id);
+    const project = xcodeproj_tool.ProjectModel{
+        .name = options.metadata.name,
+        .bundle_id = bundle_id,
+        .version = options.metadata.version,
+    };
+
+    // The project file and its shared scheme (headless xcodebuild needs
+    // an on-disk scheme; Xcode only auto-creates them interactively).
+    const project_dir = try std.fmt.allocPrint(allocator, "{s}.xcodeproj", .{options.metadata.name});
+    defer allocator.free(project_dir);
+    const schemes_dir = try std.fmt.allocPrint(allocator, "{s}/xcshareddata/xcschemes", .{project_dir});
+    defer allocator.free(schemes_dir);
+    try dir.createDirPath(io, schemes_dir);
+    const pbxproj = try xcodeproj_tool.pbxprojAlloc(allocator, project);
+    defer allocator.free(pbxproj);
+    const pbxproj_path = try std.fmt.allocPrint(allocator, "{s}/project.pbxproj", .{project_dir});
+    defer allocator.free(pbxproj_path);
+    try writeFile(dir, io, pbxproj_path, pbxproj);
+    const scheme = try xcodeproj_tool.schemeAlloc(allocator, project);
+    defer allocator.free(scheme);
+    const scheme_path = try std.fmt.allocPrint(allocator, "{s}/{s}.xcscheme", .{ schemes_dir, options.metadata.name });
+    defer allocator.free(scheme_path);
+    try writeFile(dir, io, scheme_path, scheme);
+
+    // The toolkit host sources and the app.zon-derived Info.plist.
+    try dir.createDirPath(io, "Host");
+    try writeFile(dir, io, "Host/" ++ ios_tool.host_source_name, ios_tool.host_source);
+    try writeFile(dir, io, "Host/" ++ ios_tool.host_header_name, ios_tool.host_header);
+    const info_plist = try ios_tool.infoPlistAlloc(allocator, options.metadata);
     defer allocator.free(info_plist);
-    try writeFile(dir, io, "Info.plist", info_plist);
-    const shell_model = mobileShellModel(options.metadata);
-    const shell_config = try iosShellConfigAlloc(allocator, shell_model);
-    defer allocator.free(shell_config);
-    try writeFile(dir, io, "zero-nativeHost/ZeroNativeShellConfig.swift", shell_config);
-    const assets_output = try assetOutputPath(allocator, options.output_path, "Resources", options);
+    try writeFile(dir, io, "Host/Info.plist", info_plist);
+
+    // App icon (single-source pipeline) and bundled assets. The bundled
+    // folder is named "Assets", NOT "Resources": a bundle-root directory
+    // named Resources makes CFBundle read the .app as a deep
+    // (macOS-layout) bundle, and xcodebuild's archive stamping then fails
+    // to find the Info.plist ("Archive Missing Bundle Identifier").
+    try writeIosIcon(allocator, io, dir, options.metadata);
+    const assets_output = try assetOutputPath(allocator, options.output_path, "Assets", options);
     defer allocator.free(assets_output);
     const bundle_stats = try assets_tool.bundle(allocator, io, options.assets_dir, assets_output);
-    if (options.binary_path) |binary_path| try copyFileToDir(allocator, io, dir, binary_path, "Libraries/libzero-native.a");
-    try writeReport(allocator, dir, io, "package-manifest.zon", options, "libzero-native.a", bundle_stats.asset_count);
+
+    // The app's embed static library (device arm64 slice — built by the
+    // CLI before packaging, or passed via --binary).
+    try dir.createDirPath(io, "Libraries");
+    if (options.binary_path) |binary_path| try copyFileToDir(allocator, io, dir, binary_path, "Libraries/libnative-sdk.a");
+
+    const readme = try iosProjectReadme(allocator, options.metadata);
+    defer allocator.free(readme);
+    try writeFile(dir, io, "README.md", readme);
+    try writeReport(allocator, dir, io, "package-manifest.zon", options, "libnative-sdk.a", bundle_stats.asset_count);
     return .{ .path = options.output_path, .artifact_name = std.fs.path.basename(options.output_path), .target = .ios, .asset_count = bundle_stats.asset_count, .web_engine = options.web_engine };
 }
 
+fn iosProjectReadme(allocator: std.mem.Allocator, metadata: manifest_tool.Metadata) ![]const u8 {
+    return std.fmt.allocPrint(allocator,
+        \\# {s} — iOS host project
+        \\
+        \\Generated by `native package --target ios`. Everything here is toolkit-owned output derived from app.zon — regenerate instead of editing.
+        \\
+        \\- `{s}.xcodeproj` — deterministic project with a shared scheme; `xcodebuild -scheme {s} archive` works with zero edits (for an unsigned verification pass add `CODE_SIGNING_ALLOWED=NO`).
+        \\- `Host/` — the toolkit UIKit host (canvas presentation, touch/keyboard/IME, safe areas) and the generated Info.plist.
+        \\- `Libraries/libnative-sdk.a` — the app compiled as the embed static library (device arm64 slice). The simulator loop is `native dev --target ios`, which rebuilds the library for the simulator.
+        \\- `Assets.xcassets`, `Assets/` — the app icon rendered from the single-source icon pipeline, and the bundled app assets.
+        \\
+        \\Code signing stays manual, like macOS notarization: open the project once in Xcode to pick a team, or pass `DEVELOPMENT_TEAM=<id> CODE_SIGN_IDENTITY="Apple Development"` to xcodebuild.
+        \\
+    , .{ metadata.displayName(), metadata.name, metadata.name });
+}
+
+/// The Android host tier: a COMPLETE generated host project the user
+/// never edits — the toolkit-owned host sources, the app.zon-derived
+/// AndroidManifest.xml, launcher icons, the bundled app assets, and the
+/// embed static library — plus the assembled debug APK when the Android
+/// SDK/NDK toolchain is present. The APK assembles directly with the
+/// SDK's build tools (aapt2/javac/d8/zipalign/apksigner; see
+/// android.zig for the rationale). Store signing keys stay manual, like
+/// macOS notarization.
 fn createAndroidArtifact(allocator: std.mem.Allocator, io: std.Io, options: PackageOptions) !PackageStats {
-    _ = try createAndroidSkeleton(io, options.output_path);
-    var dir = try std.Io.Dir.cwd().openDir(io, options.output_path, .{});
+    var cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, options.output_path);
+    var dir = try cwd.openDir(io, options.output_path, .{});
     defer dir.close(io);
-    try dir.createDirPath(io, "app/src/main/cpp/lib");
-    const build_gradle = try androidBuildGradleForMetadata(allocator, options.metadata);
-    defer allocator.free(build_gradle);
-    try writeFile(dir, io, "app/build.gradle", build_gradle);
-    const manifest = try androidManifestForMetadata(allocator, options.metadata);
+
+    // The toolkit host sources and the app.zon-derived manifest.
+    try dir.createDirPath(io, "Host");
+    try writeFile(dir, io, "Host/" ++ android_tool.host_activity_name, android_tool.host_activity_source);
+    try writeFile(dir, io, "Host/" ++ android_tool.host_bridge_name, android_tool.host_bridge_source);
+    try writeFile(dir, io, "Host/" ++ android_tool.host_header_name, android_tool.host_header);
+    const manifest = try android_tool.manifestAlloc(allocator, options.metadata, true);
     defer allocator.free(manifest);
-    try writeFile(dir, io, "app/src/main/AndroidManifest.xml", manifest);
-    const shell_model = mobileShellModel(options.metadata);
-    const shell_config = try androidShellConfigAlloc(allocator, shell_model);
-    defer allocator.free(shell_config);
-    try writeFile(dir, io, "app/src/main/java/dev/zero_native/ZeroNativeShellConfig.kt", shell_config);
-    const assets_output = try assetOutputPath(allocator, options.output_path, "app/src/main/assets/zero-native", options);
+    try writeFile(dir, io, "AndroidManifest.xml", manifest);
+
+    // Launcher icons (single-source pipeline, default fallback so the
+    // manifest's @mipmap reference always resolves) and bundled assets
+    // in the layout the host mirrors onto the device at first launch.
+    try writeAndroidIcons(allocator, io, dir, options.metadata);
+    const res_path = try std.fs.path.join(allocator, &.{ options.output_path, "res" });
+    defer allocator.free(res_path);
+    try android_tool.writeHostResources(io, res_path);
+    const assets_output = try assetOutputPath(allocator, options.output_path, "assets/native-sdk", options);
     defer allocator.free(assets_output);
     const bundle_stats = try assets_tool.bundle(allocator, io, options.assets_dir, assets_output);
-    if (options.binary_path) |binary_path| try copyFileToDir(allocator, io, dir, binary_path, "app/src/main/cpp/lib/libzero-native.a");
-    try writeReport(allocator, dir, io, "package-manifest.zon", options, "libzero-native.a", bundle_stats.asset_count);
-    return .{ .path = options.output_path, .artifact_name = std.fs.path.basename(options.output_path), .target = .android, .asset_count = bundle_stats.asset_count, .web_engine = options.web_engine };
+
+    // The app's embed static library (aarch64-linux-android — built by
+    // the CLI before packaging, or passed via --binary).
+    try dir.createDirPath(io, "Libraries");
+    if (options.binary_path) |binary_path| try copyFileToDir(allocator, io, dir, binary_path, "Libraries/libnative-sdk.a");
+
+    const readme = try androidProjectReadme(allocator, options.metadata);
+    defer allocator.free(readme);
+    try writeFile(dir, io, "README.md", readme);
+    try writeReport(allocator, dir, io, "package-manifest.zon", options, "libnative-sdk.a", bundle_stats.asset_count);
+
+    var artifact_name: []const u8 = std.fs.path.basename(options.output_path);
+    if (try assembleAndroidApk(allocator, io, options)) |apk_name| {
+        artifact_name = apk_name;
+    }
+    return .{ .path = options.output_path, .artifact_name = artifact_name, .target = .android, .asset_count = bundle_stats.asset_count, .web_engine = options.web_engine };
+}
+
+/// Assemble the debug APK inside the generated project when the caller
+/// supplied an environment to probe and the Android toolchain + a JDK
+/// are installed. Returns the APK file name, or null when assembly was
+/// skipped (with the reason printed — never silently).
+fn assembleAndroidApk(allocator: std.mem.Allocator, io: std.Io, options: PackageOptions) !?[]const u8 {
+    const env_map = options.env_map orelse {
+        std.debug.print("native (android): project emitted without the debug APK (no environment to locate the Android toolchain in this context)\n", .{});
+        return null;
+    };
+    const binary_path = options.binary_path orelse {
+        std.debug.print("native (android): project emitted without the debug APK (no embed library was built or passed via --binary)\n", .{});
+        return null;
+    };
+    const tc = (try android_tool.findToolchain(allocator, io, env_map)) orelse return null;
+    defer tc.deinit(allocator);
+    const java = (try android_tool.resolveJavaAlloc(allocator, io, env_map)) orelse {
+        std.debug.print("native (android): project emitted without the debug APK (no JDK found - set JAVA_HOME)\n", .{});
+        return null;
+    };
+    defer allocator.free(java);
+
+    const host_dir = try std.fs.path.join(allocator, &.{ options.output_path, "Host" });
+    defer allocator.free(host_dir);
+    const work_dir = try std.fs.path.join(allocator, &.{ options.output_path, "build" });
+    defer allocator.free(work_dir);
+    const so_path = try std.fs.path.join(allocator, &.{ options.output_path, "build-libnative_sdk_host.so" });
+    defer allocator.free(so_path);
+    const manifest_path = try std.fs.path.join(allocator, &.{ options.output_path, "AndroidManifest.xml" });
+    defer allocator.free(manifest_path);
+    const res_dir = try std.fs.path.join(allocator, &.{ options.output_path, "res" });
+    defer allocator.free(res_dir);
+    const assets_dir = try std.fs.path.join(allocator, &.{ options.output_path, "assets", "native-sdk" });
+    defer allocator.free(assets_dir);
+    const apk_name = try std.fmt.allocPrint(allocator, "{s}-debug.apk", .{options.metadata.name});
+    errdefer allocator.free(apk_name);
+    const out_apk = try std.fs.path.join(allocator, &.{ options.output_path, apk_name });
+    defer allocator.free(out_apk);
+    const keystore_path = try android_tool.debugKeystorePathAlloc(allocator, env_map);
+    defer allocator.free(keystore_path);
+
+    std.debug.print("native (android): compiling the toolkit host library ({s})\n", .{android_tool.clang_target});
+    try android_tool.compileHostLibrary(allocator, io, &tc, host_dir, binary_path, so_path);
+    std.debug.print("native (android): assembling {s}\n", .{out_apk});
+    try android_tool.assembleApk(allocator, io, .{
+        .toolchain = &tc,
+        .java = java,
+        .work_dir = work_dir,
+        .manifest_path = manifest_path,
+        .host_dir = host_dir,
+        .so_path = so_path,
+        .res_dir = res_dir,
+        .assets_dir = assets_dir,
+        .keystore_path = keystore_path,
+        .out_apk = out_apk,
+    });
+    // The intermediates served their purpose; the .so is preserved in
+    // the APK itself.
+    std.Io.Dir.cwd().deleteTree(io, work_dir) catch {};
+    std.Io.Dir.cwd().deleteFile(io, so_path) catch {};
+    return apk_name;
+}
+
+fn androidProjectReadme(allocator: std.mem.Allocator, metadata: manifest_tool.Metadata) ![]const u8 {
+    return std.fmt.allocPrint(allocator,
+        \\# {s} — Android host project
+        \\
+        \\Generated by `native package --target android`. Everything here is toolkit-owned output derived from app.zon — regenerate instead of editing.
+        \\
+        \\- `{s}-debug.apk` — the debug-signed APK, assembled directly with the Android SDK build tools (aapt2, javac, d8, zipalign, apksigner) and the NDK compiler when they are installed; rerun `native package --target android` after installing them if it is missing.
+        \\- `Host/` — the toolkit Android host: the activity (canvas presentation, touch/keyboard/IME, safe areas, Paint text measurement) and the JNI bridge over the embed C ABI.
+        \\- `AndroidManifest.xml`, `res/` — the app.zon-derived manifest and the launcher icons rendered from the single-source icon pipeline.
+        \\- `assets/native-sdk/` — the bundled app assets, mirrored into the app's files directory at first launch.
+        \\- `Libraries/libnative-sdk.a` — the app compiled as the embed static library (aarch64-linux-android). The device loop is `native dev --target android`, which rebuilds the library in Debug.
+        \\
+        \\The APK is debug-signed with the per-user toolkit keystore (~/.native/android/debug.keystore) for installs via `adb install`. Store distribution (Play upload keys, app bundles) stays a manual step, like macOS notarization.
+        \\
+    , .{ metadata.displayName(), metadata.name });
 }
 
 fn writeFile(dir: std.Io.Dir, io: std.Io, path: []const u8, bytes: []const u8) !void {
@@ -326,12 +484,43 @@ fn assetOutputPath(allocator: std.mem.Allocator, output_path: []const u8, resour
     return std.fs.path.join(allocator, &.{ output_path, resources_subpath });
 }
 
+/// Where the macOS bundle carries the app's assets. Frontend apps keep
+/// the established Resources/<dist> layout their webview asset root
+/// resolves against. Everything else mirrors the asset directory at its
+/// app-relative path — Resources/assets by default — so a relative asset
+/// path the app uses at runtime ("assets/music/track.mp3") names the
+/// same file inside the bundle that it names in a dev run: the packaged
+/// macOS host resolves relative asset paths against Resources. An
+/// absolute or parent-escaping --assets directory has no app-relative
+/// meaning a packaged process could resolve, so it keeps the flat
+/// Resources layout.
+fn macosAssetOutputPath(allocator: std.mem.Allocator, options: PackageOptions) ![]const u8 {
+    if (options.frontend != null) return assetOutputPath(allocator, options.output_path, "Contents/Resources", options);
+    if (appRelativeAssetSubpath(options.assets_dir)) |subpath| {
+        return std.fs.path.join(allocator, &.{ options.output_path, "Contents/Resources", subpath });
+    }
+    return std.fs.path.join(allocator, &.{ options.output_path, "Contents/Resources" });
+}
+
+/// The asset directory as an app-relative bundle subpath, or null when
+/// it cannot honestly be one (empty, ".", absolute, or escaping the app
+/// root through a ".." segment).
+fn appRelativeAssetSubpath(assets_dir: []const u8) ?[]const u8 {
+    if (assets_dir.len == 0 or std.fs.path.isAbsolute(assets_dir)) return null;
+    var segments = std.mem.tokenizeAny(u8, assets_dir, "/\\");
+    var has_component = false;
+    while (segments.next()) |segment| {
+        if (std.mem.eql(u8, segment, "..")) return null;
+        if (!std.mem.eql(u8, segment, ".")) has_component = true;
+    }
+    if (!has_component) return null;
+    return assets_dir;
+}
+
 fn macosInfoPlist(allocator: std.mem.Allocator, metadata: manifest_tool.Metadata, executable_name: []const u8) ![]const u8 {
     const icon_name = macosIconFile(metadata);
     const bundle_id = try xmlEscapeAlloc(allocator, metadata.id);
     defer allocator.free(bundle_id);
-    const name = try xmlEscapeAlloc(allocator, metadata.name);
-    defer allocator.free(name);
     const display_name = try xmlEscapeAlloc(allocator, metadata.displayName());
     defer allocator.free(display_name);
     const executable = try xmlEscapeAlloc(allocator, executable_name);
@@ -344,6 +533,19 @@ fn macosInfoPlist(allocator: std.mem.Allocator, metadata: manifest_tool.Metadata
     defer allocator.free(document_types);
     const url_types = try macosUrlTypes(allocator, metadata);
     defer allocator.free(url_types);
+    // The About panel's bottom line in packaged bundles: the manifest
+    // description rides NSHumanReadableCopyright, the plist key the
+    // standard About panel renders as its footer text — the same line
+    // dev runs pass to the panel directly.
+    const about_line = try macosAboutLine(allocator, metadata);
+    defer allocator.free(about_line);
+    // CFBundleName is the SHORT user-visible name — the application
+    // menu's title next to the Apple menu reads it — while
+    // CFBundleDisplayName serves the Finder and longer surfaces. Both
+    // carry the manifest display name so every user-facing surface
+    // (menu bar, Dock, Gatekeeper prompts) agrees; the manifest `.name`
+    // stays the executable's name, exactly like dev runs, whose host
+    // titles the application menu with the display name too.
     return std.fmt.allocPrint(allocator,
         \\<?xml version="1.0" encoding="UTF-8"?>
         \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -367,822 +569,20 @@ fn macosInfoPlist(allocator: std.mem.Allocator, metadata: manifest_tool.Metadata
         \\  <string>{s}</string>
         \\  <key>CFBundleVersion</key>
         \\  <string>{s}</string>
-        \\{s}{s}
+        \\{s}{s}{s}
         \\</dict>
         \\</plist>
         \\
-    , .{ bundle_id, name, display_name, executable, icon, version, version, document_types, url_types });
+    , .{ bundle_id, display_name, display_name, executable, icon, version, version, about_line, document_types, url_types });
 }
 
-fn embedHeader() []const u8 {
-    return
-    \\#pragma once
-    \\#include <stdint.h>
-    \\#include <stddef.h>
-    \\void *zero_native_app_create(void);
-    \\void zero_native_app_destroy(void *app);
-    \\void zero_native_app_start(void *app);
-    \\void zero_native_app_activate(void *app);
-    \\void zero_native_app_deactivate(void *app);
-    \\void zero_native_app_stop(void *app);
-    \\void zero_native_app_resize(void *app, float width, float height, float scale, void *surface);
-    \\void zero_native_app_touch(void *app, uint64_t id, int phase, float x, float y, float pressure);
-    \\void zero_native_app_command(void *app, const char *name, uintptr_t len);
-    \\void zero_native_app_frame(void *app);
-    \\void zero_native_app_set_asset_root(void *app, const char *path, uintptr_t len);
-    \\void zero_native_app_set_asset_entry(void *app, const char *path, uintptr_t len);
-    \\uintptr_t zero_native_app_last_command_count(void *app);
-    \\const char *zero_native_app_last_command_name(void *app);
-    \\const char *zero_native_app_last_error_name(void *app);
-    \\
-    ;
-}
-
-fn iosReadme() []const u8 {
-    return "iOS zero-native host skeleton. Link Libraries/libzero-native.a and call the functions in zero-nativeHost/zero_native.h from the native UIKit shell.\n";
-}
-
-fn iosInfoPlist() []const u8 {
-    return
-    \\<?xml version="1.0" encoding="UTF-8"?>
-    \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-    \\<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>dev.zero_native.ios</string><key>CFBundleName</key><string>zero-nativeHost</string></dict></plist>
-    \\
-    ;
-}
-
-fn iosInfoPlistForMetadata(allocator: std.mem.Allocator, metadata: manifest_tool.Metadata) ![]const u8 {
-    const bundle_id = try xmlEscapeAlloc(allocator, metadata.id);
-    defer allocator.free(bundle_id);
-    const name = try xmlEscapeAlloc(allocator, metadata.name);
-    defer allocator.free(name);
-    const display_name = try xmlEscapeAlloc(allocator, metadata.displayName());
-    defer allocator.free(display_name);
-    const version = try xmlEscapeAlloc(allocator, metadata.version);
-    defer allocator.free(version);
-    return std.fmt.allocPrint(allocator,
-        \\<?xml version="1.0" encoding="UTF-8"?>
-        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        \\<plist version="1.0">
-        \\<dict>
-        \\  <key>CFBundleIdentifier</key>
-        \\  <string>{s}</string>
-        \\  <key>CFBundleName</key>
-        \\  <string>{s}</string>
-        \\  <key>CFBundleDisplayName</key>
-        \\  <string>{s}</string>
-        \\  <key>CFBundleShortVersionString</key>
-        \\  <string>{s}</string>
-        \\  <key>CFBundleVersion</key>
-        \\  <string>{s}</string>
-        \\</dict>
-        \\</plist>
-        \\
-    , .{ bundle_id, name, display_name, version, version });
-}
-
-const MobileShellModel = struct {
-    title: []const u8,
-    status: []const u8,
-    primary_button_title: []const u8,
-    primary_command: []const u8,
-    secondary_button_title: []const u8,
-    secondary_command: []const u8,
-    asset_root_subdirectory: []const u8,
-    asset_entry_path: []const u8,
-};
-
-fn defaultMobileShellModel() MobileShellModel {
-    return .{
-        .title = "zero-native",
-        .status = "Native commands ready",
-        .primary_button_title = "Back",
-        .primary_command = "mobile.back",
-        .secondary_button_title = "Refresh",
-        .secondary_command = "mobile.refresh",
-        .asset_root_subdirectory = "",
-        .asset_entry_path = "index.html",
-    };
-}
-
-fn mobileShellModel(metadata: manifest_tool.Metadata) MobileShellModel {
-    var model = defaultMobileShellModel();
-    model.title = metadata.displayName();
-    if (metadata.frontend) |frontend| {
-        model.asset_root_subdirectory = frontend.dist;
-        model.asset_entry_path = frontend.entry;
-    }
-    if (metadata.shell.windows.len == 0) return model;
-
-    for (metadata.shell.windows[0].views) |view| {
-        if (view.text) |text| {
-            if (std.mem.eql(u8, view.label, "mobile-title")) {
-                model.title = text;
-            } else if (std.mem.eql(u8, view.label, "mobile-status") or std.mem.eql(u8, view.kind, "statusbar")) {
-                model.status = text;
-            }
-        }
-        if (view.command) |command| {
-            const title = view.text orelse command;
-            if (std.mem.eql(u8, view.label, "mobile-back") or std.mem.indexOf(u8, command, "back") != null) {
-                model.primary_button_title = title;
-                model.primary_command = command;
-            } else if (std.mem.eql(u8, view.label, "mobile-refresh") or std.mem.indexOf(u8, command, "refresh") != null) {
-                model.secondary_button_title = title;
-                model.secondary_command = command;
-            }
-        }
-    }
-    return model;
-}
-
-const SourceStringTarget = enum {
-    swift,
-    kotlin,
-};
-
-fn sourceStringLiteralAlloc(allocator: std.mem.Allocator, value: []const u8, target: SourceStringTarget) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.append(allocator, '"');
-    for (value) |ch| {
-        switch (ch) {
-            '"' => try out.appendSlice(allocator, "\\\""),
-            '\\' => try out.appendSlice(allocator, "\\\\"),
-            '\n' => try out.appendSlice(allocator, "\\n"),
-            '\r' => try out.appendSlice(allocator, "\\r"),
-            '\t' => try out.appendSlice(allocator, "\\t"),
-            '$' => if (target == .kotlin) try out.appendSlice(allocator, "\\$") else try out.append(allocator, ch),
-            else => try out.append(allocator, ch),
-        }
-    }
-    try out.append(allocator, '"');
-    return out.toOwnedSlice(allocator);
-}
-
-fn iosDefaultShellConfig() []const u8 {
-    return
-    \\enum ZeroNativeShellConfig {
-    \\    static let title = "zero-native"
-    \\    static let status = "Native commands ready"
-    \\    static let primaryButtonTitle = "Back"
-    \\    static let primaryCommand = "mobile.back"
-    \\    static let secondaryButtonTitle = "Refresh"
-    \\    static let secondaryCommand = "mobile.refresh"
-    \\    static let assetRootSubdirectory = ""
-    \\    static let assetEntryPath = "index.html"
-    \\}
-    \\
-    ;
-}
-
-fn iosShellConfigAlloc(allocator: std.mem.Allocator, model: MobileShellModel) ![]const u8 {
-    const title = try sourceStringLiteralAlloc(allocator, model.title, .swift);
-    defer allocator.free(title);
-    const status = try sourceStringLiteralAlloc(allocator, model.status, .swift);
-    defer allocator.free(status);
-    const primary_title = try sourceStringLiteralAlloc(allocator, model.primary_button_title, .swift);
-    defer allocator.free(primary_title);
-    const primary_command = try sourceStringLiteralAlloc(allocator, model.primary_command, .swift);
-    defer allocator.free(primary_command);
-    const secondary_title = try sourceStringLiteralAlloc(allocator, model.secondary_button_title, .swift);
-    defer allocator.free(secondary_title);
-    const secondary_command = try sourceStringLiteralAlloc(allocator, model.secondary_command, .swift);
-    defer allocator.free(secondary_command);
-    const asset_root = try sourceStringLiteralAlloc(allocator, model.asset_root_subdirectory, .swift);
-    defer allocator.free(asset_root);
-    const asset_entry = try sourceStringLiteralAlloc(allocator, model.asset_entry_path, .swift);
-    defer allocator.free(asset_entry);
-
-    return std.fmt.allocPrint(allocator,
-        \\enum ZeroNativeShellConfig {{
-        \\    static let title = {s}
-        \\    static let status = {s}
-        \\    static let primaryButtonTitle = {s}
-        \\    static let primaryCommand = {s}
-        \\    static let secondaryButtonTitle = {s}
-        \\    static let secondaryCommand = {s}
-        \\    static let assetRootSubdirectory = {s}
-        \\    static let assetEntryPath = {s}
-        \\}}
-        \\
-    , .{ title, status, primary_title, primary_command, secondary_title, secondary_command, asset_root, asset_entry });
-}
-
-fn iosViewController() []const u8 {
-    return
-    \\import UIKit
-    \\import WebKit
-    \\
-    \\final class ZeroNativeHostViewController: UIViewController {
-    \\    private let headerView = UIView()
-    \\    private let titleLabel = UILabel()
-    \\    private let statusLabel = UILabel()
-    \\    private let backButton = UIButton(type: .system)
-    \\    private let refreshButton = UIButton(type: .system)
-    \\    private let webView = WKWebView(frame: .zero)
-    \\    private var webViewBottomConstraint: NSLayoutConstraint?
-    \\    private var nativeApp: UnsafeMutableRawPointer?
-    \\
-    \\    override func viewDidLoad() {
-    \\        super.viewDidLoad()
-    \\        view.backgroundColor = .systemBackground
-    \\        configureHeader()
-    \\
-    \\        headerView.translatesAutoresizingMaskIntoConstraints = false
-    \\        webView.translatesAutoresizingMaskIntoConstraints = false
-    \\        view.addSubview(headerView)
-    \\        view.addSubview(webView)
-    \\        let bottom = webView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
-    \\        webViewBottomConstraint = bottom
-    \\        NSLayoutConstraint.activate([
-    \\            headerView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-    \\            headerView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-    \\            headerView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-    \\            headerView.heightAnchor.constraint(equalToConstant: 92),
-    \\            webView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-    \\            webView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-    \\            webView.topAnchor.constraint(equalTo: headerView.bottomAnchor),
-    \\            bottom,
-    \\        ])
-    \\        NotificationCenter.default.addObserver(self, selector: #selector(keyboardFrameWillChange), name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
-    \\        NotificationCenter.default.addObserver(self, selector: #selector(keyboardWillHide), name: UIResponder.keyboardWillHideNotification, object: nil)
-    \\
-    \\        nativeApp = zero_native_app_create()
-    \\        if let nativeApp {
-    \\            configureNativeAssetRoot(nativeApp)
-    \\            zero_native_app_start(nativeApp)
-    \\        }
-    \\        loadWorkspace()
-    \\    }
-    \\
-    \\    private func packagedAssetRootURL() -> URL? {
-    \\        guard let resourceURL = Bundle.main.resourceURL else { return nil }
-    \\        let resourcesURL = resourceURL.appendingPathComponent("Resources", isDirectory: true)
-    \\        let roots: [URL]
-    \\        if ZeroNativeShellConfig.assetRootSubdirectory.isEmpty {
-    \\            roots = [resourceURL, resourcesURL]
-    \\        } else {
-    \\            roots = [
-    \\                resourceURL.appendingPathComponent(ZeroNativeShellConfig.assetRootSubdirectory, isDirectory: true),
-    \\                resourcesURL.appendingPathComponent(ZeroNativeShellConfig.assetRootSubdirectory, isDirectory: true),
-    \\            ]
-    \\        }
-    \\        for rootURL in roots {
-    \\            let entryURL = rootURL.appendingPathComponent(ZeroNativeShellConfig.assetEntryPath, isDirectory: false)
-    \\            if FileManager.default.fileExists(atPath: entryURL.path) { return rootURL }
-    \\        }
-    \\        return roots.first
-    \\    }
-    \\
-    \\    private func configureNativeAssetRoot(_ nativeApp: UnsafeMutableRawPointer) {
-    \\        guard let rootURL = packagedAssetRootURL() else { return }
-    \\        let path = rootURL.path
-    \\        path.withCString { pointer in
-    \\            zero_native_app_set_asset_root(nativeApp, pointer, UInt(path.utf8.count))
-    \\        }
-    \\        ZeroNativeShellConfig.assetEntryPath.withCString { pointer in
-    \\            zero_native_app_set_asset_entry(nativeApp, pointer, UInt(ZeroNativeShellConfig.assetEntryPath.utf8.count))
-    \\        }
-    \\    }
-    \\
-    \\    private func loadWorkspace() {
-    \\        if let rootURL = packagedAssetRootURL() {
-    \\            let entryURL = rootURL.appendingPathComponent(ZeroNativeShellConfig.assetEntryPath, isDirectory: false)
-    \\            if FileManager.default.fileExists(atPath: entryURL.path) {
-    \\                webView.loadFileURL(entryURL, allowingReadAccessTo: rootURL)
-    \\                return
-    \\            }
-    \\        }
-    \\        webView.loadHTMLString(Self.html, baseURL: nil)
-    \\    }
-    \\
-    \\    private func configureHeader() {
-    \\        headerView.backgroundColor = .secondarySystemBackground
-    \\        titleLabel.text = ZeroNativeShellConfig.title
-    \\        titleLabel.font = .preferredFont(forTextStyle: .title2)
-    \\        titleLabel.adjustsFontForContentSizeCategory = true
-    \\        statusLabel.text = ZeroNativeShellConfig.status
-    \\        statusLabel.font = .preferredFont(forTextStyle: .caption1)
-    \\        statusLabel.textColor = .secondaryLabel
-    \\        backButton.setTitle(ZeroNativeShellConfig.primaryButtonTitle, for: .normal)
-    \\        backButton.addTarget(self, action: #selector(sendBackCommand), for: .touchUpInside)
-    \\        refreshButton.setTitle(ZeroNativeShellConfig.secondaryButtonTitle, for: .normal)
-    \\        refreshButton.addTarget(self, action: #selector(sendRefreshCommand), for: .touchUpInside)
-    \\        [titleLabel, statusLabel, backButton, refreshButton].forEach {
-    \\            $0.translatesAutoresizingMaskIntoConstraints = false
-    \\            headerView.addSubview($0)
-    \\        }
-    \\        NSLayoutConstraint.activate([
-    \\            titleLabel.leadingAnchor.constraint(equalTo: headerView.leadingAnchor, constant: 20),
-    \\            titleLabel.topAnchor.constraint(equalTo: headerView.topAnchor, constant: 16),
-    \\            statusLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-    \\            statusLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 6),
-    \\            refreshButton.trailingAnchor.constraint(equalTo: headerView.trailingAnchor, constant: -20),
-    \\            refreshButton.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
-    \\            backButton.trailingAnchor.constraint(equalTo: refreshButton.leadingAnchor, constant: -12),
-    \\            backButton.centerYAnchor.constraint(equalTo: refreshButton.centerYAnchor),
-    \\        ])
-    \\    }
-    \\
-    \\    @objc private func sendBackCommand() {
-    \\        dispatchNativeCommand(ZeroNativeShellConfig.primaryCommand)
-    \\    }
-    \\
-    \\    @objc private func sendRefreshCommand() {
-    \\        dispatchNativeCommand(ZeroNativeShellConfig.secondaryCommand)
-    \\    }
-    \\
-    \\    private func dispatchNativeCommand(_ command: String) {
-    \\        guard let nativeApp else { return }
-    \\        command.withCString { pointer in
-    \\            zero_native_app_command(nativeApp, pointer, UInt(command.utf8.count))
-    \\        }
-    \\        let count = zero_native_app_last_command_count(nativeApp)
-    \\        let name = String(cString: zero_native_app_last_command_name(nativeApp))
-    \\        statusLabel.text = "\(name) #\(count)"
-    \\        zero_native_app_frame(nativeApp)
-    \\    }
-    \\
-    \\    @objc private func keyboardFrameWillChange(_ notification: Notification) {
-    \\        guard let value = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue else { return }
-    \\        let keyboardFrame = view.convert(value.cgRectValue, from: nil)
-    \\        webViewBottomConstraint?.constant = -max(0, view.bounds.maxY - keyboardFrame.minY)
-    \\        view.layoutIfNeeded()
-    \\    }
-    \\
-    \\    @objc private func keyboardWillHide(_ notification: Notification) {
-    \\        _ = notification
-    \\        webViewBottomConstraint?.constant = 0
-    \\        view.layoutIfNeeded()
-    \\    }
-    \\
-    \\    override func viewDidLayoutSubviews() {
-    \\        super.viewDidLayoutSubviews()
-    \\        guard let nativeApp else { return }
-    \\        let scale = Float(view.window?.screen.scale ?? UIScreen.main.scale)
-    \\        zero_native_app_resize(nativeApp, Float(webView.bounds.width), Float(webView.bounds.height), scale, nil)
-    \\        zero_native_app_frame(nativeApp)
-    \\    }
-    \\
-    \\    deinit {
-    \\        NotificationCenter.default.removeObserver(self)
-    \\        guard let nativeApp else { return }
-    \\        zero_native_app_stop(nativeApp)
-    \\        zero_native_app_destroy(nativeApp)
-    \\    }
-    \\
-    \\    private static let html = """
-    \\    <!doctype html>
-    \\    <meta name="viewport" content="width=device-width, initial-scale=1">
-    \\    <body style="margin:0;font-family:-apple-system,system-ui;background:#f7f8fa;color:#171717">
-    \\      <main style="padding:28px 22px;display:grid;gap:16px">
-    \\        <h1 style="margin:0;font-size:30px">Workspace</h1>
-    \\        <p style="margin:0;color:#5f6672;line-height:1.5">This content is rendered by WKWebView while the header remains native UIKit.</p>
-    \\      </main>
-    \\    </body>
-    \\    """
-    \\}
-    \\
-    ;
-}
-
-fn androidReadme() []const u8 {
-    return "Android zero-native host skeleton. Copy libzero-native.a into app/src/main/cpp/lib and build with Android Studio or Gradle.\n";
-}
-
-fn androidBuildGradle() []const u8 {
-    return
-    \\plugins {
-    \\    id "com.android.application" version "8.5.0"
-    \\    id "org.jetbrains.kotlin.android" version "2.0.20"
-    \\}
-    \\
-    \\android {
-    \\    namespace "dev.zero_native"
-    \\    compileSdk 35
-    \\
-    \\    defaultConfig {
-    \\        applicationId "dev.zero_native"
-    \\        minSdk 26
-    \\        targetSdk 35
-    \\        versionCode 1
-    \\        versionName "0.1.0"
-    \\
-    \\        externalNativeBuild {
-    \\            cmake {
-    \\                arguments "-DANDROID_STL=c++_shared"
-    \\            }
-    \\        }
-    \\    }
-    \\
-    \\    externalNativeBuild {
-    \\        cmake {
-    \\            path "src/main/cpp/CMakeLists.txt"
-    \\        }
-    \\    }
-    \\}
-    \\
-    ;
-}
-
-fn androidBuildGradleForMetadata(allocator: std.mem.Allocator, metadata: manifest_tool.Metadata) ![]const u8 {
-    const application_id = try androidApplicationIdAlloc(allocator, metadata.id);
-    defer allocator.free(application_id);
-    return std.fmt.allocPrint(allocator,
-        \\plugins {{
-        \\    id "com.android.application" version "8.5.0"
-        \\    id "org.jetbrains.kotlin.android" version "2.0.20"
-        \\}}
-        \\
-        \\android {{
-        \\    namespace "{s}"
-        \\    compileSdk 35
-        \\
-        \\    defaultConfig {{
-        \\        applicationId "{s}"
-        \\        minSdk 26
-        \\        targetSdk 35
-        \\        versionCode 1
-        \\        versionName "{s}"
-        \\
-        \\        externalNativeBuild {{
-        \\            cmake {{
-        \\                arguments "-DANDROID_STL=c++_shared"
-        \\            }}
-        \\        }}
-        \\    }}
-        \\
-        \\    externalNativeBuild {{
-        \\        cmake {{
-        \\            path "src/main/cpp/CMakeLists.txt"
-        \\        }}
-        \\    }}
-        \\}}
-        \\
-    , .{ application_id, application_id, metadata.version });
-}
-
-fn androidCMakeLists() []const u8 {
-    return
-    \\cmake_minimum_required(VERSION 3.22.1)
-    \\
-    \\project(zero_native_host C)
-    \\
-    \\add_library(zero-native STATIC IMPORTED)
-    \\set_target_properties(zero-native PROPERTIES
-    \\    IMPORTED_LOCATION "${CMAKE_CURRENT_SOURCE_DIR}/lib/libzero-native.a"
-    \\)
-    \\
-    \\add_library(zero_native_host SHARED zero_native_jni.c)
-    \\target_include_directories(zero_native_host PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-    \\target_link_libraries(zero_native_host zero-native android log)
-    \\
-    ;
-}
-
-fn androidManifest() []const u8 {
-    return "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\"><application android:theme=\"@style/AppTheme\"><activity android:name=\"dev.zero_native.MainActivity\" android:configChanges=\"keyboard|keyboardHidden|orientation|screenSize\" android:exported=\"true\" android:windowSoftInputMode=\"adjustResize\"><intent-filter><action android:name=\"android.intent.action.MAIN\"/><category android:name=\"android.intent.category.LAUNCHER\"/></intent-filter></activity></application></manifest>\n";
-}
-
-fn androidManifestForMetadata(allocator: std.mem.Allocator, metadata: manifest_tool.Metadata) ![]const u8 {
-    const label = try xmlEscapeAlloc(allocator, metadata.displayName());
-    defer allocator.free(label);
-    return std.fmt.allocPrint(allocator,
-        \\<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-        \\  <application android:label="{s}" android:theme="@style/AppTheme">
-        \\    <activity android:name="dev.zero_native.MainActivity" android:configChanges="keyboard|keyboardHidden|orientation|screenSize" android:exported="true" android:windowSoftInputMode="adjustResize">
-        \\      <intent-filter>
-        \\        <action android:name="android.intent.action.MAIN" />
-        \\        <category android:name="android.intent.category.LAUNCHER" />
-        \\      </intent-filter>
-        \\    </activity>
-        \\  </application>
-        \\</manifest>
-        \\
-    , .{label});
-}
-
-fn androidStyles() []const u8 {
-    return
-    \\<resources>
-    \\    <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
-    \\        <item name="android:windowLightStatusBar">true</item>
-    \\        <item name="android:colorAccent">#2563EB</item>
-    \\    </style>
-    \\</resources>
-    \\
-    ;
-}
-
-fn androidApplicationIdAlloc(allocator: std.mem.Allocator, id: []const u8) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var segment_start = true;
-    for (id) |ch| {
-        if (ch == '.') {
-            try out.append(allocator, '.');
-            segment_start = true;
-            continue;
-        }
-        if (segment_start and !std.ascii.isAlphabetic(ch)) {
-            try out.append(allocator, 'a');
-        }
-        segment_start = false;
-        if (std.ascii.isAlphanumeric(ch) or ch == '_') {
-            try out.append(allocator, ch);
-        } else {
-            try out.append(allocator, '_');
-        }
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn androidDefaultShellConfig() []const u8 {
-    return
-    \\package dev.zero_native
-    \\
-    \\object ZeroNativeShellConfig {
-    \\    const val title = "zero-native"
-    \\    const val status = "Native commands ready"
-    \\    const val primaryButtonTitle = "Back"
-    \\    const val primaryCommand = "mobile.back"
-    \\    const val secondaryButtonTitle = "Refresh"
-    \\    const val secondaryCommand = "mobile.refresh"
-    \\    const val assetRootSubdirectory = ""
-    \\    const val assetEntryPath = "index.html"
-    \\}
-    \\
-    ;
-}
-
-fn androidShellConfigAlloc(allocator: std.mem.Allocator, model: MobileShellModel) ![]const u8 {
-    const title = try sourceStringLiteralAlloc(allocator, model.title, .kotlin);
-    defer allocator.free(title);
-    const status = try sourceStringLiteralAlloc(allocator, model.status, .kotlin);
-    defer allocator.free(status);
-    const primary_title = try sourceStringLiteralAlloc(allocator, model.primary_button_title, .kotlin);
-    defer allocator.free(primary_title);
-    const primary_command = try sourceStringLiteralAlloc(allocator, model.primary_command, .kotlin);
-    defer allocator.free(primary_command);
-    const secondary_title = try sourceStringLiteralAlloc(allocator, model.secondary_button_title, .kotlin);
-    defer allocator.free(secondary_title);
-    const secondary_command = try sourceStringLiteralAlloc(allocator, model.secondary_command, .kotlin);
-    defer allocator.free(secondary_command);
-    const asset_root = try sourceStringLiteralAlloc(allocator, model.asset_root_subdirectory, .kotlin);
-    defer allocator.free(asset_root);
-    const asset_entry = try sourceStringLiteralAlloc(allocator, model.asset_entry_path, .kotlin);
-    defer allocator.free(asset_entry);
-
-    return std.fmt.allocPrint(allocator,
-        \\package dev.zero_native
-        \\
-        \\object ZeroNativeShellConfig {{
-        \\    const val title = {s}
-        \\    const val status = {s}
-        \\    const val primaryButtonTitle = {s}
-        \\    const val primaryCommand = {s}
-        \\    const val secondaryButtonTitle = {s}
-        \\    const val secondaryCommand = {s}
-        \\    const val assetRootSubdirectory = {s}
-        \\    const val assetEntryPath = {s}
-        \\}}
-        \\
-    , .{ title, status, primary_title, primary_command, secondary_title, secondary_command, asset_root, asset_entry });
-}
-
-fn androidActivity() []const u8 {
-    return
-    \\package dev.zero_native
-    \\
-    \\import android.app.Activity
-    \\import android.content.res.Configuration
-    \\import android.graphics.Color
-    \\import android.net.Uri
-    \\import android.os.Bundle
-    \\import android.view.MotionEvent
-    \\import android.view.SurfaceHolder
-    \\import android.view.SurfaceView
-    \\import android.webkit.WebView
-    \\import android.widget.Button
-    \\import android.widget.FrameLayout
-    \\import android.widget.LinearLayout
-    \\import android.widget.TextView
-    \\
-    \\class MainActivity : Activity(), SurfaceHolder.Callback {
-    \\    private var nativeApp: Long = 0
-    \\    private lateinit var statusLabel: TextView
-    \\
-    \\    override fun onCreate(savedInstanceState: Bundle?) {
-    \\        super.onCreate(savedInstanceState)
-    \\        System.loadLibrary("zero_native_host")
-    \\
-    \\        val surface = SurfaceView(this)
-    \\        surface.holder.addCallback(this)
-    \\
-    \\        val header = LinearLayout(this).apply {
-    \\            orientation = LinearLayout.VERTICAL
-    \\            setBackgroundColor(Color.rgb(245, 246, 248))
-    \\            setPadding(32, 28, 32, 24)
-    \\        }
-    \\        val title = TextView(this).apply {
-    \\            text = ZeroNativeShellConfig.title
-    \\            textSize = 24f
-    \\            setTextColor(Color.rgb(24, 24, 27))
-    \\        }
-    \\        statusLabel = TextView(this).apply {
-    \\            text = ZeroNativeShellConfig.status
-    \\            textSize = 13f
-    \\            setTextColor(Color.rgb(95, 102, 114))
-    \\            setPadding(0, 8, 0, 0)
-    \\        }
-    \\        val actions = LinearLayout(this).apply {
-    \\            orientation = LinearLayout.HORIZONTAL
-    \\            setPadding(0, 12, 0, 0)
-    \\        }
-    \\        val back = Button(this).apply {
-    \\            text = ZeroNativeShellConfig.primaryButtonTitle
-    \\            setOnClickListener { dispatchNativeCommand(ZeroNativeShellConfig.primaryCommand) }
-    \\        }
-    \\        val refresh = Button(this).apply {
-    \\            text = ZeroNativeShellConfig.secondaryButtonTitle
-    \\            setOnClickListener { dispatchNativeCommand(ZeroNativeShellConfig.secondaryCommand) }
-    \\        }
-    \\        actions.addView(back, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-    \\        actions.addView(refresh, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-    \\        header.addView(title)
-    \\        header.addView(statusLabel)
-    \\        header.addView(actions)
-    \\
-    \\        val webView = WebView(this).apply {
-    \\            settings.javaScriptEnabled = false
-    \\            loadWorkspace(this)
-    \\        }
-    \\        val content = FrameLayout(this)
-    \\        content.addView(surface, FrameLayout.LayoutParams(
-    \\            FrameLayout.LayoutParams.MATCH_PARENT,
-    \\            FrameLayout.LayoutParams.MATCH_PARENT,
-    \\        ))
-    \\        content.addView(webView, FrameLayout.LayoutParams(
-    \\            FrameLayout.LayoutParams.MATCH_PARENT,
-    \\            FrameLayout.LayoutParams.MATCH_PARENT,
-    \\        ))
-    \\        val root = LinearLayout(this).apply {
-    \\            orientation = LinearLayout.VERTICAL
-    \\            setBackgroundColor(Color.WHITE)
-    \\        }
-    \\        root.addView(header, LinearLayout.LayoutParams(
-    \\            LinearLayout.LayoutParams.MATCH_PARENT,
-    \\            LinearLayout.LayoutParams.WRAP_CONTENT,
-    \\        ))
-    \\        root.addView(content, LinearLayout.LayoutParams(
-    \\            LinearLayout.LayoutParams.MATCH_PARENT,
-    \\            0,
-    \\            1f,
-    \\        ))
-    \\        setContentView(root)
-    \\
-    \\        nativeApp = nativeCreate()
-    \\        nativeSetAssetRoot(nativeApp, packagedAssetRoot())
-    \\        nativeSetAssetEntry(nativeApp, ZeroNativeShellConfig.assetEntryPath)
-    \\        nativeStart(nativeApp)
-    \\    }
-    \\
-    \\    private fun packagedAssetRoot(): String {
-    \\        return if (ZeroNativeShellConfig.assetRootSubdirectory.isEmpty()) {
-    \\            "android_asset/zero-native"
-    \\        } else {
-    \\            "android_asset/zero-native/${ZeroNativeShellConfig.assetRootSubdirectory}"
-    \\        }
-    \\    }
-    \\
-    \\    private fun packagedAssetEntry(): String {
-    \\        return if (ZeroNativeShellConfig.assetRootSubdirectory.isEmpty()) {
-    \\            "zero-native/${ZeroNativeShellConfig.assetEntryPath}"
-    \\        } else {
-    \\            "zero-native/${ZeroNativeShellConfig.assetRootSubdirectory}/${ZeroNativeShellConfig.assetEntryPath}"
-    \\        }
-    \\    }
-    \\
-    \\    private fun loadWorkspace(webView: WebView) {
-    \\        val assetPath = packagedAssetEntry()
-    \\        try {
-    \\            assets.open(assetPath).close()
-    \\            val url = Uri.Builder().scheme("file").path("/android_asset/$assetPath").build().toString()
-    \\            webView.loadUrl(url)
-    \\        } catch (_: Exception) {
-    \\            webView.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
-    \\        }
-    \\    }
-    \\
-    \\    private fun dispatchNativeCommand(command: String) {
-    \\        if (nativeApp == 0L) return
-    \\        val count = nativeCommand(nativeApp, command)
-    \\        if (::statusLabel.isInitialized) {
-    \\            statusLabel.text = "Command $count: $command"
-    \\        }
-    \\        nativeFrame(nativeApp)
-    \\    }
-    \\
-    \\    override fun onResume() {
-    \\        super.onResume()
-    \\        if (nativeApp != 0L) nativeActivate(nativeApp)
-    \\    }
-    \\
-    \\    override fun onPause() {
-    \\        if (nativeApp != 0L) nativeDeactivate(nativeApp)
-    \\        super.onPause()
-    \\    }
-    \\
-    \\    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-    \\        if (nativeApp == 0L) return
-    \\        nativeResize(nativeApp, width.toFloat(), height.toFloat(), resources.displayMetrics.density, holder.surface)
-    \\        nativeFrame(nativeApp)
-    \\    }
-    \\
-    \\    override fun surfaceCreated(holder: SurfaceHolder) {}
-    \\
-    \\    override fun surfaceDestroyed(holder: SurfaceHolder) {}
-    \\
-    \\    override fun onConfigurationChanged(newConfig: Configuration) {
-    \\        super.onConfigurationChanged(newConfig)
-    \\        if (nativeApp != 0L) nativeFrame(nativeApp)
-    \\    }
-    \\
-    \\    override fun onTouchEvent(event: MotionEvent): Boolean {
-    \\        if (nativeApp == 0L) return false
-    \\        nativeTouch(nativeApp, event.getPointerId(0).toLong(), event.actionMasked, event.x, event.y, event.pressure)
-    \\        nativeFrame(nativeApp)
-    \\        return true
-    \\    }
-    \\
-    \\    override fun onBackPressed() {
-    \\        if (nativeApp != 0L) {
-    \\            dispatchNativeCommand(ZeroNativeShellConfig.primaryCommand)
-    \\            return
-    \\        }
-    \\        super.onBackPressed()
-    \\    }
-    \\
-    \\    override fun onDestroy() {
-    \\        if (nativeApp != 0L) {
-    \\            nativeStop(nativeApp)
-    \\            nativeDestroy(nativeApp)
-    \\            nativeApp = 0
-    \\        }
-    \\        super.onDestroy()
-    \\    }
-    \\
-    \\    external fun nativeCreate(): Long
-    \\    external fun nativeDestroy(app: Long)
-    \\    external fun nativeStart(app: Long)
-    \\    external fun nativeActivate(app: Long)
-    \\    external fun nativeDeactivate(app: Long)
-    \\    external fun nativeStop(app: Long)
-    \\    external fun nativeSetAssetRoot(app: Long, path: String)
-    \\    external fun nativeSetAssetEntry(app: Long, path: String)
-    \\    external fun nativeResize(app: Long, width: Float, height: Float, scale: Float, surface: Any)
-    \\    external fun nativeTouch(app: Long, id: Long, phase: Int, x: Float, y: Float, pressure: Float)
-    \\    external fun nativeCommand(app: Long, command: String): Int
-    \\    external fun nativeFrame(app: Long)
-    \\
-    \\    companion object {
-    \\        private const val html = """
-    \\            <!doctype html>
-    \\            <meta name="viewport" content="width=device-width, initial-scale=1">
-    \\            <body style="margin:0;font-family:system-ui,sans-serif;background:#f7f8fa;color:#18181b">
-    \\              <main style="padding:28px 22px;display:grid;gap:16px">
-    \\                <h1 style="margin:0;font-size:30px">Workspace</h1>
-    \\                <p style="margin:0;color:#5f6672;line-height:1.5">This content is rendered by Android WebView while the header remains native Android UI.</p>
-    \\              </main>
-    \\            </body>
-    \\        """
-    \\    }
-    \\}
-    \\
-    ;
-}
-
-fn androidJni() []const u8 {
-    return
-    \\#include <jni.h>
-    \\#include <stdint.h>
-    \\#include <string.h>
-    \\#include "zero_native.h"
-    \\JNIEXPORT jlong JNICALL Java_dev_zero_1native_MainActivity_nativeCreate(JNIEnv *env, jobject self) { (void)env; (void)self; return (jlong)zero_native_app_create(); }
-    \\JNIEXPORT void JNICALL Java_dev_zero_1native_MainActivity_nativeDestroy(JNIEnv *env, jobject self, jlong app) { (void)env; (void)self; zero_native_app_destroy((void*)app); }
-    \\JNIEXPORT void JNICALL Java_dev_zero_1native_MainActivity_nativeStart(JNIEnv *env, jobject self, jlong app) { (void)env; (void)self; zero_native_app_start((void*)app); }
-    \\JNIEXPORT void JNICALL Java_dev_zero_1native_MainActivity_nativeActivate(JNIEnv *env, jobject self, jlong app) { (void)env; (void)self; zero_native_app_activate((void*)app); }
-    \\JNIEXPORT void JNICALL Java_dev_zero_1native_MainActivity_nativeDeactivate(JNIEnv *env, jobject self, jlong app) { (void)env; (void)self; zero_native_app_deactivate((void*)app); }
-    \\JNIEXPORT void JNICALL Java_dev_zero_1native_MainActivity_nativeStop(JNIEnv *env, jobject self, jlong app) { (void)env; (void)self; zero_native_app_stop((void*)app); }
-    \\JNIEXPORT void JNICALL Java_dev_zero_1native_MainActivity_nativeSetAssetRoot(JNIEnv *env, jobject self, jlong app, jstring path) { (void)self; const char *chars = (*env)->GetStringUTFChars(env, path, NULL); if (!chars) return; zero_native_app_set_asset_root((void*)app, chars, strlen(chars)); (*env)->ReleaseStringUTFChars(env, path, chars); }
-    \\JNIEXPORT void JNICALL Java_dev_zero_1native_MainActivity_nativeSetAssetEntry(JNIEnv *env, jobject self, jlong app, jstring path) { (void)self; const char *chars = (*env)->GetStringUTFChars(env, path, NULL); if (!chars) return; zero_native_app_set_asset_entry((void*)app, chars, strlen(chars)); (*env)->ReleaseStringUTFChars(env, path, chars); }
-    \\JNIEXPORT void JNICALL Java_dev_zero_1native_MainActivity_nativeResize(JNIEnv *env, jobject self, jlong app, jfloat w, jfloat h, jfloat scale, jobject surface) { (void)env; (void)self; zero_native_app_resize((void*)app, w, h, scale, surface); }
-    \\JNIEXPORT void JNICALL Java_dev_zero_1native_MainActivity_nativeTouch(JNIEnv *env, jobject self, jlong app, jlong id, jint phase, jfloat x, jfloat y, jfloat pressure) { (void)env; (void)self; zero_native_app_touch((void*)app, (uint64_t)id, phase, x, y, pressure); }
-    \\JNIEXPORT jint JNICALL Java_dev_zero_1native_MainActivity_nativeCommand(JNIEnv *env, jobject self, jlong app, jstring command) { (void)self; const char *chars = (*env)->GetStringUTFChars(env, command, NULL); if (!chars) return 0; zero_native_app_command((void*)app, chars, strlen(chars)); (*env)->ReleaseStringUTFChars(env, command, chars); return (jint)zero_native_app_last_command_count((void*)app); }
-    \\JNIEXPORT void JNICALL Java_dev_zero_1native_MainActivity_nativeFrame(JNIEnv *env, jobject self, jlong app) { (void)env; (void)self; zero_native_app_frame((void*)app); }
-    \\
-    ;
+/// The optional NSHumanReadableCopyright entry (with trailing newline)
+/// for the manifest description, or "" when the manifest has none.
+fn macosAboutLine(allocator: std.mem.Allocator, metadata: manifest_tool.Metadata) ![]const u8 {
+    const description = metadata.description orelse return try allocator.dupe(u8, "");
+    const escaped = try xmlEscapeAlloc(allocator, description);
+    defer allocator.free(escaped);
+    return std.fmt.allocPrint(allocator, "  <key>NSHumanReadableCopyright</key>\n  <string>{s}</string>\n", .{escaped});
 }
 
 fn artifactSuffix(target: PackageTarget) []const u8 {
@@ -1194,23 +594,241 @@ fn artifactSuffix(target: PackageTarget) []const u8 {
 
 fn artifactReadme(target: PackageTarget) []const u8 {
     return switch (target) {
-        .windows => "Windows zero-native artifact directory. Installer generation is future work.\n",
-        .linux => "Linux zero-native artifact directory. AppImage, Flatpak, and tarball generation are future work.\n",
-        else => "zero-native artifact directory.\n",
+        .windows => "Windows native-sdk artifact directory. Installer generation is future work.\n",
+        .linux => "Linux native-sdk artifact directory. AppImage, Flatpak, and tarball generation are future work.\n",
+        else => "native-sdk artifact directory.\n",
     };
 }
 
+// ---------------------------------------------------------------------------
+// App icons: one square source image (assets/icon.png or assets/icon.svg
+// in app.zon `.icons`) generates every platform's artifacts through the
+// built-in pipeline (`app_icon`). A prebuilt container in `.icons` always
+// wins untouched for its platform: `.icns` on macOS, `.ico` on Windows.
+// Precedence on macOS: explicit .icns > generated-from-image > the SDK
+// default icon.
+// ---------------------------------------------------------------------------
+
+/// How `.icons` resolves for packaging: at most one prebuilt container
+/// per platform plus at most one generatable source (first of each wins).
+const IconPlan = struct {
+    prebuilt_icns: ?[]const u8 = null,
+    prebuilt_ico: ?[]const u8 = null,
+    source_path: ?[]const u8 = null,
+    source_kind: app_icon_tool.SourceKind = .png,
+};
+
+fn resolveIconPlan(metadata: manifest_tool.Metadata) IconPlan {
+    var plan: IconPlan = .{};
+    for (metadata.icons) |path| {
+        if (app_icon_tool.pathHasExtension(path, ".icns")) {
+            if (plan.prebuilt_icns == null) plan.prebuilt_icns = path;
+        } else if (app_icon_tool.pathHasExtension(path, ".ico")) {
+            if (plan.prebuilt_ico == null) plan.prebuilt_ico = path;
+        } else if (app_icon_tool.sourceKindForPath(path)) |kind| {
+            if (plan.source_path == null) {
+                plan.source_path = path;
+                plan.source_kind = kind;
+            }
+        }
+    }
+    return plan;
+}
+
+/// Read and validate the icon source, printing the same teaching
+/// diagnostics `native validate` produces. A missing file warns and
+/// returns null (packaging falls back per platform); a file that exists
+/// but is not a square PNG/supported SVG is an error.
+fn loadIconSource(allocator: std.mem.Allocator, io: std.Io, path: []const u8, kind: app_icon_tool.SourceKind) !?app_icon_tool.Source {
+    const bytes = readPath(allocator, io, path) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("warning: app icon source {s} was not found; the artifact falls back to the default icon where one exists\n", .{path});
+            return null;
+        },
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    switch (try app_icon_tool.loadSource(allocator, bytes, kind)) {
+        .ok => |loaded| {
+            if (kind == .png and loaded.width < app_icon_tool.min_recommended_source_size) {
+                var buffer: [512]u8 = undefined;
+                std.debug.print("{s}\n", .{app_icon_tool.formatSmallSourceMessage(&buffer, path, loaded.width, loaded.height)});
+            }
+            return loaded;
+        },
+        .issue => |issue| {
+            var buffer: [512]u8 = undefined;
+            const message = switch (issue) {
+                .not_square => |dims| app_icon_tool.formatNotSquareMessage(&buffer, path, dims.width, dims.height),
+                .unsupported => app_icon_tool.formatUnsupportedMessage(&buffer, path),
+            };
+            std.debug.print("error: {s}\n", .{message});
+            return error.InvalidIconSource;
+        },
+    }
+}
+
 fn macosIconFile(metadata: manifest_tool.Metadata) []const u8 {
-    if (metadata.icons.len == 0) return "AppIcon.icns";
-    return std.fs.path.basename(metadata.icons[0]);
+    // Only a prebuilt .icns keeps its own name; generated and default
+    // icons always ship as AppIcon.icns.
+    const plan = resolveIconPlan(metadata);
+    if (plan.prebuilt_icns) |path| return std.fs.path.basename(path);
+    return "AppIcon.icns";
 }
 
 fn copyMacosIcon(allocator: std.mem.Allocator, io: std.Io, package_dir: std.Io.Dir, options: PackageOptions) !void {
-    if (options.metadata.icons.len == 0) {
-        try writeFile(package_dir, io, "Contents/Resources/AppIcon.icns", "placeholder: replace with a real macOS .icns before distributing\n");
+    const plan = resolveIconPlan(options.metadata);
+    if (plan.prebuilt_icns) |path| {
+        // Art-directed prebuilt .icns wins untouched.
+        try copyMacosResourceIcon(allocator, io, package_dir, path, "configured app icon");
         return;
     }
-    try copyMacosResourceIcon(allocator, io, package_dir, options.metadata.icons[0], "configured app icon");
+    if (plan.source_path) |path| {
+        if (try loadIconSource(allocator, io, path, plan.source_kind)) |loaded| {
+            var source = loaded;
+            defer source.deinit(allocator);
+            const icns = app_icon_tool.buildIcns(allocator, &source) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    var buffer: [512]u8 = undefined;
+                    std.debug.print("error: {s}\n", .{app_icon_tool.formatUnsupportedMessage(&buffer, path)});
+                    return error.InvalidIconSource;
+                },
+            };
+            defer allocator.free(icns);
+            try writeFile(package_dir, io, "Contents/Resources/AppIcon.icns", icns);
+            return;
+        }
+    }
+    try writeFile(package_dir, io, "Contents/Resources/AppIcon.icns", default_icon_icns);
+}
+
+/// Linux: the hicolor-theme size set the desktop entry's `Icon=app-icon`
+/// name resolves against, generated from the one source image.
+fn writeLinuxIcons(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, metadata: manifest_tool.Metadata) !void {
+    const plan = resolveIconPlan(metadata);
+    const path = plan.source_path orelse {
+        if (metadata.icons.len > 0) {
+            std.debug.print("note: Linux icons generate from a square .png or .svg in app.zon .icons; a prebuilt .icns/.ico only serves macOS/Windows, so this artifact ships without one\n", .{});
+        }
+        return;
+    };
+    var source = (try loadIconSource(allocator, io, path, plan.source_kind)) orelse return;
+    defer source.deinit(allocator);
+    for (app_icon_tool.linux_sizes) |size| {
+        const encoded = app_icon_tool.buildSquarePng(allocator, &source, size) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidIconSource,
+        };
+        defer allocator.free(encoded);
+        const icon_dir = try std.fmt.allocPrint(allocator, "share/icons/hicolor/{d}x{d}/apps", .{ size, size });
+        defer allocator.free(icon_dir);
+        try dir.createDirPath(io, icon_dir);
+        const icon_path = try std.fmt.allocPrint(allocator, "{s}/app-icon.png", .{icon_dir});
+        defer allocator.free(icon_path);
+        try writeFile(dir, io, icon_path, encoded);
+    }
+}
+
+/// Windows: a multi-size `.ico` at the artifact root (square, unmasked).
+/// A prebuilt `.ico` in `.icons` ships untouched.
+fn writeWindowsIcon(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, metadata: manifest_tool.Metadata) !void {
+    const plan = resolveIconPlan(metadata);
+    if (plan.prebuilt_ico) |path| {
+        copyFileToDir(allocator, io, dir, path, "app-icon.ico") catch {
+            std.debug.print("warning: configured .ico {s} was not found; the Windows artifact ships without an icon\n", .{path});
+        };
+        return;
+    }
+    const path = plan.source_path orelse return;
+    var source = (try loadIconSource(allocator, io, path, plan.source_kind)) orelse return;
+    defer source.deinit(allocator);
+    const ico = app_icon_tool.buildIco(allocator, &source) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidIconSource,
+    };
+    defer allocator.free(ico);
+    try writeFile(dir, io, "app-icon.ico", ico);
+}
+
+/// iOS: an asset-catalog icon set with the single 1024 universal image
+/// modern toolchains take, dropped next to the host skeleton sources.
+fn writeIosIcon(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, metadata: manifest_tool.Metadata) !void {
+    const plan = resolveIconPlan(metadata);
+    var source: app_icon_tool.Source = source: {
+        if (plan.source_path) |path| {
+            if (try loadIconSource(allocator, io, path, plan.source_kind)) |loaded| break :source loaded;
+        }
+        // No usable PNG/SVG source (an .icns-only manifest, or a missing
+        // file): render the default icon — the generated Xcode project
+        // references Assets.xcassets unconditionally, so the catalog must
+        // always exist.
+        switch (try app_icon_tool.loadSource(allocator, default_icon_png, .png)) {
+            .ok => |loaded| break :source loaded,
+            // The embedded default is a valid square PNG by construction
+            // (`zig build generate-icon` regenerates it).
+            .issue => unreachable,
+        }
+    };
+    defer source.deinit(allocator);
+    const encoded = app_icon_tool.buildSquarePng(allocator, &source, app_icon_tool.ios_icon_size) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidIconSource,
+    };
+    defer allocator.free(encoded);
+    try dir.createDirPath(io, "Assets.xcassets/AppIcon.appiconset");
+    try writeFile(dir, io, "Assets.xcassets/AppIcon.appiconset/AppIcon.png", encoded);
+    try writeFile(dir, io, "Assets.xcassets/AppIcon.appiconset/Contents.json",
+        \\{
+        \\  "images" : [
+        \\    {
+        \\      "filename" : "AppIcon.png",
+        \\      "idiom" : "universal",
+        \\      "platform" : "ios",
+        \\      "size" : "1024x1024"
+        \\    }
+        \\  ],
+        \\  "info" : {
+        \\    "author" : "native",
+        \\    "version" : 1
+        \\  }
+        \\}
+        \\
+    );
+}
+
+/// Android: launcher mipmaps at the standard densities, falling back to
+/// the SDK default icon so the generated manifest's @mipmap reference
+/// always resolves — the Android mirror of writeIosIcon. (Adaptive icons
+/// need two art-directed layers a single flat source cannot honestly
+/// provide, so only the legacy launcher set is generated.)
+fn writeAndroidIcons(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, metadata: manifest_tool.Metadata) !void {
+    const plan = resolveIconPlan(metadata);
+    var source: app_icon_tool.Source = source: {
+        if (plan.source_path) |path| {
+            if (try loadIconSource(allocator, io, path, plan.source_kind)) |loaded| break :source loaded;
+        }
+        switch (try app_icon_tool.loadSource(allocator, default_icon_png, .png)) {
+            .ok => |loaded| break :source loaded,
+            // The embedded default is a valid square PNG by construction
+            // (`zig build generate-icon` regenerates it).
+            .issue => unreachable,
+        }
+    };
+    defer source.deinit(allocator);
+    for (app_icon_tool.android_densities) |density| {
+        const encoded = app_icon_tool.buildSquarePng(allocator, &source, density.size) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidIconSource,
+        };
+        defer allocator.free(encoded);
+        const mipmap_dir = try std.fmt.allocPrint(allocator, "res/mipmap-{s}", .{density.name});
+        defer allocator.free(mipmap_dir);
+        try dir.createDirPath(io, mipmap_dir);
+        const icon_path = try std.fmt.allocPrint(allocator, "{s}/ic_launcher.png", .{mipmap_dir});
+        defer allocator.free(icon_path);
+        try writeFile(dir, io, icon_path, encoded);
+    }
 }
 
 fn copyMacosDocumentIcons(allocator: std.mem.Allocator, io: std.Io, package_dir: std.Io.Dir, metadata: manifest_tool.Metadata) !void {
@@ -1501,32 +1119,40 @@ fn copyTree(allocator: std.mem.Allocator, io: std.Io, source_path: []const u8, d
     }
 }
 
+/// Sign the finished bundle and record the signing plan inside it. The
+/// plan file lives in Contents/Resources, which codesign seals: writing
+/// it AFTER a successful signature would invalidate the resource seal
+/// (`codesign --verify --strict` reports "file added" and a quarantined
+/// install shows Gatekeeper's "damaged" dialog). So the plan is written
+/// BEFORE codesign runs — the sealed file states what was requested and
+/// the signature on the bundle is the proof it happened — and only a
+/// FAILED signing rewrites it, which is safe because a failed codesign
+/// leaves the bundle without a seal to break.
 fn runSigning(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, options: PackageOptions) !void {
+    const plan_path = "Contents/Resources/signing-plan.txt";
     switch (options.signing.mode) {
-        .none => try writeFile(dir, io, "Contents/Resources/signing-plan.txt", "signing=none\nunsigned local package\n"),
+        .none => try writeFile(dir, io, plan_path, "signing=none\nunsigned local package\n"),
         .adhoc => {
+            try writeFile(dir, io, plan_path, "signing=adhoc\nad-hoc signed\n");
             const result = codesign.signAdHoc(io, options.output_path) catch {
-                try writeFile(dir, io, "Contents/Resources/signing-plan.txt", "signing=adhoc\ncodesign --sign - failed; bundle is unsigned\n");
+                try writeFile(dir, io, plan_path, "signing=adhoc\ncodesign --sign - failed; bundle is unsigned\n");
                 return;
             };
-            const status = if (result.ok) "signing=adhoc\nad-hoc signed\n" else "signing=adhoc\ncodesign --sign - failed; bundle is unsigned\n";
-            try writeFile(dir, io, "Contents/Resources/signing-plan.txt", status);
+            if (!result.ok) try writeFile(dir, io, plan_path, "signing=adhoc\ncodesign --sign - failed; bundle is unsigned\n");
         },
         .identity => {
             const identity = options.signing.identity orelse {
-                try writeFile(dir, io, "Contents/Resources/signing-plan.txt", "signing=identity\nno identity provided; bundle is unsigned\n");
+                try writeFile(dir, io, plan_path, "signing=identity\nno identity provided; bundle is unsigned\n");
                 return;
             };
+            const plan_text = try std.fmt.allocPrint(allocator, "signing=identity\nsigned with {s}\n", .{identity});
+            defer allocator.free(plan_text);
+            try writeFile(dir, io, plan_path, plan_text);
             const result = codesign.signIdentity(io, options.output_path, identity, options.signing.entitlements) catch {
-                try writeFile(dir, io, "Contents/Resources/signing-plan.txt", "signing=identity\ncodesign failed; bundle is unsigned\n");
+                try writeFile(dir, io, plan_path, "signing=identity\ncodesign failed; bundle is unsigned\n");
                 return;
             };
-            const status_text = if (result.ok)
-                try std.fmt.allocPrint(allocator, "signing=identity\nsigned with {s}\n", .{identity})
-            else
-                try allocator.dupe(u8, "signing=identity\ncodesign failed; bundle is unsigned\n");
-            defer allocator.free(status_text);
-            try writeFile(dir, io, "Contents/Resources/signing-plan.txt", status_text);
+            if (!result.ok) try writeFile(dir, io, plan_path, "signing=identity\ncodesign failed; bundle is unsigned\n");
         },
     }
 }
@@ -2004,85 +1630,46 @@ test "archive command reports nonzero exit" {
     try std.testing.expect(!runArchiveCommand(std.testing.io, &.{ "sh", "-c", "exit 7" }, null));
 }
 
-test "mobile package templates include native command shells" {
-    const ios_controller = iosViewController();
-    try std.testing.expect(std.mem.indexOf(u8, ios_controller, "UIButton(type: .system)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ios_controller, "ZeroNativeShellConfig.primaryCommand") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ios_controller, "zero_native_app_command") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ios_controller, "zero_native_app_set_asset_root") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ios_controller, "zero_native_app_set_asset_entry") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ios_controller, "ZeroNativeShellConfig.assetEntryPath") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ios_controller, "webView.loadFileURL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ios_controller, "appendingPathComponent(\"Resources\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ios_controller, "keyboardWillChangeFrameNotification") != null);
-    try std.testing.expect(std.mem.indexOf(u8, iosDefaultShellConfig(), "primaryCommand = \"mobile.back\"") != null);
+test "mobile package templates ship the toolkit hosts" {
+    // The iOS host tier ships the toolkit-owned UIKit host over the
+    // embed ABI (canvas presentation, input, IME, safe areas, CoreText
+    // measurement, and the panic-path dyld shim the iOS SDK hides).
+    const ios_host = ios_tool.host_source;
+    try std.testing.expect(std.mem.indexOf(u8, ios_host, "native_sdk_app_viewport") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ios_host, "native_sdk_app_render_pixels") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ios_host, "native_sdk_app_scroll") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ios_host, "native_sdk_app_text_input_state") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ios_host, "native_sdk_app_set_text_measure") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ios_host, "native_sdk_app_set_asset_root") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ios_host, "native_sdk_app_widget_semantics_by_id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ios_host, "view.safeAreaInsets") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ios_host, "_dyld_get_image_header_containing_address") != null);
 
-    const android_gradle = androidBuildGradle();
-    try std.testing.expect(std.mem.indexOf(u8, android_gradle, "org.jetbrains.kotlin.android") != null);
-    try std.testing.expect(std.mem.indexOf(u8, android_gradle, "externalNativeBuild") != null);
-
-    const android_activity = androidActivity();
-    try std.testing.expect(std.mem.indexOf(u8, android_activity, "System.loadLibrary(\"zero_native_host\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, android_activity, "nativeSetAssetRoot(nativeApp, packagedAssetRoot())") != null);
-    try std.testing.expect(std.mem.indexOf(u8, android_activity, "ZeroNativeShellConfig.assetEntryPath") != null);
-    try std.testing.expect(std.mem.indexOf(u8, android_activity, "webView.loadUrl(url)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, android_activity, "dispatchNativeCommand(ZeroNativeShellConfig.secondaryCommand)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, android_activity, "WebView(this)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, android_activity, "override fun surfaceDestroyed(holder: SurfaceHolder) {}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, android_activity, "surfaceDestroyed(holder: SurfaceHolder) {\n        if (nativeApp != 0L) nativeStop(nativeApp)\n    }") == null);
-    try std.testing.expect(std.mem.indexOf(u8, androidDefaultShellConfig(), "const val secondaryCommand = \"mobile.refresh\"") != null);
-
-    const android_cmake = androidCMakeLists();
-    try std.testing.expect(std.mem.indexOf(u8, android_cmake, "add_library(zero_native_host SHARED zero_native_jni.c)") != null);
-
-    const android_jni = androidJni();
-    try std.testing.expect(std.mem.indexOf(u8, android_jni, "#include <stdint.h>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, android_jni, "zero_native_app_set_asset_root") != null);
-    try std.testing.expect(std.mem.indexOf(u8, android_jni, "zero_native_app_set_asset_entry") != null);
+    // The Android host tier ships the same architecture over JNI: the
+    // activity presents pixels, forwards touch/keyboard/IME, reports
+    // safe-area and keyboard insets, and registers Paint measurement.
+    const android_activity = android_tool.host_activity_source;
+    try std.testing.expect(std.mem.indexOf(u8, android_activity, "System.loadLibrary(\"native_sdk_host\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, android_activity, "nativeTextInputState") != null);
+    try std.testing.expect(std.mem.indexOf(u8, android_activity, "setComposingText") != null);
+    try std.testing.expect(std.mem.indexOf(u8, android_activity, "finishComposingText") != null);
+    try std.testing.expect(std.mem.indexOf(u8, android_activity, "InputMethodManager") != null);
+    try std.testing.expect(std.mem.indexOf(u8, android_activity, "WindowInsets.Type.ime()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, android_activity, "WindowInsets.Type.displayCutout()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, android_activity, "nativeScrollableWidgetAt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, android_activity, "measureText") != null);
+    try std.testing.expect(std.mem.indexOf(u8, android_activity, "native-sdk-automation") != null);
+    const android_bridge = android_tool.host_bridge_source;
+    try std.testing.expect(std.mem.indexOf(u8, android_bridge, "native_sdk_app_viewport") != null);
+    try std.testing.expect(std.mem.indexOf(u8, android_bridge, "native_sdk_app_render_pixels") != null);
+    try std.testing.expect(std.mem.indexOf(u8, android_bridge, "native_sdk_app_ime") != null);
+    try std.testing.expect(std.mem.indexOf(u8, android_bridge, "native_sdk_app_text_input_state") != null);
+    try std.testing.expect(std.mem.indexOf(u8, android_bridge, "native_sdk_app_set_text_measure") != null);
+    try std.testing.expect(std.mem.indexOf(u8, android_bridge, "native_sdk_app_set_asset_root") != null);
+    try std.testing.expect(std.mem.indexOf(u8, android_bridge, "ANativeWindow_fromSurface") != null);
+    try std.testing.expect(std.mem.indexOf(u8, android_bridge, "WINDOW_FORMAT_RGBA_8888") != null);
 }
 
-test "android shell config escapes Kotlin string interpolation" {
-    var model = defaultMobileShellModel();
-    model.title = "Sales $HOME";
-    model.status = "Total ${amount}";
-    model.primary_button_title = "Back $1";
-
-    const android_config = try androidShellConfigAlloc(std.testing.allocator, model);
-    defer std.testing.allocator.free(android_config);
-    try std.testing.expect(std.mem.indexOf(u8, android_config, "const val title = \"Sales \\$HOME\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, android_config, "const val status = \"Total \\${amount}\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, android_config, "const val primaryButtonTitle = \"Back \\$1\"") != null);
-
-    const ios_config = try iosShellConfigAlloc(std.testing.allocator, model);
-    defer std.testing.allocator.free(ios_config);
-    try std.testing.expect(std.mem.indexOf(u8, ios_config, "static let title = \"Sales $HOME\"") != null);
-}
-
-test "mobile skeletons create native library drop-in directories" {
-    var cwd = std.Io.Dir.cwd();
-    try cwd.deleteTree(std.testing.io, ".zig-cache/test-package-mobile-skeletons");
-    defer cwd.deleteTree(std.testing.io, ".zig-cache/test-package-mobile-skeletons") catch {};
-
-    try cwd.createDirPath(std.testing.io, ".zig-cache/test-package-mobile-skeletons");
-    _ = try createIosSkeleton(std.testing.io, ".zig-cache/test-package-mobile-skeletons/ios");
-    _ = try createAndroidSkeleton(std.testing.io, ".zig-cache/test-package-mobile-skeletons/android");
-
-    var ios_libs = try cwd.openDir(std.testing.io, ".zig-cache/test-package-mobile-skeletons/ios/Libraries", .{});
-    ios_libs.close(std.testing.io);
-    var ios_config = try cwd.openFile(std.testing.io, ".zig-cache/test-package-mobile-skeletons/ios/zero-nativeHost/ZeroNativeShellConfig.swift", .{});
-    ios_config.close(std.testing.io);
-
-    var android_libs = try cwd.openDir(std.testing.io, ".zig-cache/test-package-mobile-skeletons/android/app/src/main/cpp/lib", .{});
-    android_libs.close(std.testing.io);
-    var android_config = try cwd.openFile(std.testing.io, ".zig-cache/test-package-mobile-skeletons/android/app/src/main/java/dev/zero_native/ZeroNativeShellConfig.kt", .{});
-    android_config.close(std.testing.io);
-
-    var cmake = try cwd.openFile(std.testing.io, ".zig-cache/test-package-mobile-skeletons/android/app/src/main/cpp/CMakeLists.txt", .{});
-    cmake.close(std.testing.io);
-
-    var styles = try cwd.openFile(std.testing.io, ".zig-cache/test-package-mobile-skeletons/android/app/src/main/res/values/styles.xml", .{});
-    styles.close(std.testing.io);
-}
 
 test "mobile package artifacts use manifest identity metadata" {
     var cwd = std.Io.Dir.cwd();
@@ -2105,7 +1692,7 @@ test "mobile package artifacts use manifest identity metadata" {
         .views = &shell_views,
     }};
     const metadata: manifest_tool.Metadata = .{
-        .id = "dev.zero-native.mobile-app",
+        .id = "dev.native-sdk.mobile-app",
         .name = "mobile-demo",
         .display_name = "Mobile Demo",
         .version = "2.3.4",
@@ -2128,52 +1715,57 @@ test "mobile package artifacts use manifest identity metadata" {
     try std.testing.expectEqual(@as(usize, 1), ios_stats.asset_count);
     try std.testing.expectEqual(@as(usize, 1), android_stats.asset_count);
 
-    const plist = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/ios/Info.plist");
+    const plist = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/ios/Host/Info.plist");
     defer std.testing.allocator.free(plist);
-    try std.testing.expect(std.mem.indexOf(u8, plist, "dev.zero-native.mobile-app") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plist, "dev.native-sdk.mobile-app") != null);
     try std.testing.expect(std.mem.indexOf(u8, plist, "Mobile Demo") != null);
     try std.testing.expect(std.mem.indexOf(u8, plist, "2.3.4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plist, "UILaunchScreen") != null);
 
-    const gradle = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/android/app/build.gradle");
-    defer std.testing.allocator.free(gradle);
-    try std.testing.expect(std.mem.indexOf(u8, gradle, "applicationId \"dev.zero_native.mobile_app\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gradle, "namespace \"dev.zero_native.mobile_app\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gradle, "versionName \"2.3.4\"") != null);
+    // The generated Xcode project ties the host, library, and resources
+    // together with the app.zon identity — archive-ready with zero edits.
+    const pbxproj = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/ios/mobile-demo.xcodeproj/project.pbxproj");
+    defer std.testing.allocator.free(pbxproj);
+    try std.testing.expect(std.mem.indexOf(u8, pbxproj, "PRODUCT_BUNDLE_IDENTIFIER = \"dev.native-sdk.mobile-app\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pbxproj, "PRODUCT_NAME = \"mobile-demo\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pbxproj, "MARKETING_VERSION = \"2.3.4\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pbxproj, "INFOPLIST_FILE = \"Host/Info.plist\";") != null);
+    const scheme = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/ios/mobile-demo.xcodeproj/xcshareddata/xcschemes/mobile-demo.xcscheme");
+    defer std.testing.allocator.free(scheme);
+    try std.testing.expect(std.mem.indexOf(u8, scheme, "BuildableName = \"mobile-demo.app\"") != null);
+    const packaged_host = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/ios/Host/uikit_host.m");
+    defer std.testing.allocator.free(packaged_host);
+    try std.testing.expectEqualStrings(ios_tool.host_source, packaged_host);
+    var ios_libraries = try cwd.openDir(std.testing.io, ".zig-cache/test-package-mobile-identity/ios/Libraries", .{});
+    ios_libraries.close(std.testing.io);
 
-    const manifest = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/android/app/src/main/AndroidManifest.xml");
+    // The generated Android host project ties the manifest, host
+    // sources, and resources together with the app.zon identity — the
+    // debug APK assembles with zero edits when the toolchain is present
+    // (skipped here: unit tests pass no environment to probe).
+    const manifest = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/android/AndroidManifest.xml");
     defer std.testing.allocator.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "package=\"dev.native_sdk.mobile_app\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "android:versionName=\"2.3.4\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "android:label=\"Mobile Demo\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, manifest, "android:name=\"dev.zero_native.MainActivity\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "android:name=\"dev.native_sdk.host.NativeSdkActivity\"") != null);
+    const packaged_activity = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/android/Host/NativeSdkActivity.java");
+    defer std.testing.allocator.free(packaged_activity);
+    try std.testing.expectEqualStrings(android_tool.host_activity_source, packaged_activity);
+    const packaged_bridge = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/android/Host/android_host.c");
+    defer std.testing.allocator.free(packaged_bridge);
+    try std.testing.expectEqualStrings(android_tool.host_bridge_source, packaged_bridge);
+    const launcher_icon = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/android/res/mipmap-xxxhdpi/ic_launcher.png");
+    defer std.testing.allocator.free(launcher_icon);
+    try std.testing.expect(launcher_icon.len > 8);
+    var android_libraries = try cwd.openDir(std.testing.io, ".zig-cache/test-package-mobile-identity/android/Libraries", .{});
+    android_libraries.close(std.testing.io);
 
-    const ios_shell_config = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/ios/zero-nativeHost/ZeroNativeShellConfig.swift");
-    defer std.testing.allocator.free(ios_shell_config);
-    try std.testing.expect(std.mem.indexOf(u8, ios_shell_config, "static let title = \"Field Console\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ios_shell_config, "static let status = \"Shell ready\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ios_shell_config, "static let primaryCommand = \"mobile.go_back\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ios_shell_config, "static let secondaryButtonTitle = \"Sync Now\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ios_shell_config, "static let assetRootSubdirectory = \"dist\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ios_shell_config, "static let assetEntryPath = \"main.html\"") != null);
-    const ios_controller = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/ios/zero-nativeHost/ZeroNativeHostViewController.swift");
-    defer std.testing.allocator.free(ios_controller);
-    try std.testing.expect(std.mem.indexOf(u8, ios_controller, "zero_native_app_set_asset_entry") != null);
-
-    const android_shell_config = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/android/app/src/main/java/dev/zero_native/ZeroNativeShellConfig.kt");
-    defer std.testing.allocator.free(android_shell_config);
-    try std.testing.expect(std.mem.indexOf(u8, android_shell_config, "const val title = \"Field Console\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, android_shell_config, "const val status = \"Shell ready\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, android_shell_config, "const val primaryButtonTitle = \"Go Back\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, android_shell_config, "const val secondaryCommand = \"mobile.sync\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, android_shell_config, "const val assetRootSubdirectory = \"dist\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, android_shell_config, "const val assetEntryPath = \"main.html\"") != null);
-    const android_activity = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/android/app/src/main/java/dev/zero_native/MainActivity.kt");
-    defer std.testing.allocator.free(android_activity);
-    try std.testing.expect(std.mem.indexOf(u8, android_activity, "nativeSetAssetEntry(nativeApp, ZeroNativeShellConfig.assetEntryPath)") != null);
-
-    const ios_asset = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/ios/Resources/dist/main.html");
+    const ios_asset = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/ios/Assets/dist/main.html");
     defer std.testing.allocator.free(ios_asset);
     try std.testing.expectEqualStrings("<h1>Mobile</h1>", ios_asset);
 
-    const android_asset = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/android/app/src/main/assets/zero-native/dist/main.html");
+    const android_asset = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-mobile-identity/android/assets/native-sdk/dist/main.html");
     defer std.testing.allocator.free(android_asset);
     try std.testing.expectEqualStrings("<h1>Mobile</h1>", android_asset);
 }
@@ -2186,7 +1778,7 @@ test "mobile packages allow chromium desktop engine metadata" {
     try cwd.writeFile(std.testing.io, .{ .sub_path = ".zig-cache/test-package-mobile-chromium/assets/index.html", .data = "<h1>Mobile</h1>" });
 
     const metadata: manifest_tool.Metadata = .{
-        .id = "dev.zero-native.mobile-chromium",
+        .id = "dev.native-sdk.mobile-chromium",
         .name = "mobile-chromium",
         .display_name = "Mobile Chromium",
         .version = "1.0.0",
@@ -2274,16 +1866,30 @@ test "artifact names include metadata target and optimize mode" {
 }
 
 test "plist template includes identity executable and version" {
-    const metadata: manifest_tool.Metadata = .{ .id = "dev.example.app", .name = "demo", .display_name = "Demo App", .version = "1.2.3", .icons = &.{"assets/icon.icns"} };
+    const metadata: manifest_tool.Metadata = .{ .id = "dev.example.app", .name = "demo", .display_name = "Demo App", .description = "A demo of the packaging pipeline.", .version = "1.2.3", .icons = &.{"assets/icon.icns"} };
     const plist = try macosInfoPlist(std.testing.allocator, metadata, "demo");
     defer std.testing.allocator.free(plist);
     try std.testing.expect(std.mem.indexOf(u8, plist, "CFBundleIdentifier") != null);
     try std.testing.expect(std.mem.indexOf(u8, plist, "CFBundleDisplayName") != null);
     try std.testing.expect(std.mem.indexOf(u8, plist, "dev.example.app") != null);
     try std.testing.expect(std.mem.indexOf(u8, plist, "Demo App") != null);
+    // CFBundleName is what the application menu shows: it must carry the
+    // display name, never the lowercase manifest/executable name.
+    try std.testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleName</key>\n  <string>Demo App</string>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plist, "<string>demo</string>\n  <key>CFBundleDisplayName</key>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, plist, "<key>CFBundleExecutable</key>\n  <string>demo</string>") != null);
     try std.testing.expect(std.mem.indexOf(u8, plist, "icon.icns") != null);
     try std.testing.expect(std.mem.indexOf(u8, plist, "LSMinimumSystemVersion") != null);
     try std.testing.expect(std.mem.indexOf(u8, plist, "11.0") != null);
+    // The manifest description reaches the About panel's footer key.
+    try std.testing.expect(std.mem.indexOf(u8, plist, "NSHumanReadableCopyright") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plist, "A demo of the packaging pipeline.") != null);
+
+    // Without a description the key is absent, not emitted empty.
+    const bare: manifest_tool.Metadata = .{ .id = "dev.example.app", .name = "demo", .version = "1.2.3" };
+    const bare_plist = try macosInfoPlist(std.testing.allocator, bare, "demo");
+    defer std.testing.allocator.free(bare_plist);
+    try std.testing.expect(std.mem.indexOf(u8, bare_plist, "NSHumanReadableCopyright") == null);
 }
 
 test "plist template includes document and URL registrations" {
@@ -2347,6 +1953,42 @@ test "macOS package copies document type icons into resources" {
     const copied = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-doc-icons/Demo.app/Contents/Resources/markdown.icns");
     defer std.testing.allocator.free(copied);
     try std.testing.expectEqualStrings("icnsdoc-icon", copied);
+}
+
+test "macOS package mirrors app assets at their app-relative path" {
+    // The packaged host resolves relative asset paths against
+    // Contents/Resources, so the bundle must carry the asset tree at the
+    // same relative paths a dev run reads ("assets/music/track.mp3" →
+    // Resources/assets/music/track.mp3) — never flattened into the
+    // Resources root where no runtime path ever finds it.
+    var cwd = std.Io.Dir.cwd();
+    try cwd.deleteTree(std.testing.io, ".zig-cache/test-package-asset-layout");
+    defer cwd.deleteTree(std.testing.io, ".zig-cache/test-package-asset-layout") catch {};
+    try cwd.createDirPath(std.testing.io, ".zig-cache/test-package-asset-layout/assets/music");
+    try cwd.writeFile(std.testing.io, .{ .sub_path = ".zig-cache/test-package-asset-layout/assets/music/track.mp3", .data = "mp3-bytes" });
+
+    const metadata: manifest_tool.Metadata = .{ .id = "dev.example.app", .name = "demo", .version = "1.2.3" };
+    const stats = try createMacosApp(std.testing.allocator, std.testing.io, .{
+        .metadata = metadata,
+        .output_path = ".zig-cache/test-package-asset-layout/Demo.app",
+        .assets_dir = ".zig-cache/test-package-asset-layout/assets",
+    });
+    try std.testing.expectEqual(@as(usize, 1), stats.asset_count);
+
+    const bundled = try readPath(std.testing.allocator, std.testing.io, ".zig-cache/test-package-asset-layout/Demo.app/Contents/Resources/.zig-cache/test-package-asset-layout/assets/music/track.mp3");
+    defer std.testing.allocator.free(bundled);
+    try std.testing.expectEqualStrings("mp3-bytes", bundled);
+}
+
+test "app-relative asset subpaths accept plain trees and reject escapes" {
+    try std.testing.expectEqualStrings("assets", appRelativeAssetSubpath("assets").?);
+    try std.testing.expectEqualStrings("data/sounds", appRelativeAssetSubpath("data/sounds").?);
+    try std.testing.expect(appRelativeAssetSubpath("") == null);
+    try std.testing.expect(appRelativeAssetSubpath(".") == null);
+    try std.testing.expect(appRelativeAssetSubpath("./.") == null);
+    try std.testing.expect(appRelativeAssetSubpath("../shared") == null);
+    try std.testing.expect(appRelativeAssetSubpath("assets/../..") == null);
+    try std.testing.expect(appRelativeAssetSubpath("/tmp/assets") == null);
 }
 
 test "windows registration script contains extension and protocol keys" {
@@ -2463,4 +2105,284 @@ test "package report records target signing and assets" {
     const len = try file.readPositionalAll(std.testing.io, &buffer, 0);
     try std.testing.expect(std.mem.indexOf(u8, buffer[0..len], ".target = \"linux\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer[0..len], ".asset_count = 2") != null);
+}
+
+// ---------------------------------------------------------------------------
+// App icon pipeline tests
+// ---------------------------------------------------------------------------
+
+/// Write a solid full-bleed square PNG source for icon tests.
+fn writeTestIconSource(gpa: std.mem.Allocator, io: std.Io, path: []const u8, extent: usize) !void {
+    const pixels = try gpa.alloc(u8, extent * extent * 4);
+    defer gpa.free(pixels);
+    var index: usize = 0;
+    while (index < extent * extent) : (index += 1) {
+        pixels[index * 4 + 0] = 40;
+        pixels[index * 4 + 1] = 90;
+        pixels[index * 4 + 2] = 220;
+        pixels[index * 4 + 3] = 255;
+    }
+    const encoded = try app_icon_tool.encodePng(gpa, pixels, extent, extent);
+    defer gpa.free(encoded);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = encoded });
+}
+
+test "macos package generates a full icns family from a png source" {
+    const gpa = std.testing.allocator;
+    var cwd = std.Io.Dir.cwd();
+    const root = ".zig-cache/test-package-icon-gen";
+    try cwd.deleteTree(std.testing.io, root);
+    defer cwd.deleteTree(std.testing.io, root) catch {};
+    try cwd.createDirPath(std.testing.io, root ++ "/assets");
+    try writeTestIconSource(gpa, std.testing.io, root ++ "/assets/icon.png", 128);
+
+    const metadata: manifest_tool.Metadata = .{
+        .id = "dev.example.app",
+        .name = "demo",
+        .version = "1.0.0",
+        .icons = &.{root ++ "/assets/icon.png"},
+    };
+    _ = try createMacosApp(gpa, std.testing.io, .{
+        .metadata = metadata,
+        .output_path = root ++ "/Demo.app",
+        .assets_dir = root ++ "/assets",
+    });
+
+    const icns = try readPath(gpa, std.testing.io, root ++ "/Demo.app/Contents/Resources/AppIcon.icns");
+    defer gpa.free(icns);
+    var iterator = app_icon_tool.IcnsIterator.init(icns) orelse return error.TestUnexpectedResult;
+    var seen: usize = 0;
+    while (iterator.next()) |member| {
+        const slot = app_icon_tool.icns_slots[seen];
+        try std.testing.expectEqualSlices(u8, &slot.kind, &member.kind);
+        switch (slot.payload) {
+            .png => {
+                const header = app_icon_tool.pngHeader(member.data) orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(slot.size, header.width);
+                try std.testing.expectEqual(slot.size, header.height);
+            },
+            .argb => {
+                const rgba = try app_icon_tool.decodeArgb(gpa, member.data, slot.size, slot.size);
+                defer gpa.free(rgba);
+                try std.testing.expectEqual(slot.size * slot.size * 4, rgba.len);
+            },
+        }
+        seen += 1;
+    }
+    try std.testing.expectEqual(app_icon_tool.icns_slots.len, seen);
+
+    // The Info.plist references the generated name, not the source name.
+    const plist = try readPath(gpa, std.testing.io, root ++ "/Demo.app/Contents/Info.plist");
+    defer gpa.free(plist);
+    try std.testing.expect(std.mem.indexOf(u8, plist, "AppIcon.icns") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plist, "icon.png") == null);
+}
+
+test "a prebuilt icns wins untouched over a png source" {
+    const gpa = std.testing.allocator;
+    var cwd = std.Io.Dir.cwd();
+    const root = ".zig-cache/test-package-icon-precedence";
+    try cwd.deleteTree(std.testing.io, root);
+    defer cwd.deleteTree(std.testing.io, root) catch {};
+    try cwd.createDirPath(std.testing.io, root ++ "/assets");
+    try writeTestIconSource(gpa, std.testing.io, root ++ "/assets/icon.png", 64);
+    const prebuilt = "icns\x00\x00\x00\x0cJUNK";
+    try cwd.writeFile(std.testing.io, .{ .sub_path = root ++ "/assets/icon.icns", .data = prebuilt });
+
+    const metadata: manifest_tool.Metadata = .{
+        .id = "dev.example.app",
+        .name = "demo",
+        .version = "1.0.0",
+        // Source listed FIRST: the prebuilt .icns must still win.
+        .icons = &.{ root ++ "/assets/icon.png", root ++ "/assets/icon.icns" },
+    };
+    _ = try createMacosApp(gpa, std.testing.io, .{
+        .metadata = metadata,
+        .output_path = root ++ "/Demo.app",
+        .assets_dir = root ++ "/assets",
+    });
+
+    const copied = try readPath(gpa, std.testing.io, root ++ "/Demo.app/Contents/Resources/icon.icns");
+    defer gpa.free(copied);
+    try std.testing.expectEqualStrings(prebuilt, copied);
+}
+
+test "macos package without icons ships the default icon" {
+    const gpa = std.testing.allocator;
+    var cwd = std.Io.Dir.cwd();
+    const root = ".zig-cache/test-package-icon-default";
+    try cwd.deleteTree(std.testing.io, root);
+    defer cwd.deleteTree(std.testing.io, root) catch {};
+    try cwd.createDirPath(std.testing.io, root ++ "/assets");
+
+    const metadata: manifest_tool.Metadata = .{ .id = "dev.example.app", .name = "demo", .version = "1.0.0" };
+    _ = try createMacosApp(gpa, std.testing.io, .{
+        .metadata = metadata,
+        .output_path = root ++ "/Demo.app",
+        .assets_dir = root ++ "/assets",
+    });
+    const icns = try readPath(gpa, std.testing.io, root ++ "/Demo.app/Contents/Resources/AppIcon.icns");
+    defer gpa.free(icns);
+    try std.testing.expect(app_icon_tool.IcnsIterator.init(icns) != null);
+}
+
+test "a non-square icon source fails packaging with the teaching error" {
+    const gpa = std.testing.allocator;
+    var cwd = std.Io.Dir.cwd();
+    const root = ".zig-cache/test-package-icon-nonsquare";
+    try cwd.deleteTree(std.testing.io, root);
+    defer cwd.deleteTree(std.testing.io, root) catch {};
+    try cwd.createDirPath(std.testing.io, root ++ "/assets");
+    const pixels = try gpa.alloc(u8, 6 * 4 * 4);
+    defer gpa.free(pixels);
+    @memset(pixels, 255);
+    const encoded = try app_icon_tool.encodePng(gpa, pixels, 6, 4);
+    defer gpa.free(encoded);
+    try cwd.writeFile(std.testing.io, .{ .sub_path = root ++ "/assets/icon.png", .data = encoded });
+
+    const metadata: manifest_tool.Metadata = .{
+        .id = "dev.example.app",
+        .name = "demo",
+        .version = "1.0.0",
+        .icons = &.{root ++ "/assets/icon.png"},
+    };
+    try std.testing.expectError(error.InvalidIconSource, createMacosApp(gpa, std.testing.io, .{
+        .metadata = metadata,
+        .output_path = root ++ "/Demo.app",
+        .assets_dir = root ++ "/assets",
+    }));
+}
+
+test "linux artifact installs the hicolor icon size set" {
+    const gpa = std.testing.allocator;
+    var cwd = std.Io.Dir.cwd();
+    const root = ".zig-cache/test-package-icon-linux";
+    try cwd.deleteTree(std.testing.io, root);
+    defer cwd.deleteTree(std.testing.io, root) catch {};
+    try cwd.createDirPath(std.testing.io, root ++ "/assets");
+    try writeTestIconSource(gpa, std.testing.io, root ++ "/assets/icon.png", 64);
+
+    const metadata: manifest_tool.Metadata = .{
+        .id = "dev.example.app",
+        .name = "demo",
+        .version = "1.0.0",
+        .icons = &.{root ++ "/assets/icon.png"},
+    };
+    _ = try createPackage(gpa, std.testing.io, .{
+        .metadata = metadata,
+        .target = .linux,
+        .output_path = root ++ "/demo-linux",
+        .assets_dir = root ++ "/assets",
+    });
+
+    inline for (app_icon_tool.linux_sizes) |size| {
+        const icon_path = try std.fmt.allocPrint(gpa, "{s}/demo-linux/share/icons/hicolor/{d}x{d}/apps/app-icon.png", .{ root, size, size });
+        defer gpa.free(icon_path);
+        const encoded = try readPath(gpa, std.testing.io, icon_path);
+        defer gpa.free(encoded);
+        const header = app_icon_tool.pngHeader(encoded) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, size), header.width);
+        try std.testing.expectEqual(@as(usize, size), header.height);
+    }
+}
+
+test "windows artifact gets a generated multi-size ico" {
+    const gpa = std.testing.allocator;
+    var cwd = std.Io.Dir.cwd();
+    const root = ".zig-cache/test-package-icon-windows";
+    try cwd.deleteTree(std.testing.io, root);
+    defer cwd.deleteTree(std.testing.io, root) catch {};
+    try cwd.createDirPath(std.testing.io, root ++ "/assets");
+    try writeTestIconSource(gpa, std.testing.io, root ++ "/assets/icon.png", 64);
+
+    const metadata: manifest_tool.Metadata = .{
+        .id = "dev.example.app",
+        .name = "demo",
+        .version = "1.0.0",
+        .icons = &.{root ++ "/assets/icon.png"},
+    };
+    _ = try createPackage(gpa, std.testing.io, .{
+        .metadata = metadata,
+        .target = .windows,
+        .output_path = root ++ "/demo-windows",
+        .assets_dir = root ++ "/assets",
+    });
+
+    const ico = try readPath(gpa, std.testing.io, root ++ "/demo-windows/app-icon.ico");
+    defer gpa.free(ico);
+    var iterator = app_icon_tool.IcoIterator.init(ico) orelse return error.TestUnexpectedResult;
+    var seen: usize = 0;
+    while (iterator.next()) |entry| {
+        try std.testing.expectEqual(app_icon_tool.ico_sizes[seen], entry.size);
+        const header = app_icon_tool.pngHeader(entry.data) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(app_icon_tool.ico_sizes[seen], header.width);
+        seen += 1;
+    }
+    try std.testing.expectEqual(app_icon_tool.ico_sizes.len, seen);
+}
+
+test "ios artifact carries the asset-catalog icon set" {
+    const gpa = std.testing.allocator;
+    var cwd = std.Io.Dir.cwd();
+    const root = ".zig-cache/test-package-icon-ios";
+    try cwd.deleteTree(std.testing.io, root);
+    defer cwd.deleteTree(std.testing.io, root) catch {};
+    try cwd.createDirPath(std.testing.io, root ++ "/assets");
+    try writeTestIconSource(gpa, std.testing.io, root ++ "/assets/icon.png", 64);
+
+    const metadata: manifest_tool.Metadata = .{
+        .id = "dev.example.app",
+        .name = "demo",
+        .version = "1.0.0",
+        .icons = &.{root ++ "/assets/icon.png"},
+    };
+    _ = try createPackage(gpa, std.testing.io, .{
+        .metadata = metadata,
+        .target = .ios,
+        .output_path = root ++ "/demo-ios",
+        .assets_dir = root ++ "/assets",
+    });
+
+    const contents = try readPath(gpa, std.testing.io, root ++ "/demo-ios/Assets.xcassets/AppIcon.appiconset/Contents.json");
+    defer gpa.free(contents);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "1024x1024") != null);
+    const icon = try readPath(gpa, std.testing.io, root ++ "/demo-ios/Assets.xcassets/AppIcon.appiconset/AppIcon.png");
+    defer gpa.free(icon);
+    const header = app_icon_tool.pngHeader(icon) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(app_icon_tool.ios_icon_size, header.width);
+}
+
+test "android artifact carries launcher mipmaps and references them" {
+    const gpa = std.testing.allocator;
+    var cwd = std.Io.Dir.cwd();
+    const root = ".zig-cache/test-package-icon-android";
+    try cwd.deleteTree(std.testing.io, root);
+    defer cwd.deleteTree(std.testing.io, root) catch {};
+    try cwd.createDirPath(std.testing.io, root ++ "/assets");
+    try writeTestIconSource(gpa, std.testing.io, root ++ "/assets/icon.png", 64);
+
+    const metadata: manifest_tool.Metadata = .{
+        .id = "dev.example.app",
+        .name = "demo",
+        .version = "1.0.0",
+        .icons = &.{root ++ "/assets/icon.png"},
+    };
+    _ = try createPackage(gpa, std.testing.io, .{
+        .metadata = metadata,
+        .target = .android,
+        .output_path = root ++ "/demo-android",
+        .assets_dir = root ++ "/assets",
+    });
+
+    inline for (app_icon_tool.android_densities) |density| {
+        const icon_path = try std.fmt.allocPrint(gpa, "{s}/demo-android/res/mipmap-{s}/ic_launcher.png", .{ root, density.name });
+        defer gpa.free(icon_path);
+        const encoded = try readPath(gpa, std.testing.io, icon_path);
+        defer gpa.free(encoded);
+        const header = app_icon_tool.pngHeader(encoded) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, density.size), header.width);
+    }
+    const manifest = try readPath(gpa, std.testing.io, root ++ "/demo-android/AndroidManifest.xml");
+    defer gpa.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "android:icon=\"@mipmap/ic_launcher\"") != null);
 }

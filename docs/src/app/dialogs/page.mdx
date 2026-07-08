@@ -1,6 +1,6 @@
 # Dialogs
 
-zero-native provides native file and message dialogs accessible from Zig via `Runtime.showOpenDialog(...)`, `Runtime.showSaveDialog(...)`, and `Runtime.showMessageDialog(...)`, or from JavaScript via the [builtin bridge](/bridge/builtin-commands).
+The Native SDK provides native file and message dialogs accessible from Zig via `Runtime.showOpenDialog(...)`, `Runtime.showSaveDialog(...)`, and `Runtime.showMessageDialog(...)`, or from JavaScript via the [builtin bridge](/bridge/builtin-commands).
 
 ## Open file dialog
 
@@ -135,7 +135,7 @@ Returns an optional path string.
 ## FileFilter
 
 ```zig
-const filters = [_]zero_native.FileFilter{
+const filters = [_]native_sdk.FileFilter{
     .{ .name = "Images", .extensions = &.{ "png", "jpg", "gif" } },
     .{ .name = "All Files", .extensions = &.{ "*" } },
 };
@@ -146,19 +146,19 @@ const filters = [_]zero_native.FileFilter{
 Dialogs require the [builtin bridge](/bridge/builtin-commands) to be enabled with an explicit policy that grants the `dialog` permission. JSON field names use camelCase:
 
 ```javascript
-const files = await window.zero.invoke("zero-native.dialog.openFile", {
+const files = await window.zero.invoke("native-sdk.dialog.openFile", {
   title: "Select a file",
   defaultPath: "/home",
   allowMultiple: true,
   allowDirectories: false,
 });
 
-const path = await window.zero.invoke("zero-native.dialog.saveFile", {
+const path = await window.zero.invoke("native-sdk.dialog.saveFile", {
   title: "Save as",
   defaultName: "untitled.txt",
 });
 
-const result = await window.zero.invoke("zero-native.dialog.showMessage", {
+const result = await window.zero.invoke("native-sdk.dialog.showMessage", {
   style: "warning",
   title: "Confirm",
   message: "Delete this item?",

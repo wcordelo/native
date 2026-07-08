@@ -1,5 +1,5 @@
 .{
-    .id = "dev.zero_native.android-example",
+    .id = "dev.native_sdk.android-example",
     .name = "android-example",
     .display_name = "Android Example",
     .version = "0.1.0",

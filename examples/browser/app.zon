@@ -1,9 +1,8 @@
 .{
-    .id = "dev.zero_native.browser",
+    .id = "dev.native_sdk.browser",
     .name = "browser",
     .display_name = "Browser Example",
     .version = "0.1.0",
-    .icons = .{ "assets/icon.icns" },
     .platforms = .{ "macos", "linux" },
     .permissions = .{ "window" },
     .capabilities = .{ "webview", "js_bridge" },

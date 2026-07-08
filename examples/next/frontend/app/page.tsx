@@ -11,7 +11,7 @@ export default function Home() {
 
   return (
     <main>
-      <p className="eyebrow">zero-native + Next.js</p>
+      <p className="eyebrow">Native SDK + Next.js</p>
       <h1>Next</h1>
       <p className="lede">A Next.js frontend running inside the system WebView.</p>
       <div className="card">

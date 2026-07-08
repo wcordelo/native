@@ -1,4 +1,4 @@
-# zero-native native-panels example
+# Native SDK native-panels example
 
 This example shows native panels composed around WebView content:
 

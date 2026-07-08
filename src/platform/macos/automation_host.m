@@ -2,7 +2,7 @@
 
 #import <Foundation/Foundation.h>
 
-int zero_native_automation_write_placeholder_screenshot(const char *path) {
+int native_sdk_automation_write_placeholder_screenshot(const char *path) {
     if (!path) {
         return 0;
     }

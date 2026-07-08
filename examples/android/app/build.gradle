@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace "dev.zero_native.examples.android"
+    namespace "dev.native_sdk.examples.android"
     compileSdk 35
 
     defaultConfig {
-        applicationId "dev.zero_native.examples.android"
+        applicationId "dev.native_sdk.examples.android"
         minSdk 26
         targetSdk 35
         versionCode 1

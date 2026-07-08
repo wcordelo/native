@@ -1,6 +1,6 @@
 # Bridge
 
-The bridge connects JavaScript in the WebView to native Zig handlers via JSON messages.
+For apps that [embed web content](/frontend), the bridge connects JavaScript in the WebView to native Zig handlers via JSON messages. Native-rendered apps have no bridge — markup dispatches typed messages straight into `update` (see [App Model](/app-model)).
 
 ## Architecture
 
@@ -19,7 +19,7 @@ window.zero.invoke(cmd, payload)
 ## Defining a handler
 
 ```zig
-fn ping(context: *anyopaque, invocation: zero_native.bridge.Invocation, output: []u8) anyerror![]const u8 {
+fn ping(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     _ = invocation;
     const self: *App = @ptrCast(@alignCast(context));
     self.ping_count += 1;
@@ -30,13 +30,13 @@ fn ping(context: *anyopaque, invocation: zero_native.bridge.Invocation, output: 
 The handler writes its JSON result into the provided `output` buffer (max 12 KiB) and returns a slice of it. Results must be valid JSON values; invalid raw text is rejected with `handler_failed`. When returning user data as a string, use the bridge helper so quotes and control characters are escaped:
 
 ```zig
-return zero_native.bridge.writeJsonStringValue(output, user_supplied_name);
+return native_sdk.bridge.writeJsonStringValue(output, user_supplied_name);
 ```
 
 ## Wiring the dispatcher
 
 ```zig
-fn bridge(self: *App) zero_native.BridgeDispatcher {
+fn bridge(self: *App) native_sdk.BridgeDispatcher {
     self.handlers = .{.{ .name = "native.ping", .context = self, .invoke_fn = ping }};
     return .{
         .policy = .{ .enabled = true, .commands = &policies },
@@ -175,4 +175,4 @@ try {
   </tbody>
 </table>
 
-See also: [Builtin Commands](/bridge/builtin-commands) for `zero-native.command.*`, `zero-native.window.*`, `zero-native.view.*`, `zero-native.webview.*`, `zero-native.dialog.*`, `zero-native.os.*`, `zero-native.clipboard.*`, and `zero-native.credentials.*`.
+See also: [Builtin Commands](/bridge/builtin-commands) for `native-sdk.command.*`, `native-sdk.window.*`, `native-sdk.view.*`, `native-sdk.webview.*`, `native-sdk.dialog.*`, `native-sdk.os.*`, `native-sdk.clipboard.*`, and `native-sdk.credentials.*`.

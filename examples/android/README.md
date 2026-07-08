@@ -1,8 +1,8 @@
 # Android Example
 
-A minimal Android mobile shell that embeds a zero-native static library through JNI. The example keeps a native Android header above a WebView workspace and routes native navigation/header actions through the zero-native command path.
+A minimal Android mobile shell that embeds a Native SDK static library through JNI. The example keeps a native Android header above a WebView workspace and routes native navigation/header actions through the Native SDK command path.
 
-Android views own the mobile shell layout: native header sizing, density-aware resize events, touch forwarding, and the `WebView` workspace. The zero-native runtime is driven through JNI calls into the C ABI.
+Android views own the mobile shell layout: native header sizing, density-aware resize events, touch forwarding, and the `WebView` workspace. The Native SDK runtime is driven through JNI calls into the C ABI.
 
 ## Build the native library
 
@@ -11,10 +11,10 @@ Build or package an Android static library from the repository root, then copy i
 ```bash
 zig build lib -Dtarget=aarch64-linux-android
 mkdir -p examples/android/app/src/main/cpp/lib
-cp zig-out/lib/libzero-native.a examples/android/app/src/main/cpp/lib/libzero-native.a
+cp zig-out/lib/libnative-sdk.a examples/android/app/src/main/cpp/lib/libnative-sdk.a
 ```
 
-The CMake project expects the library at `app/src/main/cpp/lib/libzero-native.a` and the C header at `app/src/main/cpp/zero_native.h`.
+The CMake project expects the library at `app/src/main/cpp/lib/libnative-sdk.a` and the C header at `app/src/main/cpp/native_sdk.h`.
 
 ## Run
 
@@ -32,21 +32,23 @@ Install on an emulator or device:
 
 ## Files
 
-- `app/src/main/java/dev/zero_native/examples/android/MainActivity.kt` hosts native Android chrome, a WebView workspace, a `SurfaceView`, and the JNI bridge.
-- `app/src/main/cpp/zero_native_jni.c` forwards JNI calls to the zero-native C ABI.
-- `app/src/main/cpp/CMakeLists.txt` imports `libzero-native.a` and builds the JNI shared library.
-- `app.zon` records the mobile example metadata for zero-native tooling.
+- `app/src/main/java/dev/native_sdk/examples/android/MainActivity.kt` hosts native Android chrome, a WebView workspace, a `SurfaceView`, and the JNI bridge.
+- `app/src/main/cpp/native_sdk_jni.c` forwards JNI calls to the Native SDK C ABI.
+- `app/src/main/cpp/CMakeLists.txt` imports `libnative-sdk.a` and builds the JNI shared library.
+- `app.zon` records the mobile example metadata for Native SDK tooling.
 
 ## Host lifecycle
 
-- `onCreate` loads the JNI library, creates the native shell, then starts the zero-native app.
-- `onResume` and `onPause` forward activation lifecycle with `zero_native_app_activate` and `zero_native_app_deactivate`.
-- `surfaceChanged` forwards size, display density, and the Android `Surface`, then requests a frame.
+- `onCreate` loads the JNI library, creates the native shell, then starts the Native SDK app.
+- `onResume` and `onPause` forward activation lifecycle with `native_sdk_app_activate` and `native_sdk_app_deactivate`.
+- `surfaceChanged` forwards size, display density, safe-area insets, keyboard inset, and the Android `Surface`, then requests a frame.
 - Orientation and screen-size changes stay in the same activity so the embedded runtime is not recreated during rotation.
 - The activity uses `windowSoftInputMode="adjustResize"` so Android owns keyboard avoidance and relayouts the content area.
-- The native Back and Refresh buttons call `nativeCommand` with stable mobile command IDs, update status from `zero_native_app_last_command_count`, and request a frame.
+- The native Back and Refresh buttons call `nativeCommand` with stable mobile command IDs, update status from `native_sdk_app_last_command_count`, and request a frame.
 - The Android system Back action dispatches `mobile.back` through the same command path.
 - `onTouchEvent` forwards pointer id, phase, position, and pressure.
+- The JNI bridge exposes hardware key, committed text, and IME composition entry points for GPU/widget text fields.
+- The embedded C ABI can expose retained GPU/widget accessibility semantics by indexed snapshot and dispatch widget accessibility actions for Android accessibility providers.
 - `surfaceDestroyed` and `onDestroy` stop and destroy the app.
 
-The `app.zon` shell view tree describes this header and WebView workspace. Native mobile layout is still implemented in Kotlin so Android owns soft-keyboard relayout, Back handling, orientation changes, and activity lifecycle.
+The `app.zon` shell view tree describes this header and WebView workspace. Native mobile layout is still implemented in Kotlin so Android owns soft-keyboard relayout, Back handling, orientation changes, and activity lifecycle while the Native SDK receives the viewport metrics needed for GPU/widget layout.

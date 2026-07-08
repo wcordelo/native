@@ -10,7 +10,7 @@ onMounted(() => {
 
 <template>
   <main>
-    <p class="eyebrow">zero-native + Vue</p>
+    <p class="eyebrow">Native SDK + Vue</p>
     <h1>App</h1>
     <p class="lede">A Vue frontend running inside the system WebView.</p>
     <div class="card">

@@ -4,6 +4,7 @@ pub const RawManifest = struct {
     id: []const u8,
     name: []const u8,
     display_name: ?[]const u8 = null,
+    description: ?[]const u8 = null,
     version: []const u8,
     icons: []const []const u8 = &.{},
     platforms: []const []const u8 = &.{},
@@ -11,6 +12,7 @@ pub const RawManifest = struct {
     capabilities: []const []const u8 = &.{},
     bridge: RawBridge = .{},
     web_engine: []const u8 = @tagName(web_engine.default_engine),
+    theme: ?[]const u8 = null,
     cef: RawCef = .{},
     frontend: ?RawFrontend = null,
     security: RawSecurity = .{},
@@ -73,11 +75,33 @@ pub const RawWindow = struct {
     height: f32 = 480,
     x: ?f32 = null,
     y: ?f32 = null,
+    resizable: bool = true,
     restore_state: bool = true,
+    titlebar: []const u8 = "standard",
+    min_width: f32 = 0,
+    min_height: f32 = 0,
 };
 
 pub const RawShell = struct {
     windows: []const RawShellWindow = &.{},
+    chrome: RawShellChrome = .{},
+};
+
+pub const RawShellChrome = struct {
+    tabs: []const RawShellTab = &.{},
+    primary_action: ?RawShellPrimaryAction = null,
+};
+
+pub const RawShellTab = struct {
+    id: []const u8,
+    label: []const u8,
+    icon: []const u8 = "",
+};
+
+pub const RawShellPrimaryAction = struct {
+    id: []const u8,
+    label: []const u8,
+    icon: []const u8 = "",
 };
 
 pub const RawShellWindow = struct {
@@ -90,6 +114,9 @@ pub const RawShellWindow = struct {
     resizable: bool = true,
     restore_state: bool = true,
     restore_policy: []const u8 = "clamp_to_visible_screen",
+    titlebar: []const u8 = "standard",
+    min_width: f32 = 0,
+    min_height: f32 = 0,
     views: []const RawShellView = &.{},
 };
 
@@ -116,6 +143,12 @@ pub const RawShellView = struct {
     url: ?[]const u8 = null,
     text: ?[]const u8 = null,
     command: ?[]const u8 = null,
+    gpu_backend: ?[]const u8 = null,
+    gpu_pixel_format: ?[]const u8 = null,
+    gpu_present_mode: ?[]const u8 = null,
+    gpu_alpha_mode: ?[]const u8 = null,
+    gpu_color_space: ?[]const u8 = null,
+    gpu_vsync: ?bool = null,
 };
 
 pub const RawShortcut = struct {

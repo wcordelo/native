@@ -1,16 +1,31 @@
-# Agent Rules
+# Agent Guide
 
-## Releasing
+Guidance for agents (and humans) working on this repository.
 
-Releases are manual, single-PR affairs. The maintainer controls the changelog voice and format.
+## Build, test, and gate
 
-To prepare a release:
+```bash
+zig build test                # root engine + runtime suites
+zig build validate            # sample app.zon manifest check
+zig build test-example-<name> # one example's suite (e.g. test-example-notes)
+scripts/gate.sh fast [ref]    # affected-only local gate for your diff (default base: main)
+scripts/gate.sh full          # everything CI-shaped that runs locally
+```
 
-1. Create a branch (e.g. `prepare-v1.2.0`)
-2. Bump the version in `packages/zero-native/package.json`
-3. Run `npm --prefix packages/zero-native run version:sync` to update all version references
-4. Write the changelog entry in `CHANGELOG.md`, wrapped in `<!-- release:start -->` and `<!-- release:end -->` markers
-5. Remove the `<!-- release:start -->` and `<!-- release:end -->` markers from the previous release entry; only the latest release should have markers
-6. Open a PR and merge to `main`
+Run `scripts/gate.sh fast` before finishing any change; it maps your diff to the suites that cover it. The docs site checks with `pnpm --dir docs check` (the gate runs it only when `docs/` changed).
 
-CI compares the version in `packages/zero-native/package.json` to what's on npm. If it differs, it publishes the CLI package and creates the GitHub release automatically. If npm already has the version but the GitHub release is missing, CI creates the GitHub release from the marked changelog entry.
+Pinned goldens (pixel signatures, schema fingerprints, command counts) are updated deliberately: review the rendered output or the counted commands first, and keep the pin's comment a self-contained description of what the value represents.
+
+## Changelog
+
+Do not edit `CHANGELOG.md` directly. Each user-visible change ships a fragment in `changelog.d/` — see `changelog.d/README.md` for the format and voice. Internal-only polish needs no fragment.
+
+## Where things live
+
+- `src/` — the engine and runtime; `src/primitives/canvas/` holds the widget, markup, and vector core.
+- `examples/` — the showcase apps, most zero-config (`app.zon` + `src/`).
+- `docs/` — the documentation site; `docs/AGENTS.md` has its MDX conventions.
+- `skills/` and `skill-data/` — the agent skills the CLI ships (`native skills list`).
+- `tools/` and `scripts/` — dev tooling and the local gate.
+
+Releases are maintainer-run; see [RELEASING.md](./RELEASING.md).

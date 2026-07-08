@@ -1,0 +1,45 @@
+.{
+    .id = "dev.native_sdk.system_monitor",
+    .name = "system-monitor",
+    .display_name = "System Monitor",
+    .description = "Live CPU, memory, and process sampling on a native canvas.",
+    .version = "0.1.0",
+    .platforms = .{"macos"},
+    .permissions = .{ "view", "command" },
+    .capabilities = .{ "native_views", "gpu_surfaces", "shortcuts" },
+    .shortcuts = .{
+        // The standard settings shortcut (primary+comma): delivered as a
+        // command event and mapped to `.open_settings` in main.zig's
+        // `command` — the same code path the app-menu Settings item uses.
+        .{ .id = "monitor.settings", .key = ",", .modifiers = .{"primary"} },
+    },
+    .shell = .{
+        .windows = .{
+            .{
+                .label = "main",
+                .title = "System Monitor",
+                .width = 1144,
+                .height = 720,
+                // The tile grid is machined for exactly this content
+                // size; the floor stops the resize where clipping would
+                // begin (proven by the layout audit sweep).
+                .min_width = 1144,
+                .min_height = 720,
+                .restore_state = false,
+                .restore_policy = "center_on_primary",
+                .titlebar = "hidden_inset_tall",
+                .views = .{
+                    .{ .label = "monitor-canvas", .kind = "gpu_surface", .fill = true, .role = "System monitor canvas", .accessibility_label = "System monitor", .gpu_backend = "metal", .gpu_pixel_format = "bgra8_unorm", .gpu_present_mode = "timer", .gpu_alpha_mode = "opaque", .gpu_color_space = "srgb", .gpu_vsync = true },
+                },
+            },
+        },
+    },
+    .security = .{
+        .navigation = .{
+            .allowed_origins = .{ "zero://app", "zero://inline" },
+            .external_links = .{ .action = "deny" },
+        },
+    },
+    .web_engine = "system",
+    .cef = .{ .dir = "third_party/cef/macos", .auto_install = false },
+}

@@ -1,9 +1,8 @@
 .{
-    .id = "dev.zero_native.native_shell",
+    .id = "dev.native_sdk.native_shell",
     .name = "native-shell",
     .display_name = "Native Shell",
     .version = "0.1.0",
-    .icons = .{ "assets/icon.icns" },
     .platforms = .{ "macos", "linux" },
     .permissions = .{ "command", "view" },
     .capabilities = .{ "webview", "js_bridge", "native_views", "menus", "shortcuts" },
@@ -30,7 +29,7 @@
         .windows = .{
             .{
                 .label = "main",
-                .title = "zero-native Native Shell",
+                .title = "Native SDK Native Shell",
                 .width = 1100,
                 .height = 760,
                 .restore_policy = "center_on_primary",

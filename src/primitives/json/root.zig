@@ -125,16 +125,25 @@ pub fn parseStringValue(value: []const u8, storage: *StringStorage) ![]const u8 
 }
 
 pub fn writeString(writer: anytype, value: []const u8) !void {
+    try writeStringParts(writer, &.{value});
+}
+
+/// One JSON string from several byte slices (quote once, escape each
+/// part): lets callers serialize a composed string — an elided text
+/// line followed by its ellipsis — without concatenating buffers.
+pub fn writeStringParts(writer: anytype, parts: []const []const u8) !void {
     try writer.writeByte('"');
-    for (value) |ch| {
-        switch (ch) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            0...8, 11...12, 14...0x1f => try writer.print("\\u{x:0>4}", .{ch}),
-            else => try writer.writeByte(ch),
+    for (parts) |part| {
+        for (part) |ch| {
+            switch (ch) {
+                '"' => try writer.writeAll("\\\""),
+                '\\' => try writer.writeAll("\\\\"),
+                '\n' => try writer.writeAll("\\n"),
+                '\r' => try writer.writeAll("\\r"),
+                '\t' => try writer.writeAll("\\t"),
+                0...8, 11...12, 14...0x1f => try writer.print("\\u{x:0>4}", .{ch}),
+                else => try writer.writeByte(ch),
+            }
         }
     }
     try writer.writeByte('"');

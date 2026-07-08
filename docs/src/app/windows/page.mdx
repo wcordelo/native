@@ -1,6 +1,20 @@
 # Windows
 
-zero-native supports multiple windows. The main window is created automatically; secondary windows can be created from Zig or JavaScript.
+The Native SDK supports multiple windows. A native-rendered app declares its windows as a scene — `ShellWindow` entries carrying titles, sizes, restore behavior, and view trees, the shape [`UiApp`](/app-model) takes through its `scene` option and `app.zon` takes through the [`shell` block](/app-zon#shell):
+
+```zig
+const shell_windows = [_]native_sdk.ShellWindow{.{
+    .label = "main",
+    .title = "My App",
+    .width = 480,
+    .height = 320,
+    .restore_state = false,
+    .views = &shell_views,
+}};
+const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
+```
+
+The first scene window adopts the startup window; additional scene windows are created through the window service. Secondary windows can also be created imperatively from Zig — or, in apps that [embed web content](/frontend), from trusted JavaScript.
 
 ## Creating windows from Zig
 
@@ -8,7 +22,7 @@ zero-native supports multiple windows. The main window is created automatically;
 const info = try runtime.createWindow(.{
     .label = "tools",
     .title = "Tools",
-    .default_frame = zero_native.geometry.RectF.init(80, 80, 420, 320),
+    .default_frame = native_sdk.geometry.RectF.init(80, 80, 420, 320),
 });
 try runtime.focusWindow(info.id);
 ```
@@ -18,7 +32,7 @@ try runtime.focusWindow(info.id);
 `js_window_api` exposes the `window.zero.windows.*` helper in JavaScript. Window commands still require an allowed origin and the `window` permission when runtime permissions are configured:
 
 ```zig
-const app_permissions = [_][]const u8{zero_native.security.permission_window};
+const app_permissions = [_][]const u8{native_sdk.security.permission_window};
 
 .security = .{
     .permissions = &app_permissions,
@@ -145,6 +159,6 @@ When `saveWindow` is called, the store merges by matching on `label` or `id`, so
 
 ```zig
 .windows = .{
-    .{ .label = "main", .title = "zero-native", .width = 720, .height = 480, .restore_state = true },
+    .{ .label = "main", .title = "native-sdk", .width = 720, .height = 480, .restore_state = true },
 },
 ```

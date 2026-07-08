@@ -2,6 +2,7 @@
 
 #import <AppKit/AppKit.h>
 #import <CoreFoundation/CoreFoundation.h>
+#import <ImageIO/ImageIO.h>
 #import <Security/Security.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <crt_externs.h>
@@ -23,54 +24,58 @@
 #include <math.h>
 #include <map>
 
-#ifndef ZERO_NATIVE_CEF_DIR
-#define ZERO_NATIVE_CEF_DIR "third_party/cef/macos"
+#ifndef NATIVE_SDK_CEF_DIR
+#define NATIVE_SDK_CEF_DIR "third_party/cef/macos"
 #endif
 
-@class ZeroNativeChromiumHost;
+@class NativeSdkChromiumHost;
 
-@interface ZeroNativeChromiumApplication : NSApplication <CefAppProtocol>
+@interface NativeSdkChromiumApplication : NSApplication <CefAppProtocol>
 @property(nonatomic, assign) BOOL handlingSendEvent;
 @end
 
 namespace {
 
-static const char *kBridgeMessageName = "zero_native_bridge";
-static const char *kBridgeEnabledExtraInfo = "zeroNativeBridgeEnabled";
-static const uint32_t ZeroNativeShortcutModifierPrimary = 1u << 0;
-static const uint32_t ZeroNativeShortcutModifierCommand = 1u << 1;
-static const uint32_t ZeroNativeShortcutModifierControl = 1u << 2;
-static const uint32_t ZeroNativeShortcutModifierOption = 1u << 3;
-static const uint32_t ZeroNativeShortcutModifierShift = 1u << 4;
-static const char *ZeroNativeCefBridgeScript();
-static NSRect ZeroNativeConstrainFrame(NSRect frame);
-static NSString *ZeroNativeResolvedAssetRoot(NSString *rootPath);
-static NSURL *ZeroNativeAssetEntryFileURL(NSString *rootPath, NSString *entryPath);
-static NSString *ZeroNativeSafeAssetPath(NSURL *url, NSString *entryPath);
-static NSArray<NSString *> *ZeroNativePolicyListFromBytes(const char *bytes, size_t len, NSArray<NSString *> *fallback);
-static NSString *ZeroNativeAbsolutePath(NSString *path);
-static NSString *ZeroNativeExistingPath(NSString *path);
-static NSString *ZeroNativeCefFrameworkPath(void);
-static NSString *ZeroNativeOriginForURL(NSURL *url);
-static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url);
-static NSString *ZeroNativeShortcutKeyForEvent(NSEvent *event);
-static BOOL ZeroNativeShortcutUsesImplicitShift(NSString *key, NSEvent *event);
-static BOOL ZeroNativeShortcutModifiersMatch(uint32_t shortcutModifiers, NSEventModifierFlags eventModifiers, BOOL allowImplicitShift);
+static const char *kBridgeMessageName = "native_sdk_bridge";
+static const char *kBridgeEnabledExtraInfo = "nativeSdkBridgeEnabled";
+static const uint32_t NativeSdkShortcutModifierPrimary = 1u << 0;
+static const uint32_t NativeSdkShortcutModifierCommand = 1u << 1;
+static const uint32_t NativeSdkShortcutModifierControl = 1u << 2;
+static const uint32_t NativeSdkShortcutModifierOption = 1u << 3;
+static const uint32_t NativeSdkShortcutModifierShift = 1u << 4;
+static const char *NativeSdkCefBridgeScript();
+static NSRect NativeSdkConstrainFrame(NSRect frame);
+static NSString *NativeSdkResolvedAssetRoot(NSString *rootPath);
+static NSURL *NativeSdkAssetEntryFileURL(NSString *rootPath, NSString *entryPath);
+static NSString *NativeSdkSafeAssetPath(NSURL *url, NSString *entryPath);
+static NSArray<NSString *> *NativeSdkPolicyListFromBytes(const char *bytes, size_t len, NSArray<NSString *> *fallback);
+static NSString *NativeSdkAbsolutePath(NSString *path);
+static NSString *NativeSdkExistingPath(NSString *path);
+static NSString *NativeSdkCefFrameworkPath(void);
+static NSString *NativeSdkOriginForURL(NSURL *url);
+static BOOL NativeSdkPolicyListMatches(NSArray<NSString *> *values, NSURL *url);
+static NSString *NativeSdkShortcutKeyForEvent(NSEvent *event);
+static BOOL NativeSdkShortcutUsesImplicitShift(NSString *key, NSEvent *event);
+static BOOL NativeSdkShortcutModifiersMatch(uint32_t shortcutModifiers, NSEventModifierFlags eventModifiers, BOOL allowImplicitShift);
 
-static NSString *ZeroNativeStringFromBytes(const char *bytes, size_t len) {
+static NSString *NativeSdkStringFromBytes(const char *bytes, size_t len) {
     if (!bytes || len == 0) return nil;
     return [[NSString alloc] initWithBytes:bytes length:len encoding:NSUTF8StringEncoding];
 }
 
-static NSString *ZeroNativePasteboardTypeForMime(const char *mime_type, size_t mime_type_len) {
-    NSString *mime = ZeroNativeStringFromBytes(mime_type, mime_type_len).lowercaseString;
+static uint64_t NativeSdkChromiumTimestampNanoseconds(void) {
+    return (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000000000.0);
+}
+
+static NSString *NativeSdkPasteboardTypeForMime(const char *mime_type, size_t mime_type_len) {
+    NSString *mime = NativeSdkStringFromBytes(mime_type, mime_type_len).lowercaseString;
     if ([mime isEqualToString:@"text"] || [mime isEqualToString:@"text/plain"]) return NSPasteboardTypeString;
     if ([mime isEqualToString:@"text/html"]) return NSPasteboardTypeHTML;
     if ([mime isEqualToString:@"text/rtf"] || [mime isEqualToString:@"application/rtf"]) return NSPasteboardTypeRTF;
     return nil;
 }
 
-static NSMutableDictionary *ZeroNativeCredentialQuery(NSString *service, NSString *account) {
+static NSMutableDictionary *NativeSdkCredentialQuery(NSString *service, NSString *account) {
     return [@{
         (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
         (__bridge id)kSecAttrService: service,
@@ -78,7 +83,7 @@ static NSMutableDictionary *ZeroNativeCredentialQuery(NSString *service, NSStrin
     } mutableCopy];
 }
 
-class ZeroNativeCefBridgeV8Handler final : public CefV8Handler {
+class NativeSdkCefBridgeV8Handler final : public CefV8Handler {
 public:
     bool Execute(const CefString& name, CefRefPtr<CefV8Value> object, const CefV8ValueList& arguments, CefRefPtr<CefV8Value>& retval, CefString& exception) override {
         (void)object;
@@ -89,18 +94,18 @@ public:
             retval = CefV8Value::CreateBool(true);
             return true;
         }
-        exception = "Invalid zero-native bridge message";
+        exception = "Invalid native-sdk bridge message";
         return true;
     }
 
 private:
-    IMPLEMENT_REFCOUNTING(ZeroNativeCefBridgeV8Handler);
+    IMPLEMENT_REFCOUNTING(NativeSdkCefBridgeV8Handler);
 };
 
-class ZeroNativeCefClient final : public CefClient, public CefLifeSpanHandler, public CefLoadHandler, public CefRequestHandler {
+class NativeSdkCefClient final : public CefClient, public CefLifeSpanHandler, public CefLoadHandler, public CefRequestHandler {
 public:
-    explicit ZeroNativeCefClient(ZeroNativeChromiumHost *host, uint64_t window_id) : host_(host), window_id_(window_id) {}
-    ZeroNativeCefClient(ZeroNativeChromiumHost *host, uint64_t window_id, std::string webview_key, uint64_t webview_generation, bool bridge_enabled) : host_(host), window_id_(window_id), webview_key_(webview_key), webview_generation_(webview_generation), bridge_enabled_(bridge_enabled) {}
+    explicit NativeSdkCefClient(NativeSdkChromiumHost *host, uint64_t window_id) : host_(host), window_id_(window_id) {}
+    NativeSdkCefClient(NativeSdkChromiumHost *host, uint64_t window_id, std::string webview_key, uint64_t webview_generation, bool bridge_enabled) : host_(host), window_id_(window_id), webview_key_(webview_key), webview_generation_(webview_generation), bridge_enabled_(bridge_enabled) {}
 
     CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override {
         return this;
@@ -126,17 +131,17 @@ public:
     }
 
 private:
-    ZeroNativeChromiumHost *host_;
+    NativeSdkChromiumHost *host_;
     uint64_t window_id_;
     std::string webview_key_;
     uint64_t webview_generation_ = 0;
     bool bridge_enabled_ = true;
-    IMPLEMENT_REFCOUNTING(ZeroNativeCefClient);
+    IMPLEMENT_REFCOUNTING(NativeSdkCefClient);
 };
 
-class ZeroNativeCefApp final : public CefApp, public CefRenderProcessHandler {
+class NativeSdkCefApp final : public CefApp, public CefRenderProcessHandler {
 public:
-    ZeroNativeCefApp() = default;
+    NativeSdkCefApp() = default;
 
     void OnBeforeCommandLineProcessing(const CefString& process_type, CefRefPtr<CefCommandLine> command_line) override {
         (void)process_type;
@@ -167,17 +172,17 @@ public:
         const auto found = browser ? bridge_enabled_by_browser_id_.find(browser->GetIdentifier()) : bridge_enabled_by_browser_id_.end();
         if (found == bridge_enabled_by_browser_id_.end() || !found->second) return;
         CefRefPtr<CefV8Value> bridge = CefV8Value::CreateObject(nullptr, nullptr);
-        bridge->SetValue("postMessage", CefV8Value::CreateFunction("postMessage", new ZeroNativeCefBridgeV8Handler()), V8_PROPERTY_ATTRIBUTE_READONLY);
-        context->GetGlobal()->SetValue("zeroNativeCefBridge", bridge, V8_PROPERTY_ATTRIBUTE_READONLY);
-        frame->ExecuteJavaScript(CefString(ZeroNativeCefBridgeScript()), frame->GetURL(), 0);
+        bridge->SetValue("postMessage", CefV8Value::CreateFunction("postMessage", new NativeSdkCefBridgeV8Handler()), V8_PROPERTY_ATTRIBUTE_READONLY);
+        context->GetGlobal()->SetValue("nativeSdkCefBridge", bridge, V8_PROPERTY_ATTRIBUTE_READONLY);
+        frame->ExecuteJavaScript(CefString(NativeSdkCefBridgeScript()), frame->GetURL(), 0);
     }
 
 private:
     std::map<int, bool> bridge_enabled_by_browser_id_;
-    IMPLEMENT_REFCOUNTING(ZeroNativeCefApp);
+    IMPLEMENT_REFCOUNTING(NativeSdkCefApp);
 };
 
-static CefRefPtr<CefDictionaryValue> ZeroNativeCefExtraInfo(bool bridge_enabled) {
+static CefRefPtr<CefDictionaryValue> NativeSdkCefExtraInfo(bool bridge_enabled) {
     CefRefPtr<CefDictionaryValue> extra_info = CefDictionaryValue::Create();
     extra_info->SetBool(kBridgeEnabledExtraInfo, bridge_enabled);
     return extra_info;
@@ -208,17 +213,17 @@ static void ensureCefInitialized() {
     }
 
     CefMainArgs args(*_NSGetArgc(), *_NSGetArgv());
-    CefRefPtr<ZeroNativeCefApp> app = new ZeroNativeCefApp();
+    CefRefPtr<NativeSdkCefApp> app = new NativeSdkCefApp();
     const int exit_code = CefExecuteProcess(args, app, nullptr);
     if (exit_code >= 0) exit(exit_code);
 
     CefSettings settings;
     settings.no_sandbox = true;
     settings.multi_threaded_message_loop = false;
-    NSString *frameworkPath = ZeroNativeCefFrameworkPath();
+    NSString *frameworkPath = NativeSdkCefFrameworkPath();
     NSString *resourcesPath = [frameworkPath stringByAppendingPathComponent:@"Resources"];
     NSString *appSupport = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject ?: NSTemporaryDirectory();
-    NSString *cefDataRoot = [appSupport stringByAppendingPathComponent:@"zero-native/CEF"];
+    NSString *cefDataRoot = [appSupport stringByAppendingPathComponent:@"native-sdk/CEF"];
     NSString *cefCachePath = [cefDataRoot stringByAppendingPathComponent:@"Default"];
     [[NSFileManager defaultManager] createDirectoryAtPath:cefCachePath withIntermediateDirectories:YES attributes:nil error:nil];
     NSString *executablePath = [NSBundle mainBundle].executablePath ?: [[[NSProcessInfo processInfo] arguments] firstObject];
@@ -237,17 +242,17 @@ static void ensureCefInitialized() {
 }
 
 static NSString *temporaryHtmlUrl(NSString *html) {
-    NSString *filename = [NSString stringWithFormat:@"zero-native-cef-%@.html", [[NSUUID UUID] UUIDString]];
+    NSString *filename = [NSString stringWithFormat:@"native-sdk-cef-%@.html", [[NSUUID UUID] UUIDString]];
     NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:filename];
     NSError *error = nil;
     if (![html writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&error]) {
-        NSLog(@"zero-native: failed to write temporary CEF HTML file: %@", error);
+        NSLog(@"native-sdk: failed to write temporary CEF HTML file: %@", error);
         return @"about:blank";
     }
     return [NSURL fileURLWithPath:path].absoluteString;
 }
 
-static NSString *ZeroNativeResolvedAssetRoot(NSString *rootPath) {
+static NSString *NativeSdkResolvedAssetRoot(NSString *rootPath) {
     if (rootPath.length == 0 || [rootPath isEqualToString:@"."]) {
         return [NSBundle mainBundle].resourcePath ?: [[NSFileManager defaultManager] currentDirectoryPath];
     }
@@ -259,15 +264,15 @@ static NSString *ZeroNativeResolvedAssetRoot(NSString *rootPath) {
     return [[[NSFileManager defaultManager] currentDirectoryPath] stringByAppendingPathComponent:rootPath];
 }
 
-static NSURL *ZeroNativeAssetEntryFileURL(NSString *rootPath, NSString *entryPath) {
+static NSURL *NativeSdkAssetEntryFileURL(NSString *rootPath, NSString *entryPath) {
     NSString *entry = entryPath.length > 0 ? entryPath : @"index.html";
     while ([entry hasPrefix:@"/"]) {
         entry = [entry substringFromIndex:1];
     }
-    return [NSURL fileURLWithPath:[ZeroNativeResolvedAssetRoot(rootPath ?: @"") stringByAppendingPathComponent:entry]];
+    return [NSURL fileURLWithPath:[NativeSdkResolvedAssetRoot(rootPath ?: @"") stringByAppendingPathComponent:entry]];
 }
 
-static BOOL ZeroNativePathHasUnsafeSegment(NSString *path) {
+static BOOL NativeSdkPathHasUnsafeSegment(NSString *path) {
     for (NSString *segment in [path componentsSeparatedByString:@"/"]) {
         if (segment.length == 0) continue;
         if ([segment isEqualToString:@"."] || [segment isEqualToString:@".."]) return YES;
@@ -276,7 +281,7 @@ static BOOL ZeroNativePathHasUnsafeSegment(NSString *path) {
     return NO;
 }
 
-static NSString *ZeroNativeSafeAssetPath(NSURL *url, NSString *entryPath) {
+static NSString *NativeSdkSafeAssetPath(NSURL *url, NSString *entryPath) {
     if (!url) return nil;
     NSString *path = url.path.stringByRemovingPercentEncoding ?: url.path;
     if (path.length == 0 || [path isEqualToString:@"/"]) return entryPath.length > 0 ? entryPath : @"index.html";
@@ -284,34 +289,34 @@ static NSString *ZeroNativeSafeAssetPath(NSURL *url, NSString *entryPath) {
         path = [path substringFromIndex:1];
     }
     if (path.length == 0) return entryPath.length > 0 ? entryPath : @"index.html";
-    if (ZeroNativePathHasUnsafeSegment(path)) return nil;
+    if (NativeSdkPathHasUnsafeSegment(path)) return nil;
     return path;
 }
 
-static NSString *ZeroNativeAbsolutePath(NSString *path) {
+static NSString *NativeSdkAbsolutePath(NSString *path) {
     if (path.length == 0) return [[NSFileManager defaultManager] currentDirectoryPath];
     if (path.isAbsolutePath) return path;
     return [[[NSFileManager defaultManager] currentDirectoryPath] stringByAppendingPathComponent:path];
 }
 
-static NSString *ZeroNativeExistingPath(NSString *path) {
+static NSString *NativeSdkExistingPath(NSString *path) {
     if (path.length == 0) return nil;
     return [[NSFileManager defaultManager] fileExistsAtPath:path] ? path : nil;
 }
 
-static NSString *ZeroNativeCefFrameworkPath(void) {
+static NSString *NativeSdkCefFrameworkPath(void) {
     NSBundle *bundle = [NSBundle mainBundle];
     NSString *bundleFramework = [[bundle privateFrameworksPath] stringByAppendingPathComponent:@"Chromium Embedded Framework.framework"];
-    if (ZeroNativeExistingPath(bundleFramework)) return bundleFramework;
+    if (NativeSdkExistingPath(bundleFramework)) return bundleFramework;
 
     NSString *bundleContentsFramework = [[bundle.bundlePath stringByAppendingPathComponent:@"Contents/Frameworks"] stringByAppendingPathComponent:@"Chromium Embedded Framework.framework"];
-    if (ZeroNativeExistingPath(bundleContentsFramework)) return bundleContentsFramework;
+    if (NativeSdkExistingPath(bundleContentsFramework)) return bundleContentsFramework;
 
-    NSString *devRoot = ZeroNativeAbsolutePath(@ZERO_NATIVE_CEF_DIR);
+    NSString *devRoot = NativeSdkAbsolutePath(@NATIVE_SDK_CEF_DIR);
     return [devRoot stringByAppendingPathComponent:@"Release/Chromium Embedded Framework.framework"];
 }
 
-static NSRect ZeroNativeConstrainFrame(NSRect frame) {
+static NSRect NativeSdkConstrainFrame(NSRect frame) {
     NSScreen *screen = [NSScreen mainScreen];
     if (!screen) return frame;
     NSRect visible = screen.visibleFrame;
@@ -324,16 +329,16 @@ static NSRect ZeroNativeConstrainFrame(NSRect frame) {
     return frame;
 }
 
-static const char *ZeroNativeCefBridgeScript() {
+static const char *NativeSdkCefBridgeScript() {
     return "(function(){"
         "if(window.zero&&window.zero.invoke){return;}"
         "var pending=new Map();"
         "var listeners=new Map();"
         "var nextId=1;"
         "function post(message){"
-        "if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.zeroNativeBridge){window.webkit.messageHandlers.zeroNativeBridge.postMessage(message);return;}"
-        "if(window.zeroNativeCefBridge&&window.zeroNativeCefBridge.postMessage){window.zeroNativeCefBridge.postMessage(message);return;}"
-        "throw new Error('zero-native bridge transport is unavailable');"
+        "if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.nativeSdkBridge){window.webkit.messageHandlers.nativeSdkBridge.postMessage(message);return;}"
+        "if(window.nativeSdkCefBridge&&window.nativeSdkCefBridge.postMessage){window.nativeSdkCefBridge.postMessage(message);return;}"
+        "throw new Error('native-sdk bridge transport is unavailable');"
         "}"
         "function complete(response){"
         "var id=response&&response.id!=null?String(response.id):'';"
@@ -376,69 +381,69 @@ static const char *ZeroNativeCefBridgeScript() {
         "function viewHandle(info){return Object.freeze(Object.assign({},info,{update:function(patch){return views.update(Object.assign({},patch||{},{label:info.label,windowId:info.windowId}));},setFrame:function(frame){return views.setFrame({label:info.label,windowId:info.windowId,frame:frame});},setVisible:function(visible){return views.setVisible({label:info.label,windowId:info.windowId,visible:visible});},focus:function(){return views.focus({label:info.label,windowId:info.windowId});},close:function(){return views.close({label:info.label,windowId:info.windowId});}}));}"
         "function on(name,callback){if(typeof callback!=='function'){throw new TypeError('callback must be a function');}var set=listeners.get(name);if(!set){set=new Set();listeners.set(name,set);}set.add(callback);return function(){off(name,callback);};}"
         "function off(name,callback){var set=listeners.get(name);if(set){set.delete(callback);if(set.size===0){listeners.delete(name);}}}"
-        "function emit(name,detail){var set=listeners.get(name);if(set){Array.from(set).forEach(function(callback){callback(detail);});}window.dispatchEvent(new CustomEvent('zero-native:'+name,{detail:detail}));}"
+        "function emit(name,detail){var set=listeners.get(name);if(set){Array.from(set).forEach(function(callback){callback(detail);});}window.dispatchEvent(new CustomEvent('native-sdk:'+name,{detail:detail}));}"
         "var commands=Object.freeze({"
-        "invoke:function(value){return invoke('zero-native.command.invoke',commandPayload(value));},"
-        "list:function(){return invoke('zero-native.command.list',{});}"
+        "invoke:function(value){return invoke('native-sdk.command.invoke',commandPayload(value));},"
+        "list:function(){return invoke('native-sdk.command.list',{});}"
         "});"
         "var windows=Object.freeze({"
-        "create:function(options){return invoke('zero-native.window.create',options||{});},"
-        "list:function(){return invoke('zero-native.window.list',{});},"
-        "focus:function(value){return invoke('zero-native.window.focus',selector(value));},"
-        "close:function(value){return invoke('zero-native.window.close',selector(value));}"
+        "create:function(options){return invoke('native-sdk.window.create',options||{});},"
+        "list:function(){return invoke('native-sdk.window.list',{});},"
+        "focus:function(value){return invoke('native-sdk.window.focus',selector(value));},"
+        "close:function(value){return invoke('native-sdk.window.close',selector(value));}"
         "});"
         "var dialogs=Object.freeze({"
-        "openFile:function(options){return invoke('zero-native.dialog.openFile',options||{});},"
-        "saveFile:function(options){return invoke('zero-native.dialog.saveFile',options||{});},"
-        "showMessage:function(options){return invoke('zero-native.dialog.showMessage',options||{});}"
+        "openFile:function(options){return invoke('native-sdk.dialog.openFile',options||{});},"
+        "saveFile:function(options){return invoke('native-sdk.dialog.saveFile',options||{});},"
+        "showMessage:function(options){return invoke('native-sdk.dialog.showMessage',options||{});}"
         "});"
         "function clipboardReadPayload(value){value=value||{};return {mimeType:ensureString(value.mimeType||value.type||'text/plain','mimeType')};}"
         "function clipboardWritePayload(value){if(typeof value==='string'){return {mimeType:'text/plain',data:value};}value=value||{};var data=value.data!=null?value.data:(value.text!=null?value.text:value.value);return {mimeType:ensureString(value.mimeType||value.type||'text/plain','mimeType'),data:ensureText(data,'data')};}"
         "var clipboard=Object.freeze({"
-        "readText:function(){return invoke('zero-native.clipboard.readText',{});},"
-        "writeText:function(value){var text=typeof value==='string'?value:(value||{}).text;return invoke('zero-native.clipboard.writeText',{text:ensureText(text,'text')});},"
-        "read:function(value){return invoke('zero-native.clipboard.read',clipboardReadPayload(value));},"
-        "write:function(value){return invoke('zero-native.clipboard.write',clipboardWritePayload(value));}"
+        "readText:function(){return invoke('native-sdk.clipboard.readText',{});},"
+        "writeText:function(value){var text=typeof value==='string'?value:(value||{}).text;return invoke('native-sdk.clipboard.writeText',{text:ensureText(text,'text')});},"
+        "read:function(value){return invoke('native-sdk.clipboard.read',clipboardReadPayload(value));},"
+        "write:function(value){return invoke('native-sdk.clipboard.write',clipboardWritePayload(value));}"
         "});"
         "var os=Object.freeze({"
-        "openUrl:function(value){var options=typeof value==='string'?{url:value}:(value||{});return invoke('zero-native.os.openUrl',{url:ensureString(options.url,'url')});},"
-        "showNotification:function(value){var options=typeof value==='string'?{title:value}:(value||{});var payload={title:ensureString(options.title,'title')};if(options.subtitle!=null){payload.subtitle=ensureString(options.subtitle,'subtitle');}if(options.body!=null){payload.body=ensureString(options.body,'body');}return invoke('zero-native.os.showNotification',payload);},"
-        "revealPath:function(value){var options=typeof value==='string'?{path:value}:(value||{});return invoke('zero-native.os.revealPath',{path:ensureString(options.path,'path')});},"
-        "addRecentDocument:function(value){var options=typeof value==='string'?{path:value}:(value||{});return invoke('zero-native.os.addRecentDocument',{path:ensureString(options.path,'path')});},"
-        "clearRecentDocuments:function(){return invoke('zero-native.os.clearRecentDocuments',{});}"
+        "openUrl:function(value){var options=typeof value==='string'?{url:value}:(value||{});return invoke('native-sdk.os.openUrl',{url:ensureString(options.url,'url')});},"
+        "showNotification:function(value){var options=typeof value==='string'?{title:value}:(value||{});var payload={title:ensureString(options.title,'title')};if(options.subtitle!=null){payload.subtitle=ensureString(options.subtitle,'subtitle');}if(options.body!=null){payload.body=ensureString(options.body,'body');}return invoke('native-sdk.os.showNotification',payload);},"
+        "revealPath:function(value){var options=typeof value==='string'?{path:value}:(value||{});return invoke('native-sdk.os.revealPath',{path:ensureString(options.path,'path')});},"
+        "addRecentDocument:function(value){var options=typeof value==='string'?{path:value}:(value||{});return invoke('native-sdk.os.addRecentDocument',{path:ensureString(options.path,'path')});},"
+        "clearRecentDocuments:function(){return invoke('native-sdk.os.clearRecentDocuments',{});}"
         "});"
         "function credentialPayload(value){value=value||{};return {service:ensureString(value.service,'service'),account:ensureString(value.account,'account')};}"
         "function credentialSetPayload(value){var payload=credentialPayload(value);payload.secret=ensureString(value.secret!=null?value.secret:value.value,'secret');return payload;}"
         "var credentials=Object.freeze({"
-        "set:function(value){return invoke('zero-native.credentials.set',credentialSetPayload(value));},"
-        "get:function(value){return invoke('zero-native.credentials.get',credentialPayload(value));},"
-        "delete:function(value){return invoke('zero-native.credentials.delete',credentialPayload(value));}"
+        "set:function(value){return invoke('native-sdk.credentials.set',credentialSetPayload(value));},"
+        "get:function(value){return invoke('native-sdk.credentials.get',credentialPayload(value));},"
+        "delete:function(value){return invoke('native-sdk.credentials.delete',credentialPayload(value));}"
         "});"
         "function platformFeaturePayload(value){if(typeof value==='string'){return {feature:ensureString(value,'feature')};}value=value||{};return {feature:ensureString(value.feature!=null?value.feature:value.name,'feature')};}"
         "var platform=Object.freeze({"
-        "supports:function(value){return invoke('zero-native.platform.supports',platformFeaturePayload(value));}"
+        "supports:function(value){return invoke('native-sdk.platform.supports',platformFeaturePayload(value));}"
         "});"
         "function zoomPayload(options){options=options||{};validateWebViewSelector(options);return {label:options.label,windowId:options.windowId,zoom:ensureNumber(options.zoom,'zoom')};}"
         "function layerPayload(options){options=options||{};validateWebViewSelector(options);return {label:options.label,windowId:options.windowId,layer:ensureNumber(options.layer,'layer')};}"
         "var webviews=Object.freeze({"
-        "create:function(options){return invoke('zero-native.webview.create',createPayload(options)).then(webviewHandle);},"
-        "list:function(){return invoke('zero-native.webview.list',{});},"
-        "setFrame:function(options){return invoke('zero-native.webview.setFrame',framePayload(options));},"
-        "navigate:function(options){return invoke('zero-native.webview.navigate',navigatePayload(options));},"
-        "setZoom:function(options){return invoke('zero-native.webview.setZoom',zoomPayload(options));},"
-        "setLayer:function(options){return invoke('zero-native.webview.setLayer',layerPayload(options));},"
-        "close:function(options){return invoke('zero-native.webview.close',closePayload(options));}"
+        "create:function(options){return invoke('native-sdk.webview.create',createPayload(options)).then(webviewHandle);},"
+        "list:function(){return invoke('native-sdk.webview.list',{});},"
+        "setFrame:function(options){return invoke('native-sdk.webview.setFrame',framePayload(options));},"
+        "navigate:function(options){return invoke('native-sdk.webview.navigate',navigatePayload(options));},"
+        "setZoom:function(options){return invoke('native-sdk.webview.setZoom',zoomPayload(options));},"
+        "setLayer:function(options){return invoke('native-sdk.webview.setLayer',layerPayload(options));},"
+        "close:function(options){return invoke('native-sdk.webview.close',closePayload(options));}"
         "});"
         "var views=Object.freeze({"
-        "create:function(options){return invoke('zero-native.view.create',viewCreatePayload(options)).then(viewHandle);},"
-        "list:function(){return invoke('zero-native.view.list',{});},"
-        "update:function(options,patch){if(typeof options==='string'){return invoke('zero-native.view.update',viewPatchPayload(Object.assign({},patch||{},{label:options}))).then(viewHandle);}return invoke('zero-native.view.update',viewPatchPayload(options)).then(viewHandle);},"
-        "setFrame:function(options){return invoke('zero-native.view.setFrame',viewFramePayload(options)).then(viewHandle);},"
-        "setVisible:function(options){return invoke('zero-native.view.setVisible',viewVisiblePayload(options)).then(viewHandle);},"
-        "focus:function(options){return invoke('zero-native.view.focus',viewSelectorPayload(options)).then(viewHandle);},"
-        "focusNext:function(options){options=options||{};return invoke('zero-native.view.focusNext',{windowId:options.windowId}).then(viewHandle);},"
-        "focusPrevious:function(options){options=options||{};return invoke('zero-native.view.focusPrevious',{windowId:options.windowId}).then(viewHandle);},"
-        "close:function(options){return invoke('zero-native.view.close',viewSelectorPayload(options));}"
+        "create:function(options){return invoke('native-sdk.view.create',viewCreatePayload(options)).then(viewHandle);},"
+        "list:function(){return invoke('native-sdk.view.list',{});},"
+        "update:function(options,patch){if(typeof options==='string'){return invoke('native-sdk.view.update',viewPatchPayload(Object.assign({},patch||{},{label:options}))).then(viewHandle);}return invoke('native-sdk.view.update',viewPatchPayload(options)).then(viewHandle);},"
+        "setFrame:function(options){return invoke('native-sdk.view.setFrame',viewFramePayload(options)).then(viewHandle);},"
+        "setVisible:function(options){return invoke('native-sdk.view.setVisible',viewVisiblePayload(options)).then(viewHandle);},"
+        "focus:function(options){return invoke('native-sdk.view.focus',viewSelectorPayload(options)).then(viewHandle);},"
+        "focusNext:function(options){options=options||{};return invoke('native-sdk.view.focusNext',{windowId:options.windowId}).then(viewHandle);},"
+        "focusPrevious:function(options){options=options||{};return invoke('native-sdk.view.focusPrevious',{windowId:options.windowId}).then(viewHandle);},"
+        "close:function(options){return invoke('native-sdk.view.close',viewSelectorPayload(options));}"
         "});"
         "Object.defineProperty(window,'zero',{value:Object.freeze({invoke:invoke,on:on,off:off,commands:commands,windows:windows,dialogs:dialogs,clipboard:clipboard,os:os,credentials:credentials,platform:platform,webviews:webviews,views:views,_complete:complete,_emit:emit}),configurable:false});"
         "})();";
@@ -446,7 +451,7 @@ static const char *ZeroNativeCefBridgeScript() {
 
 } // namespace
 
-@implementation ZeroNativeChromiumApplication
+@implementation NativeSdkChromiumApplication
 
 - (BOOL)isHandlingSendEvent {
     return self.handlingSendEvent;
@@ -463,24 +468,44 @@ static const char *ZeroNativeCefBridgeScript() {
 
 @end
 
-@interface ZeroNativeChromiumWindowDelegate : NSObject <NSWindowDelegate>
-@property(nonatomic, assign) ZeroNativeChromiumHost *host;
+@interface NativeSdkChromiumWindowDelegate : NSObject <NSWindowDelegate>
+@property(nonatomic, assign) NativeSdkChromiumHost *host;
 @property(nonatomic, assign) uint64_t windowId;
+/// Set for tall-titlebar windows, whose delegate KVO-observes the
+/// window's `contentLayoutRect` (chrome re-query timing) and must
+/// unregister before the window closes.
+@property(nonatomic, assign) BOOL observesContentLayout;
 @end
 
-@interface ZeroNativeChromiumShortcut : NSObject
+@interface NativeSdkChromiumShortcut : NSObject
 @property(nonatomic, strong) NSString *identifier;
 @property(nonatomic, strong) NSString *key;
 @property(nonatomic, assign) uint32_t modifiers;
 @end
 
-@interface ZeroNativeChromiumHost : NSObject
+/* Captures the selected item id of a context-menu popUp (NSMenuItem
+ * targets are weak; the presenter block keeps this alive). */
+@interface NativeSdkChromiumContextMenuTarget : NSObject
+@property(nonatomic, assign) uint32_t selectedItemId;
+- (void)contextMenuItemClicked:(NSMenuItem *)item;
+@end
+
+@implementation NativeSdkChromiumContextMenuTarget
+
+- (void)contextMenuItemClicked:(NSMenuItem *)item {
+    NSNumber *value = item.representedObject;
+    if ([value isKindOfClass:[NSNumber class]]) self.selectedItemId = value.unsignedIntValue;
+}
+
+@end
+
+@interface NativeSdkChromiumHost : NSObject
 @property(nonatomic, strong) NSWindow *window;
 @property(nonatomic, strong) NSView *browserContainer;
-@property(nonatomic, strong) ZeroNativeChromiumWindowDelegate *delegate;
+@property(nonatomic, strong) NativeSdkChromiumWindowDelegate *delegate;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSWindow *> *windows;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSView *> *browserContainers;
-@property(nonatomic, strong) NSMutableDictionary<NSNumber *, ZeroNativeChromiumWindowDelegate *> *delegates;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, NativeSdkChromiumWindowDelegate *> *delegates;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *bridgeOrigins;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *internalURLPrefixes;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *assetRoots;
@@ -495,37 +520,50 @@ static const char *ZeroNativeCefBridgeScript() {
 @property(nonatomic, strong) NSMutableSet<NSString *> *closingWebViewKeys;
 @property(nonatomic, assign) uint64_t nextWebViewGeneration;
 @property(nonatomic, strong) NSTimer *timer;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSTimer *> *appTimers;
 @property(nonatomic, strong) NSString *appName;
-@property(nonatomic, assign) zero_native_appkit_event_callback_t callback;
-@property(nonatomic, assign) zero_native_appkit_bridge_callback_t bridgeCallback;
+/* The human-facing app name (app.zon display_name, empty = appName):
+ * drives the application menu title and its About/Hide/Quit labels, the
+ * process name, and the About panel. */
+@property(nonatomic, strong) NSString *displayName;
+/* app.zon version and description for the About panel; empty when
+ * undeclared. */
+@property(nonatomic, strong) NSString *appVersion;
+@property(nonatomic, strong) NSString *aboutDescription;
+@property(nonatomic, assign) native_sdk_appkit_event_callback_t callback;
+@property(nonatomic, assign) native_sdk_appkit_bridge_callback_t bridgeCallback;
 @property(nonatomic, assign) void *context;
 @property(nonatomic, assign) void *bridgeContext;
 @property(nonatomic, assign) BOOL didShutdown;
 @property(nonatomic, assign) BOOL observesApplicationActivation;
 @property(nonatomic, strong) id shortcutEventMonitor;
-@property(nonatomic, strong) NSArray<ZeroNativeChromiumShortcut *> *shortcuts;
+@property(nonatomic, strong) NSArray<NativeSdkChromiumShortcut *> *shortcuts;
 @property(nonatomic, strong) NSStatusItem *statusItem;
-@property(nonatomic, assign) zero_native_appkit_tray_callback_t trayCallback;
+@property(nonatomic, assign) native_sdk_appkit_tray_callback_t trayCallback;
 @property(nonatomic, assign) void *trayContext;
-@property(nonatomic) CefRefPtr<ZeroNativeCefClient> cefClient;
+@property(nonatomic) CefRefPtr<NativeSdkCefClient> cefClient;
 @property(nonatomic) CefRefPtr<CefBrowser> browser;
-@property(nonatomic, assign) std::map<uint64_t, CefRefPtr<ZeroNativeCefClient>> *cefClients;
+@property(nonatomic, assign) std::map<uint64_t, CefRefPtr<NativeSdkCefClient>> *cefClients;
 @property(nonatomic, assign) std::map<uint64_t, CefRefPtr<CefBrowser>> *browsers;
-@property(nonatomic, assign) std::map<std::string, CefRefPtr<ZeroNativeCefClient>> *webviewCefClients;
+@property(nonatomic, assign) std::map<std::string, CefRefPtr<NativeSdkCefClient>> *webviewCefClients;
 @property(nonatomic, assign) std::map<std::string, CefRefPtr<CefBrowser>> *webviewBrowsers;
 @property(nonatomic, strong) NSArray<NSString *> *allowedNavigationOrigins;
 @property(nonatomic, strong) NSArray<NSString *> *allowedExternalURLs;
 @property(nonatomic, assign) NSInteger externalLinkAction;
-- (instancetype)initWithAppName:(NSString *)appName title:(NSString *)title width:(double)width height:(double)height;
+- (instancetype)initWithAppName:(NSString *)appName displayName:(NSString *)displayName version:(NSString *)version aboutDescription:(NSString *)aboutDescription title:(NSString *)title width:(double)width height:(double)height;
 - (void)configureApplication;
 - (void)buildMenuBar;
 - (NSMenuItem *)menuItem:(NSString *)title action:(SEL)action key:(NSString *)key modifiers:(NSEventModifierFlags)modifiers;
-- (BOOL)createWindowWithId:(uint64_t)windowId title:(NSString *)title label:(NSString *)label x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame makeMain:(BOOL)makeMain;
+- (BOOL)createWindowWithId:(uint64_t)windowId title:(NSString *)title label:(NSString *)label x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame resizable:(BOOL)resizable makeMain:(BOOL)makeMain;
 - (void)focusWindowWithId:(uint64_t)windowId;
 - (void)closeWindowWithId:(uint64_t)windowId;
-- (void)runWithCallback:(zero_native_appkit_event_callback_t)callback context:(void *)context;
+- (void)runWithCallback:(native_sdk_appkit_event_callback_t)callback context:(void *)context;
 - (void)stop;
-- (void)emitEvent:(zero_native_appkit_event_t)event;
+- (void)emitEvent:(native_sdk_appkit_event_t)event;
+- (void)startAppTimerWithId:(uint64_t)timerId intervalNs:(uint64_t)intervalNs repeats:(BOOL)repeats;
+- (void)cancelAppTimerWithId:(uint64_t)timerId;
+- (void)invalidateAppTimers;
+- (void)wakeFromAnyThread;
 - (void)startApplicationActivationObservers;
 - (void)stopApplicationActivationObservers;
 - (void)applicationDidBecomeActive:(NSNotification *)notification;
@@ -570,10 +608,10 @@ static const char *ZeroNativeCefBridgeScript() {
 - (void)trayMenuItemClicked:(NSMenuItem *)menuItem;
 @end
 
-@implementation ZeroNativeChromiumShortcut
+@implementation NativeSdkChromiumShortcut
 @end
 
-@implementation ZeroNativeChromiumWindowDelegate
+@implementation NativeSdkChromiumWindowDelegate
 
 - (void)windowDidResize:(NSNotification *)notification {
     (void)notification;
@@ -591,8 +629,59 @@ static const char *ZeroNativeCefBridgeScript() {
     [self.host emitWindowFrameForWindowId:self.windowId open:YES];
 }
 
+// Mirror of the AppKit host: the tall-titlebar toolbar is pure geometry,
+// and fullscreen would otherwise keep it visible as a blank band over
+// the app's own header. DID notifications, not WILL — the system
+// snapshots and restores toolbar visibility across the transition and
+// stomps changes made at the WILL edge; the re-emitted resize makes the
+// runtime re-query chrome insets after the toggle.
+// Same discipline as the AppKit host: the tall-titlebar toolbar is pure
+// geometry, and fullscreen keeps it visible as a blank band over the
+// app's own header — hide at the WILL edge so the transition's resizes
+// see it, re-assert the restore at the DID edge (the system stomps a
+// WILL-edge restore). The chrome re-query rides the contentLayoutRect
+// KVO below, which fires only when the band has actually relaid out.
+- (void)windowWillEnterFullScreen:(NSNotification *)notification {
+    (void)notification;
+    [self setToolbarVisible:NO];
+}
+
+- (void)windowDidEnterFullScreen:(NSNotification *)notification {
+    (void)notification;
+    [self setToolbarVisible:NO];
+}
+
+- (void)windowWillExitFullScreen:(NSNotification *)notification {
+    (void)notification;
+    [self setToolbarVisible:YES];
+}
+
+- (void)windowDidExitFullScreen:(NSNotification *)notification {
+    (void)notification;
+    [self setToolbarVisible:YES];
+}
+
+- (void)setToolbarVisible:(BOOL)visible {
+    NSWindow *window = self.host.windows[@(self.windowId)];
+    if (!window.toolbar) return;
+    window.toolbar.visible = visible;
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
+    (void)object;
+    (void)change;
+    (void)context;
+    if (![keyPath isEqualToString:@"contentLayoutRect"]) return;
+    [self.host emitResizeForWindowId:self.windowId];
+}
+
 - (void)windowWillClose:(NSNotification *)notification {
     (void)notification;
+    if (self.observesContentLayout) {
+        NSWindow *window = self.host.windows[@(self.windowId)];
+        [window removeObserver:self forKeyPath:@"contentLayoutRect"];
+        self.observesContentLayout = NO;
+    }
     [self.host emitWindowFrameForWindowId:self.windowId open:NO];
     [self.host closeWebViewsInWindow:self.windowId];
     NSNumber *key = @(self.windowId);
@@ -616,16 +705,19 @@ static const char *ZeroNativeCefBridgeScript() {
 
 @end
 
-@implementation ZeroNativeChromiumHost
+@implementation NativeSdkChromiumHost
 
-- (instancetype)initWithAppName:(NSString *)appName title:(NSString *)title width:(double)width height:(double)height {
+- (instancetype)initWithAppName:(NSString *)appName displayName:(NSString *)displayName version:(NSString *)version aboutDescription:(NSString *)aboutDescription title:(NSString *)title width:(double)width height:(double)height {
     self = [super init];
     if (!self) return nil;
 
-    [ZeroNativeChromiumApplication sharedApplication];
+    [NativeSdkChromiumApplication sharedApplication];
     ensureCefInitialized();
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-    self.appName = appName.length > 0 ? appName : @"zero-native";
+    self.appName = appName.length > 0 ? appName : @"native-sdk";
+    self.displayName = displayName.length > 0 ? displayName : self.appName;
+    self.appVersion = version ?: @"";
+    self.aboutDescription = aboutDescription ?: @"";
     [self configureApplication];
     self.windows = [[NSMutableDictionary alloc] init];
     self.browserContainers = [[NSMutableDictionary alloc] init];
@@ -642,24 +734,25 @@ static const char *ZeroNativeCefBridgeScript() {
     self.webviewPendingZooms = [[NSMutableDictionary alloc] init];
     self.webviewGenerations = [[NSMutableDictionary alloc] init];
     self.closingWebViewKeys = [[NSMutableSet alloc] init];
+    self.appTimers = [[NSMutableDictionary alloc] init];
     self.nextWebViewGeneration = 1;
-    self.cefClients = new std::map<uint64_t, CefRefPtr<ZeroNativeCefClient>>();
+    self.cefClients = new std::map<uint64_t, CefRefPtr<NativeSdkCefClient>>();
     self.browsers = new std::map<uint64_t, CefRefPtr<CefBrowser>>();
-    self.webviewCefClients = new std::map<std::string, CefRefPtr<ZeroNativeCefClient>>();
+    self.webviewCefClients = new std::map<std::string, CefRefPtr<NativeSdkCefClient>>();
     self.webviewBrowsers = new std::map<std::string, CefRefPtr<CefBrowser>>();
     self.allowedNavigationOrigins = @[ @"zero://app", @"zero://inline" ];
     self.allowedExternalURLs = @[];
     self.externalLinkAction = 0;
     self.shortcuts = @[];
 
-    [self createWindowWithId:1 title:(title.length > 0 ? title : self.appName) label:@"main" x:0 y:0 width:width height:height restoreFrame:NO makeMain:YES];
+    [self createWindowWithId:1 title:(title.length > 0 ? title : self.appName) label:@"main" x:0 y:0 width:width height:height restoreFrame:NO resizable:YES makeMain:YES];
     self.didShutdown = NO;
     self.observesApplicationActivation = NO;
     return self;
 }
 
 - (void)configureApplication {
-    [[NSProcessInfo processInfo] setProcessName:self.appName];
+    [[NSProcessInfo processInfo] setProcessName:self.displayName];
     [self buildMenuBar];
 }
 
@@ -667,19 +760,21 @@ static const char *ZeroNativeCefBridgeScript() {
     NSMenu *mainMenu = [[NSMenu alloc] initWithTitle:@""];
     [NSApp setMainMenu:mainMenu];
 
-    NSMenuItem *appMenuItem = [[NSMenuItem alloc] initWithTitle:self.appName action:nil keyEquivalent:@""];
+    // Every string the application menu derives \u2014 the bold menu-bar
+    // title and the About/Hide/Quit labels \u2014 reads from the one display
+    // name, never the binary name. No Settings item: the host has no
+    // settings surface to open, and a dead item is worse than none.
+    NSMenuItem *appMenuItem = [[NSMenuItem alloc] initWithTitle:self.displayName action:nil keyEquivalent:@""];
     [mainMenu addItem:appMenuItem];
-    NSMenu *appMenu = [[NSMenu alloc] initWithTitle:self.appName];
+    NSMenu *appMenu = [[NSMenu alloc] initWithTitle:self.displayName];
     [appMenuItem setSubmenu:appMenu];
-    [appMenu addItem:[self menuItem:[NSString stringWithFormat:@"About %@", self.appName] action:@selector(orderFrontStandardAboutPanel:) key:@"" modifiers:0]];
+    [appMenu addItem:[self menuItem:[NSString stringWithFormat:@"About %@", self.displayName] action:@selector(showAboutPanel:) key:@"" modifiers:0]];
     [appMenu addItem:[NSMenuItem separatorItem]];
-    [appMenu addItem:[self menuItem:@"Preferences\u2026" action:@selector(showPreferences:) key:@"," modifiers:NSEventModifierFlagCommand]];
-    [appMenu addItem:[NSMenuItem separatorItem]];
-    [appMenu addItem:[self menuItem:[NSString stringWithFormat:@"Hide %@", self.appName] action:@selector(hide:) key:@"h" modifiers:NSEventModifierFlagCommand]];
+    [appMenu addItem:[self menuItem:[NSString stringWithFormat:@"Hide %@", self.displayName] action:@selector(hide:) key:@"h" modifiers:NSEventModifierFlagCommand]];
     [appMenu addItem:[self menuItem:@"Hide Others" action:@selector(hideOtherApplications:) key:@"h" modifiers:(NSEventModifierFlagCommand | NSEventModifierFlagOption)]];
     [appMenu addItem:[self menuItem:@"Show All" action:@selector(unhideAllApplications:) key:@"" modifiers:0]];
     [appMenu addItem:[NSMenuItem separatorItem]];
-    [appMenu addItem:[self menuItem:[NSString stringWithFormat:@"Quit %@", self.appName] action:@selector(terminate:) key:@"q" modifiers:NSEventModifierFlagCommand]];
+    [appMenu addItem:[self menuItem:[NSString stringWithFormat:@"Quit %@", self.displayName] action:@selector(terminate:) key:@"q" modifiers:NSEventModifierFlagCommand]];
 
     NSMenuItem *fileMenuItem = [[NSMenuItem alloc] initWithTitle:@"File" action:nil keyEquivalent:@""];
     [mainMenu addItem:fileMenuItem];
@@ -715,8 +810,24 @@ static const char *ZeroNativeCefBridgeScript() {
     return item;
 }
 
-- (void)showPreferences:(id)sender {
+/* The standard About panel, populated explicitly so unbundled dev runs
+ * show the manifest identity a packaged bundle reads from Info.plist. */
+- (void)showAboutPanel:(id)sender {
     (void)sender;
+    NSMutableDictionary<NSAboutPanelOptionKey, id> *options = [[NSMutableDictionary alloc] init];
+    options[NSAboutPanelOptionApplicationName] = self.displayName;
+    if (self.appVersion.length > 0) {
+        options[NSAboutPanelOptionApplicationVersion] = self.appVersion;
+        options[NSAboutPanelOptionVersion] = @"";
+    }
+    if (self.aboutDescription.length > 0) {
+        NSDictionary<NSAttributedStringKey, id> *creditAttributes = @{
+            NSFontAttributeName : [NSFont systemFontOfSize:11],
+            NSForegroundColorAttributeName : NSColor.secondaryLabelColor,
+        };
+        options[NSAboutPanelOptionCredits] = [[NSAttributedString alloc] initWithString:self.aboutDescription attributes:creditAttributes];
+    }
+    [NSApp orderFrontStandardAboutPanelWithOptions:options];
 }
 
 - (void)reload:(id)sender {
@@ -748,19 +859,22 @@ static const char *ZeroNativeCefBridgeScript() {
     delete self.browsers;
 }
 
-- (BOOL)createWindowWithId:(uint64_t)windowId title:(NSString *)title label:(NSString *)label x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame makeMain:(BOOL)makeMain {
+- (BOOL)createWindowWithId:(uint64_t)windowId title:(NSString *)title label:(NSString *)label x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame resizable:(BOOL)resizable makeMain:(BOOL)makeMain {
     NSNumber *key = @(windowId);
     if (self.windows[key]) return NO;
 
-    NSRect rect = restoreFrame ? ZeroNativeConstrainFrame(NSMakeRect(x, y, width, height)) : NSMakeRect(0, 0, width, height);
+    NSRect rect = restoreFrame ? NativeSdkConstrainFrame(NSMakeRect(x, y, width, height)) : NSMakeRect(0, 0, width, height);
+    NSWindowStyleMask styleMask = NSWindowStyleMaskTitled |
+                                  NSWindowStyleMaskClosable |
+                                  NSWindowStyleMaskMiniaturizable;
+    if (resizable) {
+        styleMask |= NSWindowStyleMaskResizable;
+    }
     NSWindow *window = [[NSWindow alloc] initWithContentRect:rect
-                                                   styleMask:(NSWindowStyleMaskTitled |
-                                                              NSWindowStyleMaskClosable |
-                                                              NSWindowStyleMaskResizable |
-                                                              NSWindowStyleMaskMiniaturizable)
+                                                   styleMask:styleMask
                                                      backing:NSBackingStoreBuffered
                                                        defer:NO];
-    [window setTitle:title.length > 0 ? title : @"zero-native"];
+    [window setTitle:title.length > 0 ? title : @"native-sdk"];
     if (!restoreFrame) [window center];
 
     NSView *stackRoot = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
@@ -773,11 +887,11 @@ static const char *ZeroNativeCefBridgeScript() {
     browserContainer.layer.zPosition = 0;
     [stackRoot addSubview:browserContainer positioned:NSWindowAbove relativeTo:nil];
 
-    ZeroNativeChromiumWindowDelegate *delegate = [[ZeroNativeChromiumWindowDelegate alloc] init];
+    NativeSdkChromiumWindowDelegate *delegate = [[NativeSdkChromiumWindowDelegate alloc] init];
     delegate.host = self;
     delegate.windowId = windowId;
     window.delegate = delegate;
-    CefRefPtr<ZeroNativeCefClient> client = new ZeroNativeCefClient(self, windowId);
+    CefRefPtr<NativeSdkCefClient> client = new NativeSdkCefClient(self, windowId);
 
     self.windows[key] = window;
     self.browserContainers[key] = browserContainer;
@@ -828,22 +942,29 @@ static const char *ZeroNativeCefBridgeScript() {
     }
 }
 
-- (void)runWithCallback:(zero_native_appkit_event_callback_t)callback context:(void *)context {
+- (void)runWithCallback:(native_sdk_appkit_event_callback_t)callback context:(void *)context {
     self.callback = callback;
     self.context = context;
 
     [self.window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
     if (!self.shortcutEventMonitor) {
-        __weak ZeroNativeChromiumHost *weakSelf = self;
+        __weak NativeSdkChromiumHost *weakSelf = self;
         self.shortcutEventMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *event) {
-            ZeroNativeChromiumHost *strongSelf = weakSelf;
+            NativeSdkChromiumHost *strongSelf = weakSelf;
             if (strongSelf && [strongSelf handleShortcutEvent:event]) return nil;
             return event;
         }];
     }
 
-    [self emitEvent:(zero_native_appkit_event_t){ .kind = ZERO_NATIVE_APPKIT_EVENT_START }];
+    [self emitEvent:(native_sdk_appkit_event_t){ .kind = NATIVE_SDK_APPKIT_EVENT_START }];
+    // A failed START handler requests shutdown synchronously, before the
+    // run loop exists — [NSApp stop:] is a no-op there. Honor the request
+    // here instead of stranding a live app behind a blank window.
+    if (self.didShutdown) {
+        shutdownCefIfNeeded();
+        return;
+    }
     [self emitResize];
     [self emitWindowFrameForWindowId:1 open:YES];
     [self startApplicationActivationObservers];
@@ -859,6 +980,7 @@ static const char *ZeroNativeCefBridgeScript() {
 - (void)stop {
     [self.timer invalidate];
     self.timer = nil;
+    [self invalidateAppTimers];
     if (self.shortcutEventMonitor) {
         [NSEvent removeMonitor:self.shortcutEventMonitor];
         self.shortcutEventMonitor = nil;
@@ -884,7 +1006,7 @@ static const char *ZeroNativeCefBridgeScript() {
     [NSApp postEvent:event atStart:NO];
 }
 
-- (void)emitEvent:(zero_native_appkit_event_t)event {
+- (void)emitEvent:(native_sdk_appkit_event_t)event {
     if (self.callback) self.callback(self.context, &event);
 }
 
@@ -906,12 +1028,12 @@ static const char *ZeroNativeCefBridgeScript() {
 
 - (void)applicationDidBecomeActive:(NSNotification *)notification {
     (void)notification;
-    [self emitEvent:(zero_native_appkit_event_t){ .kind = ZERO_NATIVE_APPKIT_EVENT_APP_ACTIVATED }];
+    [self emitEvent:(native_sdk_appkit_event_t){ .kind = NATIVE_SDK_APPKIT_EVENT_APP_ACTIVATED }];
 }
 
 - (void)applicationDidResignActive:(NSNotification *)notification {
     (void)notification;
-    [self emitEvent:(zero_native_appkit_event_t){ .kind = ZERO_NATIVE_APPKIT_EVENT_APP_DEACTIVATED }];
+    [self emitEvent:(native_sdk_appkit_event_t){ .kind = NATIVE_SDK_APPKIT_EVENT_APP_DEACTIVATED }];
 }
 
 - (void)emitResize {
@@ -927,8 +1049,8 @@ static const char *ZeroNativeCefBridgeScript() {
     }
     NSRect bounds = window.contentView.bounds;
     if (browser) browser->GetHost()->WasResized();
-    [self emitEvent:(zero_native_appkit_event_t){
-        .kind = ZERO_NATIVE_APPKIT_EVENT_RESIZE,
+    [self emitEvent:(native_sdk_appkit_event_t){
+        .kind = NATIVE_SDK_APPKIT_EVENT_RESIZE,
         .window_id = windowId,
         .width = bounds.size.width,
         .height = bounds.size.height,
@@ -940,8 +1062,8 @@ static const char *ZeroNativeCefBridgeScript() {
     NSWindow *window = self.windows[@(windowId)] ?: self.window;
     NSString *label = self.windowLabels[@(windowId)] ?: @"";
     NSRect frame = window.frame;
-    [self emitEvent:(zero_native_appkit_event_t){
-        .kind = ZERO_NATIVE_APPKIT_EVENT_WINDOW_FRAME,
+    [self emitEvent:(native_sdk_appkit_event_t){
+        .kind = NATIVE_SDK_APPKIT_EVENT_WINDOW_FRAME,
         .window_id = windowId,
         .width = frame.size.width,
         .height = frame.size.height,
@@ -957,13 +1079,76 @@ static const char *ZeroNativeCefBridgeScript() {
 
 - (void)emitFrame {
     CefDoMessageLoopWork();
-    [self emitEvent:(zero_native_appkit_event_t){ .kind = ZERO_NATIVE_APPKIT_EVENT_FRAME }];
+    [self emitEvent:(native_sdk_appkit_event_t){ .kind = NATIVE_SDK_APPKIT_EVENT_FRAME }];
 }
 
 - (void)emitShutdown {
     if (self.didShutdown) return;
     self.didShutdown = YES;
-    [self emitEvent:(zero_native_appkit_event_t){ .kind = ZERO_NATIVE_APPKIT_EVENT_SHUTDOWN }];
+    [self emitEvent:(native_sdk_appkit_event_t){ .kind = NATIVE_SDK_APPKIT_EVENT_SHUTDOWN }];
+}
+
+/* App timers and cross-thread wake, mirrored from the AppKit host: the
+ * runtime's scheduler and effect queue rely on TIMER/WAKE events on both
+ * engines. */
+- (void)startAppTimerWithId:(uint64_t)timerId intervalNs:(uint64_t)intervalNs repeats:(BOOL)repeats {
+    NSNumber *key = @(timerId);
+    [self.appTimers[key] invalidate];
+    NSTimeInterval interval = (NSTimeInterval)intervalNs / 1000000000.0;
+    // Common modes: a timer must keep firing while the user holds a menu
+    // open or live-resizes the window (same discipline as the AppKit host).
+    NSTimer *app_timer = [NSTimer timerWithTimeInterval:interval
+                                                 target:self
+                                               selector:@selector(appTimerFired:)
+                                               userInfo:@{ @"id": key, @"repeats": @(repeats) }
+                                                repeats:repeats];
+    [[NSRunLoop mainRunLoop] addTimer:app_timer forMode:NSRunLoopCommonModes];
+    self.appTimers[key] = app_timer;
+}
+
+- (void)cancelAppTimerWithId:(uint64_t)timerId {
+    NSNumber *key = @(timerId);
+    [self.appTimers[key] invalidate];
+    [self.appTimers removeObjectForKey:key];
+}
+
+- (void)appTimerFired:(NSTimer *)timer {
+    NSDictionary *info = (NSDictionary *)timer.userInfo;
+    NSNumber *key = info[@"id"];
+    if (!key) return;
+    // A non-repeating timer invalidates itself after this fire; drop the
+    // bookkeeping entry before the callback so it may start a replacement
+    // timer with the same id.
+    if (![info[@"repeats"] boolValue] && self.appTimers[key] == timer) {
+        [self.appTimers removeObjectForKey:key];
+    }
+    [self emitEvent:(native_sdk_appkit_event_t){
+        .kind = NATIVE_SDK_APPKIT_EVENT_TIMER,
+        .timer_id = key.unsignedLongLongValue,
+        .timestamp_ns = NativeSdkChromiumTimestampNanoseconds(),
+    }];
+}
+
+- (void)invalidateAppTimers {
+    for (NSTimer *timer in self.appTimers.allValues) {
+        [timer invalidate];
+    }
+    [self.appTimers removeAllObjects];
+}
+
+/* Called from any thread: marshal onto the main queue and emit the WAKE
+ * event there, so the runtime's effect-queue drain always runs on the
+ * loop thread. */
+- (void)wakeFromAnyThread {
+    __weak NativeSdkChromiumHost *weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NativeSdkChromiumHost *strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.didShutdown) return;
+        [strongSelf emitEvent:(native_sdk_appkit_event_t){
+            .kind = NATIVE_SDK_APPKIT_EVENT_WAKE,
+            .timestamp_ns = NativeSdkChromiumTimestampNanoseconds(),
+        }];
+    });
 }
 
 - (void)loadSource:(NSString *)source kind:(NSInteger)kind assetRoot:(NSString *)assetRoot entry:(NSString *)entry origin:(NSString *)origin spaFallback:(BOOL)spaFallback {
@@ -980,7 +1165,7 @@ static const char *ZeroNativeCefBridgeScript() {
         bridgeOrigin = @"zero://inline";
         internalURLPrefix = urlString;
     } else if (kind == 2) {
-        NSString *resolvedRoot = ZeroNativeResolvedAssetRoot(assetRoot ?: @"");
+        NSString *resolvedRoot = NativeSdkResolvedAssetRoot(assetRoot ?: @"");
         NSString *assetEntry = entry.length > 0 ? entry : @"index.html";
         while ([assetEntry hasPrefix:@"/"]) {
             assetEntry = [assetEntry substringFromIndex:1];
@@ -1003,7 +1188,7 @@ static const char *ZeroNativeCefBridgeScript() {
         [self.internalURLPrefixes removeObjectForKey:key];
     }
     if (kind == 2) {
-        self.assetRoots[key] = ZeroNativeResolvedAssetRoot(assetRoot ?: @"");
+        self.assetRoots[key] = NativeSdkResolvedAssetRoot(assetRoot ?: @"");
         self.assetEntries[key] = assetEntryPath.length > 0 ? assetEntryPath : @"index.html";
         self.assetOrigins[key] = bridgeOrigin.length > 0 ? bridgeOrigin : @"zero://app";
     } else {
@@ -1031,8 +1216,8 @@ static const char *ZeroNativeCefBridgeScript() {
     CefRect rect(0, 0, container.bounds.size.width, container.bounds.size.height);
     windowInfo.SetAsChild((__bridge void *)container, rect);
     CefBrowserSettings browserSettings;
-    CefRefPtr<ZeroNativeCefClient> client = (*self.cefClients)[windowId];
-    CefBrowserHost::CreateBrowser(windowInfo, client.get(), std::string(urlString.UTF8String), browserSettings, ZeroNativeCefExtraInfo(true), nullptr);
+    CefRefPtr<NativeSdkCefClient> client = (*self.cefClients)[windowId];
+    CefBrowserHost::CreateBrowser(windowInfo, client.get(), std::string(urlString.UTF8String), browserSettings, NativeSdkCefExtraInfo(true), nullptr);
 }
 
 - (NSString *)webViewKeyForWindow:(uint64_t)windowId label:(NSString *)label {
@@ -1075,13 +1260,13 @@ static const char *ZeroNativeCefBridgeScript() {
     [self reorderWebViewsInWindow:windowId];
 
     std::string keyString(key.UTF8String);
-    CefRefPtr<ZeroNativeCefClient> client = new ZeroNativeCefClient(self, windowId, keyString, generation, bridgeEnabled);
+    CefRefPtr<NativeSdkCefClient> client = new NativeSdkCefClient(self, windowId, keyString, generation, bridgeEnabled);
     if (self.webviewCefClients) (*self.webviewCefClients)[keyString] = client;
     CefWindowInfo windowInfo;
     CefRect rect(0, 0, webview.bounds.size.width, webview.bounds.size.height);
     windowInfo.SetAsChild((__bridge void *)webview, rect);
     CefBrowserSettings browserSettings;
-    CefBrowserHost::CreateBrowser(windowInfo, client.get(), std::string(resolvedURL.UTF8String), browserSettings, ZeroNativeCefExtraInfo(bridgeEnabled), nullptr);
+    CefBrowserHost::CreateBrowser(windowInfo, client.get(), std::string(resolvedURL.UTF8String), browserSettings, NativeSdkCefExtraInfo(bridgeEnabled), nullptr);
     return YES;
 }
 
@@ -1287,12 +1472,12 @@ static const char *ZeroNativeCefBridgeScript() {
     NSString *scheme = url.scheme.lowercaseString ?: @"";
     if (scheme.length == 0 || [scheme isEqualToString:@"about"]) return YES;
     if ([self isInternalURL:url]) return YES;
-    return ZeroNativePolicyListMatches(self.allowedNavigationOrigins, url);
+    return NativeSdkPolicyListMatches(self.allowedNavigationOrigins, url);
 }
 
 - (BOOL)openExternalURLIfAllowed:(NSURL *)url {
     if (self.externalLinkAction != 1) return NO;
-    if (!ZeroNativePolicyListMatches(self.allowedExternalURLs, url)) return NO;
+    if (!NativeSdkPolicyListMatches(self.allowedExternalURLs, url)) return NO;
     [[NSWorkspace sharedWorkspace] openURL:url];
     return YES;
 }
@@ -1305,9 +1490,9 @@ static const char *ZeroNativeCefBridgeScript() {
     NSString *assetRoot = self.assetRoots[key];
     NSString *assetEntry = self.assetEntries[key];
     if (assetOrigin.length == 0 || assetRoot.length == 0) return url;
-    if (![ZeroNativeOriginForURL(targetURL) isEqualToString:assetOrigin]) return url;
+    if (![NativeSdkOriginForURL(targetURL) isEqualToString:assetOrigin]) return url;
 
-    NSString *relativePath = ZeroNativeSafeAssetPath(targetURL, assetEntry.length > 0 ? assetEntry : @"index.html");
+    NSString *relativePath = NativeSdkSafeAssetPath(targetURL, assetEntry.length > 0 ? assetEntry : @"index.html");
     if (!relativePath) return nil;
     NSURL *fileURL = [NSURL fileURLWithPath:[assetRoot stringByAppendingPathComponent:relativePath]];
     NSURLComponents *components = [NSURLComponents componentsWithURL:fileURL resolvingAgainstBaseURL:NO];
@@ -1377,7 +1562,7 @@ static const char *ZeroNativeCefBridgeScript() {
     } else if (assetOrigin.length > 0 && [self isInternalURL:url windowId:windowId]) {
         return assetOrigin;
     }
-    return ZeroNativeOriginForURL(url);
+    return NativeSdkOriginForURL(url);
 }
 
 - (void)receiveBridgePayload:(NSString *)payload origin:(NSString *)origin windowId:(uint64_t)windowId webViewLabel:(NSString *)webViewLabel {
@@ -1433,15 +1618,15 @@ static const char *ZeroNativeCefBridgeScript() {
 
 - (BOOL)handleShortcutEvent:(NSEvent *)event {
     if (event.type != NSEventTypeKeyDown) return NO;
-    NSString *key = ZeroNativeShortcutKeyForEvent(event);
+    NSString *key = NativeSdkShortcutKeyForEvent(event);
     if (key.length == 0) return NO;
-    BOOL usesImplicitShift = ZeroNativeShortcutUsesImplicitShift(key, event);
+    BOOL usesImplicitShift = NativeSdkShortcutUsesImplicitShift(key, event);
 
     for (NSUInteger pass = 0; pass < (usesImplicitShift ? 2 : 1); pass++) {
         BOOL allowImplicitShift = pass == 1;
-        for (ZeroNativeChromiumShortcut *shortcut in self.shortcuts) {
+        for (NativeSdkChromiumShortcut *shortcut in self.shortcuts) {
             if (![shortcut.key isEqualToString:key]) continue;
-            if (!ZeroNativeShortcutModifiersMatch(shortcut.modifiers, event.modifierFlags, allowImplicitShift)) continue;
+            if (!NativeSdkShortcutModifiersMatch(shortcut.modifiers, event.modifierFlags, allowImplicitShift)) continue;
             [self emitShortcutWithId:shortcut.identifier key:shortcut.key modifiers:shortcut.modifiers event:event];
             return YES;
         }
@@ -1461,8 +1646,8 @@ static const char *ZeroNativeCefBridgeScript() {
     }
     const char *identifierBytes = identifier.UTF8String ? identifier.UTF8String : "";
     const char *keyBytes = key.UTF8String ? key.UTF8String : "";
-    [self emitEvent:(zero_native_appkit_event_t){
-        .kind = ZERO_NATIVE_APPKIT_EVENT_SHORTCUT,
+    [self emitEvent:(native_sdk_appkit_event_t){
+        .kind = NATIVE_SDK_APPKIT_EVENT_SHORTCUT,
         .window_id = windowId,
         .shortcut_id = identifierBytes,
         .shortcut_id_len = [identifier lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
@@ -1473,12 +1658,12 @@ static const char *ZeroNativeCefBridgeScript() {
 }
 
 - (void)setShortcutsWithIds:(const char *const *)ids idLengths:(const size_t *)idLengths keys:(const char *const *)keys keyLengths:(const size_t *)keyLengths modifiers:(const uint32_t *)modifiers count:(size_t)count {
-    NSMutableArray<ZeroNativeChromiumShortcut *> *items = [[NSMutableArray alloc] initWithCapacity:count];
+    NSMutableArray<NativeSdkChromiumShortcut *> *items = [[NSMutableArray alloc] initWithCapacity:count];
     for (size_t index = 0; index < count; index++) {
         NSString *identifier = ids[index] ? [[NSString alloc] initWithBytes:ids[index] length:idLengths[index] encoding:NSUTF8StringEncoding] : @"";
         NSString *key = keys[index] ? [[NSString alloc] initWithBytes:keys[index] length:keyLengths[index] encoding:NSUTF8StringEncoding] : @"";
         if (identifier.length == 0 || key.length == 0) continue;
-        ZeroNativeChromiumShortcut *shortcut = [[ZeroNativeChromiumShortcut alloc] init];
+        NativeSdkChromiumShortcut *shortcut = [[NativeSdkChromiumShortcut alloc] init];
         shortcut.identifier = identifier;
         shortcut.key = key.lowercaseString;
         shortcut.modifiers = modifiers[index];
@@ -1495,7 +1680,7 @@ static const char *ZeroNativeCefBridgeScript() {
 
 namespace {
 
-static NSArray<NSString *> *ZeroNativePolicyListFromBytes(const char *bytes, size_t len, NSArray<NSString *> *fallback) {
+static NSArray<NSString *> *NativeSdkPolicyListFromBytes(const char *bytes, size_t len, NSArray<NSString *> *fallback) {
     if (!bytes || len == 0) return fallback ?: @[];
     NSString *joined = [[NSString alloc] initWithBytes:bytes length:len encoding:NSUTF8StringEncoding];
     if (joined.length == 0) return fallback ?: @[];
@@ -1507,7 +1692,7 @@ static NSArray<NSString *> *ZeroNativePolicyListFromBytes(const char *bytes, siz
     return values.count > 0 ? values : (fallback ?: @[]);
 }
 
-static NSString *ZeroNativeOriginForURL(NSURL *url) {
+static NSString *NativeSdkOriginForURL(NSURL *url) {
     if (!url) return @"";
     NSString *scheme = url.scheme.lowercaseString ?: @"";
     if (scheme.length == 0 || [scheme isEqualToString:@"about"]) return @"zero://inline";
@@ -1519,7 +1704,7 @@ static NSString *ZeroNativeOriginForURL(NSURL *url) {
     return [NSString stringWithFormat:@"%@://%@", scheme, host];
 }
 
-static NSString *ZeroNativeShortcutKeyForEvent(NSEvent *event) {
+static NSString *NativeSdkShortcutKeyForEvent(NSEvent *event) {
     NSString *characters = event.charactersIgnoringModifiers ?: @"";
     if (characters.length == 0) return @"";
     unichar ch = [characters characterAtIndex:0];
@@ -1528,6 +1713,9 @@ static NSString *ZeroNativeShortcutKeyForEvent(NSEvent *event) {
         case NSDownArrowFunctionKey: return @"arrowdown";
         case NSLeftArrowFunctionKey: return @"arrowleft";
         case NSRightArrowFunctionKey: return @"arrowright";
+        case NSDeleteFunctionKey: return @"delete";
+        case NSHomeFunctionKey: return @"home";
+        case NSEndFunctionKey: return @"end";
         case 0x1b: return @"escape";
         case '\r': return @"enter";
         case '\t': return @"tab";
@@ -1559,7 +1747,7 @@ static NSString *ZeroNativeShortcutKeyForEvent(NSEvent *event) {
     }
 }
 
-static BOOL ZeroNativeShortcutUsesImplicitShift(NSString *key, NSEvent *event) {
+static BOOL NativeSdkShortcutUsesImplicitShift(NSString *key, NSEvent *event) {
     if ((event.modifierFlags & NSEventModifierFlagShift) == 0) return NO;
     if (key.length != 1) return NO;
     unichar ch = [key characterAtIndex:0];
@@ -1569,12 +1757,12 @@ static BOOL ZeroNativeShortcutUsesImplicitShift(NSString *key, NSEvent *event) {
         ch == '[' || ch == ']' || ch == '\\' || ch == '`';
 }
 
-static BOOL ZeroNativeShortcutModifiersMatch(uint32_t shortcutModifiers, NSEventModifierFlags eventModifiers, BOOL allowImplicitShift) {
+static BOOL NativeSdkShortcutModifiersMatch(uint32_t shortcutModifiers, NSEventModifierFlags eventModifiers, BOOL allowImplicitShift) {
     NSEventModifierFlags flags = eventModifiers & NSEventModifierFlagDeviceIndependentFlagsMask;
-    BOOL needsCommand = (shortcutModifiers & ZeroNativeShortcutModifierCommand) != 0 || (shortcutModifiers & ZeroNativeShortcutModifierPrimary) != 0;
-    BOOL needsControl = (shortcutModifiers & ZeroNativeShortcutModifierControl) != 0;
-    BOOL needsOption = (shortcutModifiers & ZeroNativeShortcutModifierOption) != 0;
-    BOOL needsShift = (shortcutModifiers & ZeroNativeShortcutModifierShift) != 0;
+    BOOL needsCommand = (shortcutModifiers & NativeSdkShortcutModifierCommand) != 0 || (shortcutModifiers & NativeSdkShortcutModifierPrimary) != 0;
+    BOOL needsControl = (shortcutModifiers & NativeSdkShortcutModifierControl) != 0;
+    BOOL needsOption = (shortcutModifiers & NativeSdkShortcutModifierOption) != 0;
+    BOOL needsShift = (shortcutModifiers & NativeSdkShortcutModifierShift) != 0;
     BOOL hasCommand = (flags & NSEventModifierFlagCommand) != 0;
     BOOL hasControl = (flags & NSEventModifierFlagControl) != 0;
     BOOL hasOption = (flags & NSEventModifierFlagOption) != 0;
@@ -1583,26 +1771,26 @@ static BOOL ZeroNativeShortcutModifiersMatch(uint32_t shortcutModifiers, NSEvent
     return hasCommand == needsCommand && hasControl == needsControl && hasOption == needsOption && shiftMatches;
 }
 
-static BOOL ZeroNativeWildcardPrefixHasPath(NSString *prefix) {
+static BOOL NativeSdkWildcardPrefixHasPath(NSString *prefix) {
     NSURLComponents *components = [NSURLComponents componentsWithString:prefix ?: @""];
     return components.scheme.length > 0 && components.host.length > 0 && components.percentEncodedPath.length > 0;
 }
 
-static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url) {
-    NSString *origin = ZeroNativeOriginForURL(url);
+static BOOL NativeSdkPolicyListMatches(NSArray<NSString *> *values, NSURL *url) {
+    NSString *origin = NativeSdkOriginForURL(url);
     NSString *absolute = url.absoluteString ?: @"";
     for (NSString *value in values) {
         if ([value isEqualToString:@"*"]) return YES;
         if ([value isEqualToString:origin] || [value isEqualToString:absolute]) return YES;
         if ([value hasSuffix:@"*"]) {
             NSString *prefix = [value substringToIndex:value.length - 1];
-            if (ZeroNativeWildcardPrefixHasPath(prefix) && [absolute hasPrefix:prefix]) return YES;
+            if (NativeSdkWildcardPrefixHasPath(prefix) && [absolute hasPrefix:prefix]) return YES;
         }
     }
     return NO;
 }
 
-void ZeroNativeCefClient::OnAfterCreated(CefRefPtr<CefBrowser> browser) {
+void NativeSdkCefClient::OnAfterCreated(CefRefPtr<CefBrowser> browser) {
     if (!webview_key_.empty()) {
         NSString *key = [[NSString alloc] initWithBytes:webview_key_.data() length:webview_key_.size() encoding:NSUTF8StringEncoding];
         [host_ setWebViewBrowser:browser key:key ?: @"" generation:webview_generation_];
@@ -1611,14 +1799,14 @@ void ZeroNativeCefClient::OnAfterCreated(CefRefPtr<CefBrowser> browser) {
     [host_ setBrowser:browser windowId:window_id_];
 }
 
-void ZeroNativeCefClient::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
+void NativeSdkCefClient::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
     (void)browser;
     if (webview_key_.empty()) return;
     NSString *key = [[NSString alloc] initWithBytes:webview_key_.data() length:webview_key_.size() encoding:NSUTF8StringEncoding];
     [host_ cleanupClosedWebViewWithKey:key ?: @"" generation:webview_generation_];
 }
 
-void ZeroNativeCefClient::OnLoadError(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, ErrorCode errorCode, const CefString& errorText, const CefString& failedUrl) {
+void NativeSdkCefClient::OnLoadError(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, ErrorCode errorCode, const CefString& errorText, const CefString& failedUrl) {
     (void)browser;
     (void)errorText;
     if (!frame || !frame->IsMain() || errorCode != ERR_FILE_NOT_FOUND) return;
@@ -1630,7 +1818,7 @@ void ZeroNativeCefClient::OnLoadError(CefRefPtr<CefBrowser> browser, CefRefPtr<C
     frame->LoadURL(std::string(fallback.UTF8String));
 }
 
-bool ZeroNativeCefClient::OnBeforeBrowse(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefRequest> request, bool user_gesture, bool is_redirect) {
+bool NativeSdkCefClient::OnBeforeBrowse(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefRequest> request, bool user_gesture, bool is_redirect) {
     (void)browser;
     (void)user_gesture;
     (void)is_redirect;
@@ -1643,7 +1831,7 @@ bool ZeroNativeCefClient::OnBeforeBrowse(CefRefPtr<CefBrowser> browser, CefRefPt
     return true;
 }
 
-bool ZeroNativeCefClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefProcessId source_process, CefRefPtr<CefProcessMessage> message) {
+bool NativeSdkCefClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefProcessId source_process, CefRefPtr<CefProcessMessage> message) {
     (void)browser;
     (void)source_process;
     if (message->GetName() != kBridgeMessageName) return false;
@@ -1662,46 +1850,84 @@ bool ZeroNativeCefClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser
 
 } // namespace
 
-zero_native_appkit_host_t *zero_native_appkit_create(const char *app_name, size_t app_name_len, const char *window_title, size_t window_title_len, const char *bundle_id, size_t bundle_id_len, const char *icon_path, size_t icon_path_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame) {
+static void NativeSdkApplyHiddenInsetTitlebar(NSWindow *window, int titlebar_style, NativeSdkChromiumWindowDelegate *delegate) {
+    if (!window || (titlebar_style != 1 && titlebar_style != 2)) return;
+    window.styleMask |= NSWindowStyleMaskFullSizeContentView;
+    window.titlebarAppearsTransparent = YES;
+    window.titleVisibility = NSWindowTitleHidden;
+    if (titlebar_style == 2) {
+        // hidden_inset_tall: an empty borderless toolbar switches the
+        // titlebar to the unified-toolbar height and the system centers
+        // the traffic lights in it (same trick as the AppKit host).
+        NSToolbar *toolbar = [[NSToolbar alloc] initWithIdentifier:@"native-sdk-tall-titlebar"];
+        toolbar.allowsUserCustomization = NO;
+        window.toolbar = toolbar;
+        window.toolbarStyle = NSWindowToolbarStyleUnified;
+        window.titlebarSeparatorStyle = NSTitlebarSeparatorStyleNone;
+        if (delegate && !delegate.observesContentLayout) {
+            // Chrome re-query timing rides the settled contentLayoutRect
+            // (see the delegate's observeValueForKeyPath:).
+            delegate.observesContentLayout = YES;
+            [window addObserver:delegate forKeyPath:@"contentLayoutRect" options:0 context:NULL];
+        }
+    }
+}
+
+native_sdk_appkit_host_t *native_sdk_appkit_create(const char *app_name, size_t app_name_len, const char *display_name, size_t display_name_len, const char *version, size_t version_len, const char *about_description, size_t about_description_len, int has_web_content, const char *window_title, size_t window_title_len, const char *bundle_id, size_t bundle_id_len, const char *icon_path, size_t icon_path_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, int show_policy) {
     @autoreleasepool {
+        // Present-before-show is a canvas contract; the Chromium host
+        // hosts webviews only (gpu-surface presents are unsupported on
+        // this engine), so the policy is accepted for ABI parity and
+        // windows show immediately — the web engine owns first paint.
+        // has_web_content is likewise ABI parity: this host always
+        // hosts web content, and its menus already assume it.
+        (void)show_policy;
+        (void)has_web_content;
         (void)bundle_id;
         (void)bundle_id_len;
         (void)icon_path;
         (void)icon_path_len;
         (void)window_label;
         (void)window_label_len;
-        NSString *appNameString = [[NSString alloc] initWithBytes:app_name length:app_name_len encoding:NSUTF8StringEncoding] ?: @"zero-native";
+        NSString *appNameString = [[NSString alloc] initWithBytes:app_name length:app_name_len encoding:NSUTF8StringEncoding] ?: @"native-sdk";
+        NSString *displayNameString = [[NSString alloc] initWithBytes:display_name length:display_name_len encoding:NSUTF8StringEncoding] ?: @"";
+        NSString *versionString = [[NSString alloc] initWithBytes:version length:version_len encoding:NSUTF8StringEncoding] ?: @"";
+        NSString *aboutDescriptionString = [[NSString alloc] initWithBytes:about_description length:about_description_len encoding:NSUTF8StringEncoding] ?: @"";
         NSString *titleString = [[NSString alloc] initWithBytes:window_title length:window_title_len encoding:NSUTF8StringEncoding] ?: appNameString;
-        ZeroNativeChromiumHost *host = [[ZeroNativeChromiumHost alloc] initWithAppName:appNameString title:titleString width:width height:height];
+        NativeSdkChromiumHost *host = [[NativeSdkChromiumHost alloc] initWithAppName:appNameString displayName:displayNameString version:versionString aboutDescription:aboutDescriptionString title:titleString width:width height:height];
         if (restore_frame) {
-            [host.window setFrame:ZeroNativeConstrainFrame(NSMakeRect(x, y, width, height)) display:NO];
+            [host.window setFrame:NativeSdkConstrainFrame(NSMakeRect(x, y, width, height)) display:NO];
         }
-        return (__bridge_retained zero_native_appkit_host_t *)host;
+        if (!resizable) {
+            host.window.styleMask &= ~NSWindowStyleMaskResizable;
+        }
+        NativeSdkApplyHiddenInsetTitlebar(host.window, titlebar_style, host.delegates[@1]);
+        return (__bridge_retained native_sdk_appkit_host_t *)host;
     }
 }
 
-void zero_native_appkit_destroy(zero_native_appkit_host_t *host) {
+void native_sdk_appkit_destroy(native_sdk_appkit_host_t *host) {
     if (!host) return;
     CFBridgingRelease(host);
 }
 
-void zero_native_appkit_run(zero_native_appkit_host_t *host, zero_native_appkit_event_callback_t callback, void *context) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+void native_sdk_appkit_run(native_sdk_appkit_host_t *host, native_sdk_appkit_event_callback_t callback, void *context) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
     [object runWithCallback:callback context:context];
 }
 
-void zero_native_appkit_stop(zero_native_appkit_host_t *host) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+void native_sdk_appkit_stop(native_sdk_appkit_host_t *host) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
     [object emitShutdown];
     [object stop];
 }
 
-void zero_native_appkit_load_webview(zero_native_appkit_host_t *host, const char *source, size_t source_len, int source_kind, const char *asset_root, size_t asset_root_len, const char *asset_entry, size_t asset_entry_len, const char *asset_origin, size_t asset_origin_len, int spa_fallback) {
-    zero_native_appkit_load_window_webview(host, 1, source, source_len, source_kind, asset_root, asset_root_len, asset_entry, asset_entry_len, asset_origin, asset_origin_len, spa_fallback);
+void native_sdk_appkit_load_webview(native_sdk_appkit_host_t *host, const char *source, size_t source_len, int source_kind, const char *asset_root, size_t asset_root_len, const char *asset_entry, size_t asset_entry_len, const char *asset_origin, size_t asset_origin_len, int spa_fallback) {
+    native_sdk_appkit_load_window_webview(host, 1, source, source_len, source_kind, asset_root, asset_root_len, asset_entry, asset_entry_len, asset_origin, asset_origin_len, spa_fallback);
 }
 
-void zero_native_appkit_load_window_webview(zero_native_appkit_host_t *host, uint64_t window_id, const char *source, size_t source_len, int source_kind, const char *asset_root, size_t asset_root_len, const char *asset_entry, size_t asset_entry_len, const char *asset_origin, size_t asset_origin_len, int spa_fallback) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+void native_sdk_appkit_load_window_webview(native_sdk_appkit_host_t *host, uint64_t window_id, const char *source, size_t source_len, int source_kind, const char *asset_root, size_t asset_root_len, const char *asset_entry, size_t asset_entry_len, const char *asset_origin, size_t asset_origin_len, int spa_fallback) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
     NSString *sourceString = source ? [[NSString alloc] initWithBytes:source length:source_len encoding:NSUTF8StringEncoding] : @"";
     NSString *assetRoot = asset_root ? [[NSString alloc] initWithBytes:asset_root length:asset_root_len encoding:NSUTF8StringEncoding] : @"";
     NSString *assetEntry = asset_entry ? [[NSString alloc] initWithBytes:asset_entry length:asset_entry_len encoding:NSUTF8StringEncoding] : @"";
@@ -1715,44 +1941,44 @@ void zero_native_appkit_load_window_webview(zero_native_appkit_host_t *host, uin
               windowId:window_id];
 }
 
-void zero_native_appkit_set_bridge_callback(zero_native_appkit_host_t *host, zero_native_appkit_bridge_callback_t callback, void *context) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+void native_sdk_appkit_set_bridge_callback(native_sdk_appkit_host_t *host, native_sdk_appkit_bridge_callback_t callback, void *context) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
     object.bridgeCallback = callback;
     object.bridgeContext = context;
 }
 
-void zero_native_appkit_bridge_respond(zero_native_appkit_host_t *host, const char *response, size_t response_len) {
-    zero_native_appkit_bridge_respond_window(host, 1, response, response_len);
+void native_sdk_appkit_bridge_respond(native_sdk_appkit_host_t *host, const char *response, size_t response_len) {
+    native_sdk_appkit_bridge_respond_window(host, 1, response, response_len);
 }
 
-void zero_native_appkit_bridge_respond_window(zero_native_appkit_host_t *host, uint64_t window_id, const char *response, size_t response_len) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+void native_sdk_appkit_bridge_respond_window(native_sdk_appkit_host_t *host, uint64_t window_id, const char *response, size_t response_len) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
     NSString *responseString = response ? [[NSString alloc] initWithBytes:response length:response_len encoding:NSUTF8StringEncoding] : @"{}";
     [object completeBridgeWithResponse:responseString ?: @"{}" windowId:window_id];
 }
 
-void zero_native_appkit_bridge_respond_webview(zero_native_appkit_host_t *host, uint64_t window_id, const char *webview_label, size_t webview_label_len, const char *response, size_t response_len) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+void native_sdk_appkit_bridge_respond_webview(native_sdk_appkit_host_t *host, uint64_t window_id, const char *webview_label, size_t webview_label_len, const char *response, size_t response_len) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
     NSString *labelString = webview_label ? [[NSString alloc] initWithBytes:webview_label length:webview_label_len encoding:NSUTF8StringEncoding] : @"main";
     NSString *responseString = response ? [[NSString alloc] initWithBytes:response length:response_len encoding:NSUTF8StringEncoding] : @"{}";
     [object completeBridgeWithResponse:responseString ?: @"{}" windowId:window_id webViewLabel:labelString ?: @"main"];
 }
 
-void zero_native_appkit_emit_window_event(zero_native_appkit_host_t *host, uint64_t window_id, const char *name, size_t name_len, const char *detail_json, size_t detail_json_len) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+void native_sdk_appkit_emit_window_event(native_sdk_appkit_host_t *host, uint64_t window_id, const char *name, size_t name_len, const char *detail_json, size_t detail_json_len) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
     NSString *nameString = name ? [[NSString alloc] initWithBytes:name length:name_len encoding:NSUTF8StringEncoding] : @"";
     NSString *detailString = detail_json ? [[NSString alloc] initWithBytes:detail_json length:detail_json_len encoding:NSUTF8StringEncoding] : @"null";
     [object emitEventNamed:nameString ?: @"" detailJSON:detailString ?: @"null" windowId:window_id];
 }
 
-void zero_native_appkit_set_security_policy(zero_native_appkit_host_t *host, const char *allowed_origins, size_t allowed_origins_len, const char *external_urls, size_t external_urls_len, int external_action) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
-    NSArray<NSString *> *origins = ZeroNativePolicyListFromBytes(allowed_origins, allowed_origins_len, @[ @"zero://app", @"zero://inline" ]);
-    NSArray<NSString *> *externalURLs = ZeroNativePolicyListFromBytes(external_urls, external_urls_len, @[]);
+void native_sdk_appkit_set_security_policy(native_sdk_appkit_host_t *host, const char *allowed_origins, size_t allowed_origins_len, const char *external_urls, size_t external_urls_len, int external_action) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
+    NSArray<NSString *> *origins = NativeSdkPolicyListFromBytes(allowed_origins, allowed_origins_len, @[ @"zero://app", @"zero://inline" ]);
+    NSArray<NSString *> *externalURLs = NativeSdkPolicyListFromBytes(external_urls, external_urls_len, @[]);
     [object setAllowedNavigationOrigins:origins externalURLs:externalURLs externalAction:external_action];
 }
 
-void zero_native_appkit_set_menus(zero_native_appkit_host_t *host, const char *const *menu_titles, const size_t *menu_title_lens, size_t menu_count, const uint32_t *item_menu_indices, const char *const *item_labels, const size_t *item_label_lens, const char *const *item_commands, const size_t *item_command_lens, const char *const *item_keys, const size_t *item_key_lens, const uint32_t *item_modifiers, const int *item_separators, const int *item_enabled, const int *item_checked, size_t item_count) {
+void native_sdk_appkit_set_menus(native_sdk_appkit_host_t *host, const char *const *menu_titles, const size_t *menu_title_lens, size_t menu_count, const uint32_t *item_menu_indices, const char *const *item_labels, const size_t *item_label_lens, const char *const *item_commands, const size_t *item_command_lens, const char *const *item_keys, const size_t *item_key_lens, const uint32_t *item_modifiers, const int *item_separators, const int *item_enabled, const int *item_checked, size_t item_count) {
     (void)host;
     (void)menu_titles;
     (void)menu_title_lens;
@@ -1771,7 +1997,7 @@ void zero_native_appkit_set_menus(zero_native_appkit_host_t *host, const char *c
     (void)item_count;
 }
 
-int zero_native_appkit_create_view(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, int kind, const char *parent, size_t parent_len, double x, double y, double width, double height, int layer, int visible, int enabled, const char *role, size_t role_len, const char *accessibility_label, size_t accessibility_label_len, const char *text, size_t text_len, const char *command, size_t command_len) {
+int native_sdk_appkit_create_view(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, int kind, const char *parent, size_t parent_len, double x, double y, double width, double height, int layer, int visible, int enabled, const char *role, size_t role_len, const char *accessibility_label, size_t accessibility_label_len, const char *text, size_t text_len, const char *command, size_t command_len) {
     (void)host;
     (void)window_id;
     (void)label;
@@ -1797,7 +2023,7 @@ int zero_native_appkit_create_view(zero_native_appkit_host_t *host, uint64_t win
     return 0;
 }
 
-int zero_native_appkit_update_view(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, int has_frame, double x, double y, double width, double height, int has_layer, int layer, int has_visible, int visible, int has_enabled, int enabled, int has_role, const char *role, size_t role_len, int has_accessibility_label, const char *accessibility_label, size_t accessibility_label_len, int has_text, const char *text, size_t text_len, int has_command, const char *command, size_t command_len) {
+int native_sdk_appkit_update_view(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, int has_frame, double x, double y, double width, double height, int has_layer, int layer, int has_visible, int visible, int has_enabled, int enabled, int has_role, const char *role, size_t role_len, int has_accessibility_label, const char *accessibility_label, size_t accessibility_label_len, int has_text, const char *text, size_t text_len, int has_command, const char *command, size_t command_len) {
     (void)host;
     (void)window_id;
     (void)label;
@@ -1828,7 +2054,7 @@ int zero_native_appkit_update_view(zero_native_appkit_host_t *host, uint64_t win
     return 0;
 }
 
-int zero_native_appkit_set_view_frame(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, double x, double y, double width, double height) {
+int native_sdk_appkit_set_view_frame(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, double x, double y, double width, double height) {
     (void)host;
     (void)window_id;
     (void)label;
@@ -1840,7 +2066,7 @@ int zero_native_appkit_set_view_frame(zero_native_appkit_host_t *host, uint64_t 
     return 0;
 }
 
-int zero_native_appkit_set_view_visible(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, int visible) {
+int native_sdk_appkit_set_view_visible(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, int visible) {
     (void)host;
     (void)window_id;
     (void)label;
@@ -1849,7 +2075,18 @@ int zero_native_appkit_set_view_visible(zero_native_appkit_host_t *host, uint64_
     return 0;
 }
 
-int zero_native_appkit_focus_view(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len) {
+int native_sdk_appkit_set_view_cursor(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, int cursor) {
+    // Native child views are system-engine-only (create_view above); no
+    // view exists for the label, so this reports it like the other stubs.
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    (void)cursor;
+    return 0;
+}
+
+int native_sdk_appkit_focus_view(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len) {
     (void)host;
     (void)window_id;
     (void)label;
@@ -1857,7 +2094,7 @@ int zero_native_appkit_focus_view(zero_native_appkit_host_t *host, uint64_t wind
     return 0;
 }
 
-int zero_native_appkit_close_view(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len) {
+int native_sdk_appkit_close_view(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len) {
     (void)host;
     (void)window_id;
     (void)label;
@@ -1865,81 +2102,469 @@ int zero_native_appkit_close_view(zero_native_appkit_host_t *host, uint64_t wind
     return 0;
 }
 
-void zero_native_appkit_set_shortcuts(zero_native_appkit_host_t *host, const char *const *ids, const size_t *id_lens, const char *const *keys, const size_t *key_lens, const uint32_t *modifiers, size_t count) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+void native_sdk_appkit_set_shortcuts(native_sdk_appkit_host_t *host, const char *const *ids, const size_t *id_lens, const char *const *keys, const size_t *key_lens, const uint32_t *modifiers, size_t count) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
     [object setShortcutsWithIds:ids idLengths:id_lens keys:keys keyLengths:key_lens modifiers:modifiers count:count];
 }
 
-int zero_native_appkit_create_window(zero_native_appkit_host_t *host, uint64_t window_id, const char *window_title, size_t window_title_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
-    NSString *titleString = window_title ? [[NSString alloc] initWithBytes:window_title length:window_title_len encoding:NSUTF8StringEncoding] : @"zero-native";
+int native_sdk_appkit_create_window(native_sdk_appkit_host_t *host, uint64_t window_id, const char *window_title, size_t window_title_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, int show_policy) {
+    // Accepted for ABI parity; see native_sdk_appkit_create.
+    (void)show_policy;
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
+    NSString *titleString = window_title ? [[NSString alloc] initWithBytes:window_title length:window_title_len encoding:NSUTF8StringEncoding] : @"native-sdk";
     NSString *labelString = window_label ? [[NSString alloc] initWithBytes:window_label length:window_label_len encoding:NSUTF8StringEncoding] : @"";
-    return [object createWindowWithId:window_id title:titleString ?: @"zero-native" label:labelString ?: @"" x:x y:y width:width height:height restoreFrame:(restore_frame != 0) makeMain:NO] ? 1 : 0;
+    if (![object createWindowWithId:window_id title:titleString ?: @"native-sdk" label:labelString ?: @"" x:x y:y width:width height:height restoreFrame:(restore_frame != 0) resizable:(resizable != 0) makeMain:NO]) return 0;
+    NativeSdkApplyHiddenInsetTitlebar(object.windows[@(window_id)], titlebar_style, object.delegates[@(window_id)]);
+    return 1;
 }
 
-int zero_native_appkit_focus_window(zero_native_appkit_host_t *host, uint64_t window_id) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+int native_sdk_appkit_focus_window(native_sdk_appkit_host_t *host, uint64_t window_id) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
     if (!object.windows[@(window_id)]) return 0;
     [object focusWindowWithId:window_id];
     return 1;
 }
 
-int zero_native_appkit_close_window(zero_native_appkit_host_t *host, uint64_t window_id) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+int native_sdk_appkit_close_window(native_sdk_appkit_host_t *host, uint64_t window_id) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
     if (!object.windows[@(window_id)]) return 0;
     [object closeWindowWithId:window_id];
     return 1;
 }
 
-int zero_native_appkit_create_webview(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, const char *url, size_t url_len, double x, double y, double width, double height, int layer, int transparent, int bridge_enabled) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+int native_sdk_appkit_minimize_window(native_sdk_appkit_host_t *host, uint64_t window_id) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
+    NSWindow *window = object.windows[@(window_id)];
+    if (!window) return 0;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [window miniaturize:nil];
+    });
+    return 1;
+}
+
+int native_sdk_appkit_start_window_drag(native_sdk_appkit_host_t *host, uint64_t window_id) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
+    NSWindow *window = object.windows[@(window_id)];
+    if (!window) return 0;
+    NSEvent *event = NSApp.currentEvent;
+    if (!event) return 1;
+    if (event.type != NSEventTypeLeftMouseDown && event.type != NSEventTypeLeftMouseDragged) return 1;
+    if (event.type == NSEventTypeLeftMouseDown && event.clickCount >= 2) {
+        NSString *action = [[NSUserDefaults standardUserDefaults] stringForKey:@"AppleActionOnDoubleClick"] ?: @"Maximize";
+        if ([action isEqualToString:@"Minimize"]) {
+            [window performMiniaturize:nil];
+        } else if (![action isEqualToString:@"None"]) {
+            [window performZoom:nil];
+        }
+        return 1;
+    }
+    [window performWindowDragWithEvent:event];
+    return 1;
+}
+
+int native_sdk_appkit_window_chrome_insets(native_sdk_appkit_host_t *host, uint64_t window_id, double *top, double *left, double *bottom, double *right, double *buttons_x, double *buttons_y, double *buttons_width, double *buttons_height) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
+    NSWindow *window = object.windows[@(window_id)];
+    if (!window) return 0;
+    *top = 0;
+    *left = 0;
+    *bottom = 0;
+    *right = 0;
+    *buttons_x = 0;
+    *buttons_y = 0;
+    *buttons_width = 0;
+    *buttons_height = 0;
+    if ((window.styleMask & NSWindowStyleMaskFullSizeContentView) == 0) return 1;
+    NSView *contentView = window.contentView;
+    if (!contentView) return 1;
+    NSRect contentBounds = contentView.bounds;
+    NSRect layoutRect = [contentView convertRect:window.contentLayoutRect fromView:nil];
+    double titlebarHeight = NSMaxY(contentBounds) - NSMaxY(layoutRect);
+    if (titlebarHeight <= 0.5) return 1;
+    *top = titlebarHeight;
+    NSButton *buttons[3] = {
+        [window standardWindowButton:NSWindowCloseButton],
+        [window standardWindowButton:NSWindowMiniaturizeButton],
+        [window standardWindowButton:NSWindowZoomButton],
+    };
+    NSRect cluster = NSZeroRect;
+    BOOL anyButtonVisible = NO;
+    for (size_t index = 0; index < 3; index += 1) {
+        NSButton *button = buttons[index];
+        if (!button || button.hidden || !button.superview) continue;
+        NSRect buttonFrame = [contentView convertRect:button.frame fromView:button.superview];
+        cluster = anyButtonVisible ? NSUnionRect(cluster, buttonFrame) : buttonFrame;
+        anyButtonVisible = YES;
+    }
+    if (!anyButtonVisible) return 1;
+    *buttons_x = NSMinX(cluster);
+    *buttons_y = NSMaxY(contentBounds) - NSMaxY(cluster);
+    *buttons_width = NSWidth(cluster);
+    *buttons_height = NSHeight(cluster);
+    if (NSMinX(cluster) < NSMidX(contentBounds)) {
+        *left = NSMaxX(cluster) + (NSMinX(cluster) - NSMinX(contentBounds));
+    } else {
+        *right = (NSMaxX(contentBounds) - NSMinX(cluster)) + (NSMaxX(contentBounds) - NSMaxX(cluster));
+    }
+    return 1;
+}
+
+int native_sdk_appkit_create_webview(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, const char *url, size_t url_len, double x, double y, double width, double height, int layer, int transparent, int bridge_enabled) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
     NSString *labelString = label ? [[NSString alloc] initWithBytes:label length:label_len encoding:NSUTF8StringEncoding] : @"";
     NSString *urlString = url ? [[NSString alloc] initWithBytes:url length:url_len encoding:NSUTF8StringEncoding] : @"";
     return [object createWebViewInWindow:window_id label:labelString ?: @"" url:urlString ?: @"" x:x y:y width:width height:height layer:layer transparent:transparent != 0 bridgeEnabled:bridge_enabled != 0] ? 1 : 0;
 }
 
-int zero_native_appkit_set_webview_frame(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, double x, double y, double width, double height) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+int native_sdk_appkit_set_webview_frame(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, double x, double y, double width, double height) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
     NSString *labelString = label ? [[NSString alloc] initWithBytes:label length:label_len encoding:NSUTF8StringEncoding] : @"";
     return [object setWebViewFrameInWindow:window_id label:labelString ?: @"" x:x y:y width:width height:height] ? 1 : 0;
 }
 
-int zero_native_appkit_navigate_webview(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, const char *url, size_t url_len) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+int native_sdk_appkit_navigate_webview(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, const char *url, size_t url_len) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
     NSString *labelString = label ? [[NSString alloc] initWithBytes:label length:label_len encoding:NSUTF8StringEncoding] : @"";
     NSString *urlString = url ? [[NSString alloc] initWithBytes:url length:url_len encoding:NSUTF8StringEncoding] : @"";
     return [object navigateWebViewInWindow:window_id label:labelString ?: @"" url:urlString ?: @""] ? 1 : 0;
 }
 
-int zero_native_appkit_set_webview_zoom(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, double zoom) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+int native_sdk_appkit_set_webview_zoom(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, double zoom) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
     NSString *labelString = label ? [[NSString alloc] initWithBytes:label length:label_len encoding:NSUTF8StringEncoding] : @"";
     return [object setWebViewZoomInWindow:window_id label:labelString ?: @"" zoom:zoom] ? 1 : 0;
 }
 
-int zero_native_appkit_set_webview_layer(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, int layer) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+int native_sdk_appkit_set_webview_layer(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, int layer) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
     NSString *labelString = label ? [[NSString alloc] initWithBytes:label length:label_len encoding:NSUTF8StringEncoding] : @"";
     return [object setWebViewLayerInWindow:window_id label:labelString ?: @"" layer:layer] ? 1 : 0;
 }
 
-int zero_native_appkit_close_webview(zero_native_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+int native_sdk_appkit_close_webview(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
     NSString *labelString = label ? [[NSString alloc] initWithBytes:label length:label_len encoding:NSUTF8StringEncoding] : @"";
     return [object closeWebViewInWindow:window_id label:labelString ?: @""] ? 1 : 0;
 }
 
-size_t zero_native_appkit_clipboard_read(zero_native_appkit_host_t *host, char *buffer, size_t buffer_len) {
-    return zero_native_appkit_clipboard_read_data(host, "text/plain", strlen("text/plain"), buffer, buffer_len);
+void native_sdk_appkit_start_timer(native_sdk_appkit_host_t *host, uint64_t timer_id, uint64_t interval_ns, int repeats) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
+    [object startAppTimerWithId:timer_id intervalNs:interval_ns repeats:(repeats != 0)];
 }
 
-void zero_native_appkit_clipboard_write(zero_native_appkit_host_t *host, const char *text, size_t text_len) {
-    (void)zero_native_appkit_clipboard_write_data(host, "text/plain", strlen("text/plain"), text, text_len);
+void native_sdk_appkit_cancel_timer(native_sdk_appkit_host_t *host, uint64_t timer_id) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
+    [object cancelAppTimerWithId:timer_id];
 }
 
-size_t zero_native_appkit_clipboard_read_data(zero_native_appkit_host_t *host, const char *mime_type, size_t mime_type_len, char *buffer, size_t buffer_len) {
+void native_sdk_appkit_wake(native_sdk_appkit_host_t *host) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
+    [object wakeFromAnyThread];
+}
+
+/* Audio playback lives in the system-engine AppKit host (AVAudioPlayer).
+ * The Chromium host reports the feature unsupported and the Zig side
+ * refuses before calling, so these exist only to satisfy the shared C
+ * ABI — each answers with its honest failure code. */
+int native_sdk_appkit_audio_load(native_sdk_appkit_host_t *host, const char *path, size_t path_len) {
     (void)host;
-    NSString *type = ZeroNativePasteboardTypeForMime(mime_type, mime_type_len);
+    (void)path;
+    (void)path_len;
+    return 2;
+}
+
+int native_sdk_appkit_audio_load_url(native_sdk_appkit_host_t *host, const char *url, size_t url_len, const char *cache_path, size_t cache_path_len, uint64_t expected_bytes) {
+    (void)host;
+    (void)url;
+    (void)url_len;
+    (void)cache_path;
+    (void)cache_path_len;
+    (void)expected_bytes;
+    return 2;
+}
+
+int native_sdk_appkit_audio_play(native_sdk_appkit_host_t *host) {
+    (void)host;
+    return 0;
+}
+
+int native_sdk_appkit_audio_pause(native_sdk_appkit_host_t *host) {
+    (void)host;
+    return 0;
+}
+
+int native_sdk_appkit_audio_stop(native_sdk_appkit_host_t *host) {
+    (void)host;
+    return 0;
+}
+
+int native_sdk_appkit_audio_seek(native_sdk_appkit_host_t *host, uint64_t position_ms) {
+    (void)host;
+    (void)position_ms;
+    return 0;
+}
+
+int native_sdk_appkit_audio_set_volume(native_sdk_appkit_host_t *host, double volume) {
+    (void)host;
+    (void)volume;
+    return 0;
+}
+
+void native_sdk_appkit_request_frame(native_sdk_appkit_host_t *host) {
+    // The AppKit host pauses FRAME events when idle, so a cross-thread
+    // frame request is how the automation arrival watcher wakes it. The
+    // Chromium host pumps FRAME unconditionally at 60Hz from its
+    // message-loop timer (see emitFrame), so the next tick is never more
+    // than ~16 ms away and a request has nothing to add.
+    (void)host;
+}
+
+/* GPU-surface compositing (pixel/packet presents, image store, scroll
+ * drivers, widget accessibility trees) is implemented by the system-engine
+ * AppKit host only; the Chromium host renders every window through the web
+ * engine and creates no gpu-surface views (see native_sdk_appkit_create_view
+ * above). These report failure through the same channel as an unknown view
+ * so callers see an explicit error instead of silently dropped frames. */
+int native_sdk_appkit_adopt_view_surface(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, void *ns_view) {
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    (void)ns_view;
+    return 0;
+}
+
+int native_sdk_appkit_release_view_surface(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len) {
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    return 0;
+}
+
+int native_sdk_appkit_request_gpu_surface_frame(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len) {
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    return 0;
+}
+
+int native_sdk_appkit_note_gpu_surface_input(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len) {
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    return 0;
+}
+
+int native_sdk_appkit_set_gpu_surface_scroll_drivers(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, const native_sdk_appkit_scroll_driver_t *drivers, size_t count) {
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    (void)drivers;
+    (void)count;
+    return 0;
+}
+
+int native_sdk_appkit_present_gpu_surface_pixels(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, size_t width, size_t height, double scale, int has_dirty_rect, double dirty_x, double dirty_y, double dirty_width, double dirty_height, const uint8_t *rgba8, size_t rgba8_len) {
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    (void)width;
+    (void)height;
+    (void)scale;
+    (void)has_dirty_rect;
+    (void)dirty_x;
+    (void)dirty_y;
+    (void)dirty_width;
+    (void)dirty_height;
+    (void)rgba8;
+    (void)rgba8_len;
+    return 0;
+}
+
+int native_sdk_appkit_present_gpu_surface_packet(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, double surface_width, double surface_height, double scale, uint8_t clear_r, uint8_t clear_g, uint8_t clear_b, uint8_t clear_a, int requires_render, size_t command_count, size_t unsupported_command_count, int representable, const uint8_t *json, size_t json_len) {
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    (void)surface_width;
+    (void)surface_height;
+    (void)scale;
+    (void)clear_r;
+    (void)clear_g;
+    (void)clear_b;
+    (void)clear_a;
+    (void)requires_render;
+    (void)command_count;
+    (void)unsupported_command_count;
+    (void)representable;
+    (void)json;
+    (void)json_len;
+    return 0;
+}
+
+int native_sdk_appkit_present_gpu_surface_packet_binary(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, double surface_width, double surface_height, double scale, uint8_t clear_r, uint8_t clear_g, uint8_t clear_b, uint8_t clear_a, int requires_render, size_t command_count, size_t unsupported_command_count, int representable, const uint8_t *packet, size_t packet_len) {
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    (void)surface_width;
+    (void)surface_height;
+    (void)scale;
+    (void)clear_r;
+    (void)clear_g;
+    (void)clear_b;
+    (void)clear_a;
+    (void)requires_render;
+    (void)command_count;
+    (void)unsupported_command_count;
+    (void)representable;
+    (void)packet;
+    (void)packet_len;
+    return 0;
+}
+
+int native_sdk_appkit_upload_gpu_surface_image(native_sdk_appkit_host_t *host, uint64_t image_id, size_t width, size_t height, const uint8_t *rgba8, size_t rgba8_len) {
+    (void)host;
+    (void)image_id;
+    (void)width;
+    (void)height;
+    (void)rgba8;
+    (void)rgba8_len;
+    return 0;
+}
+
+int native_sdk_appkit_remove_gpu_surface_image(native_sdk_appkit_host_t *host, uint64_t image_id) {
+    (void)host;
+    (void)image_id;
+    return 0;
+}
+
+int native_sdk_appkit_update_widget_accessibility(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, const native_sdk_appkit_widget_accessibility_node_t *nodes, size_t node_count) {
+    (void)host;
+    (void)window_id;
+    (void)label;
+    (void)label_len;
+    (void)nodes;
+    (void)node_count;
+    return 0;
+}
+
+/* The Chromium host has no packet text renderer and reports no host text
+ * metrics (see native_sdk_appkit_measure_text below), so a registered
+ * face has no host-side consumer: the engine's font-aware provider
+ * measures registered ids and the reference path inks them. Accept the
+ * registration so `Options.fonts` apps start identically under both
+ * hosts; refusing here would fail startup for a face this host never
+ * resolves. */
+int native_sdk_appkit_register_font(uint64_t font_id, const uint8_t *bytes, size_t bytes_len) {
+    if (font_id == 0 || !bytes || bytes_len == 0) return 0;
+    return 1;
+}
+
+/* The Chromium host has no packet text renderer, so there are no host
+ * metrics to match: return the documented negative sentinel and the canvas
+ * provider uses its estimator (the same fallback the AppKit host takes for
+ * invalid UTF-8). */
+double native_sdk_appkit_measure_text(uint64_t font_id, double size, const char *text, size_t text_len) {
+    (void)font_id;
+    (void)size;
+    (void)text;
+    (void)text_len;
+    return -1;
+}
+
+/* Batched advances twin of the decline above: no host metrics means no
+ * host advances either. Returning 0 declines the batch, and the engine
+ * takes the same estimator fallback the per-prefix seam takes — the
+ * decline route is pinned by the text batch parity tests. */
+int native_sdk_appkit_measure_text_advances(uint64_t font_id, double size, const char *text, size_t text_len, float *advances) {
+    (void)font_id;
+    (void)size;
+    (void)text;
+    (void)text_len;
+    (void)advances;
+    return 0;
+}
+
+/* Mirror of the AppKit host's decoder: pure CoreGraphics/ImageIO with no
+ * host state, so both engines decode identically. See appkit_host.h for
+ * the pixel-format and return-value contract. */
+int native_sdk_appkit_decode_image(const uint8_t *bytes, size_t bytes_len, uint8_t *pixels, size_t pixels_len, size_t *out_width, size_t *out_height) {
+    if (out_width) *out_width = 0;
+    if (out_height) *out_height = 0;
+    if (!bytes || bytes_len == 0 || !pixels) return 0;
+    @autoreleasepool {
+        NSData *data = [NSData dataWithBytesNoCopy:(void *)bytes length:bytes_len freeWhenDone:NO];
+        CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
+        if (!source) return 0;
+        CGImageRef image = CGImageSourceCreateImageAtIndex(source, 0, NULL);
+        CFRelease(source);
+        if (!image) return 0;
+
+        size_t width = CGImageGetWidth(image);
+        size_t height = CGImageGetHeight(image);
+        if (width == 0 || height == 0 || width > 8192 || height > 8192) {
+            CGImageRelease(image);
+            return 0;
+        }
+        if (out_width) *out_width = width;
+        if (out_height) *out_height = height;
+        size_t byte_len = width * height * 4;
+        if (byte_len / 4 / height != width || pixels_len < byte_len) {
+            CGImageRelease(image);
+            return -1;
+        }
+
+        CGColorSpaceRef color_space = CGColorSpaceCreateDeviceRGB();
+        if (!color_space) {
+            CGImageRelease(image);
+            return 0;
+        }
+        CGContextRef context = CGBitmapContextCreate(pixels, width, height, 8, width * 4, color_space, kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+        CGColorSpaceRelease(color_space);
+        if (!context) {
+            CGImageRelease(image);
+            return 0;
+        }
+        memset(pixels, 0, byte_len);
+        CGContextSetBlendMode(context, kCGBlendModeCopy);
+        CGContextDrawImage(context, CGRectMake(0, 0, (CGFloat)width, (CGFloat)height), image);
+        CGContextRelease(context);
+        CGImageRelease(image);
+
+        // Un-premultiply: round to nearest so opaque pixels survive exactly.
+        for (size_t offset = 0; offset < byte_len; offset += 4) {
+            uint8_t alpha = pixels[offset + 3];
+            if (alpha == 0) {
+                pixels[offset + 0] = 0;
+                pixels[offset + 1] = 0;
+                pixels[offset + 2] = 0;
+            } else if (alpha != 255) {
+                pixels[offset + 0] = (uint8_t)MIN(255, ((size_t)pixels[offset + 0] * 255 + alpha / 2) / alpha);
+                pixels[offset + 1] = (uint8_t)MIN(255, ((size_t)pixels[offset + 1] * 255 + alpha / 2) / alpha);
+                pixels[offset + 2] = (uint8_t)MIN(255, ((size_t)pixels[offset + 2] * 255 + alpha / 2) / alpha);
+            }
+        }
+        return 1;
+    }
+}
+
+size_t native_sdk_appkit_clipboard_read(native_sdk_appkit_host_t *host, char *buffer, size_t buffer_len) {
+    return native_sdk_appkit_clipboard_read_data(host, "text/plain", strlen("text/plain"), buffer, buffer_len);
+}
+
+void native_sdk_appkit_clipboard_write(native_sdk_appkit_host_t *host, const char *text, size_t text_len) {
+    (void)native_sdk_appkit_clipboard_write_data(host, "text/plain", strlen("text/plain"), text, text_len);
+}
+
+size_t native_sdk_appkit_clipboard_read_data(native_sdk_appkit_host_t *host, const char *mime_type, size_t mime_type_len, char *buffer, size_t buffer_len) {
+    (void)host;
+    NSString *type = NativeSdkPasteboardTypeForMime(mime_type, mime_type_len);
     if (!type || !buffer) return 0;
     NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
     NSData *data = nil;
@@ -1955,9 +2580,9 @@ size_t zero_native_appkit_clipboard_read_data(zero_native_appkit_host_t *host, c
     return count;
 }
 
-int zero_native_appkit_clipboard_write_data(zero_native_appkit_host_t *host, const char *mime_type, size_t mime_type_len, const char *bytes, size_t bytes_len) {
+int native_sdk_appkit_clipboard_write_data(native_sdk_appkit_host_t *host, const char *mime_type, size_t mime_type_len, const char *bytes, size_t bytes_len) {
     (void)host;
-    NSString *type = ZeroNativePasteboardTypeForMime(mime_type, mime_type_len);
+    NSString *type = NativeSdkPasteboardTypeForMime(mime_type, mime_type_len);
     if (!type || (!bytes && bytes_len > 0)) return 0;
     NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
     [pasteboard clearContents];
@@ -1969,7 +2594,7 @@ int zero_native_appkit_clipboard_write_data(zero_native_appkit_host_t *host, con
     return [pasteboard setData:data forType:type] ? 1 : 0;
 }
 
-int zero_native_appkit_show_notification(zero_native_appkit_host_t *host, const char *title, size_t title_len, const char *subtitle, size_t subtitle_len, const char *body, size_t body_len) {
+int native_sdk_appkit_show_notification(native_sdk_appkit_host_t *host, const char *title, size_t title_len, const char *subtitle, size_t subtitle_len, const char *body, size_t body_len) {
     (void)host;
     NSString *titleString = title ? [[NSString alloc] initWithBytes:title length:title_len encoding:NSUTF8StringEncoding] : @"";
     if (titleString.length == 0) return 0;
@@ -1983,7 +2608,7 @@ int zero_native_appkit_show_notification(zero_native_appkit_host_t *host, const 
     return 1;
 }
 
-int zero_native_appkit_open_external_url(zero_native_appkit_host_t *host, const char *url, size_t url_len) {
+int native_sdk_appkit_open_external_url(native_sdk_appkit_host_t *host, const char *url, size_t url_len) {
     (void)host;
     NSString *urlString = url ? [[NSString alloc] initWithBytes:url length:url_len encoding:NSUTF8StringEncoding] : @"";
     if (urlString.length == 0) return 0;
@@ -1992,7 +2617,7 @@ int zero_native_appkit_open_external_url(zero_native_appkit_host_t *host, const 
     return [[NSWorkspace sharedWorkspace] openURL:target] ? 1 : 0;
 }
 
-int zero_native_appkit_reveal_path(zero_native_appkit_host_t *host, const char *path, size_t path_len) {
+int native_sdk_appkit_reveal_path(native_sdk_appkit_host_t *host, const char *path, size_t path_len) {
     (void)host;
     NSString *pathString = path ? [[NSString alloc] initWithBytes:path length:path_len encoding:NSUTF8StringEncoding] : @"";
     if (pathString.length == 0) return 0;
@@ -2002,7 +2627,7 @@ int zero_native_appkit_reveal_path(zero_native_appkit_host_t *host, const char *
     return 1;
 }
 
-int zero_native_appkit_add_recent_document(zero_native_appkit_host_t *host, const char *path, size_t path_len) {
+int native_sdk_appkit_add_recent_document(native_sdk_appkit_host_t *host, const char *path, size_t path_len) {
     (void)host;
     NSString *pathString = path ? [[NSString alloc] initWithBytes:path length:path_len encoding:NSUTF8StringEncoding] : @"";
     if (pathString.length == 0) return 0;
@@ -2012,20 +2637,20 @@ int zero_native_appkit_add_recent_document(zero_native_appkit_host_t *host, cons
     return 1;
 }
 
-int zero_native_appkit_clear_recent_documents(zero_native_appkit_host_t *host) {
+int native_sdk_appkit_clear_recent_documents(native_sdk_appkit_host_t *host) {
     (void)host;
     [[NSDocumentController sharedDocumentController] clearRecentDocuments:nil];
     return 1;
 }
 
-int zero_native_appkit_set_credential(zero_native_appkit_host_t *host, const char *service, size_t service_len, const char *account, size_t account_len, const char *secret, size_t secret_len) {
+int native_sdk_appkit_set_credential(native_sdk_appkit_host_t *host, const char *service, size_t service_len, const char *account, size_t account_len, const char *secret, size_t secret_len) {
     (void)host;
     @autoreleasepool {
-        NSString *serviceString = ZeroNativeStringFromBytes(service, service_len);
-        NSString *accountString = ZeroNativeStringFromBytes(account, account_len);
+        NSString *serviceString = NativeSdkStringFromBytes(service, service_len);
+        NSString *accountString = NativeSdkStringFromBytes(account, account_len);
         if (serviceString.length == 0 || accountString.length == 0 || !secret || secret_len == 0) return 0;
         NSData *secretData = [NSData dataWithBytes:secret length:secret_len];
-        NSMutableDictionary *query = ZeroNativeCredentialQuery(serviceString, accountString);
+        NSMutableDictionary *query = NativeSdkCredentialQuery(serviceString, accountString);
         NSDictionary *update = @{ (__bridge id)kSecValueData: secretData };
         OSStatus status = SecItemUpdate((__bridge CFDictionaryRef)query, (__bridge CFDictionaryRef)update);
         if (status == errSecItemNotFound) {
@@ -2036,13 +2661,13 @@ int zero_native_appkit_set_credential(zero_native_appkit_host_t *host, const cha
     }
 }
 
-size_t zero_native_appkit_get_credential(zero_native_appkit_host_t *host, const char *service, size_t service_len, const char *account, size_t account_len, char *buffer, size_t buffer_len) {
+size_t native_sdk_appkit_get_credential(native_sdk_appkit_host_t *host, const char *service, size_t service_len, const char *account, size_t account_len, char *buffer, size_t buffer_len) {
     (void)host;
     @autoreleasepool {
-        NSString *serviceString = ZeroNativeStringFromBytes(service, service_len);
-        NSString *accountString = ZeroNativeStringFromBytes(account, account_len);
+        NSString *serviceString = NativeSdkStringFromBytes(service, service_len);
+        NSString *accountString = NativeSdkStringFromBytes(account, account_len);
         if (serviceString.length == 0 || accountString.length == 0 || !buffer) return 0;
-        NSMutableDictionary *query = ZeroNativeCredentialQuery(serviceString, accountString);
+        NSMutableDictionary *query = NativeSdkCredentialQuery(serviceString, accountString);
         query[(__bridge id)kSecReturnData] = @YES;
         query[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitOne;
         CFTypeRef result = NULL;
@@ -2055,19 +2680,19 @@ size_t zero_native_appkit_get_credential(zero_native_appkit_host_t *host, const 
     }
 }
 
-int zero_native_appkit_delete_credential(zero_native_appkit_host_t *host, const char *service, size_t service_len, const char *account, size_t account_len) {
+int native_sdk_appkit_delete_credential(native_sdk_appkit_host_t *host, const char *service, size_t service_len, const char *account, size_t account_len) {
     (void)host;
     @autoreleasepool {
-        NSString *serviceString = ZeroNativeStringFromBytes(service, service_len);
-        NSString *accountString = ZeroNativeStringFromBytes(account, account_len);
+        NSString *serviceString = NativeSdkStringFromBytes(service, service_len);
+        NSString *accountString = NativeSdkStringFromBytes(account, account_len);
         if (serviceString.length == 0 || accountString.length == 0) return 0;
-        NSMutableDictionary *query = ZeroNativeCredentialQuery(serviceString, accountString);
+        NSMutableDictionary *query = NativeSdkCredentialQuery(serviceString, accountString);
         OSStatus status = SecItemDelete((__bridge CFDictionaryRef)query);
         return status == errSecSuccess ? 1 : 0;
     }
 }
 
-static NSArray<NSString *> *ZeroNativeParseExtensions(const char *extensions, size_t len) {
+static NSArray<NSString *> *NativeSdkParseExtensions(const char *extensions, size_t len) {
     if (!extensions || len == 0) return nil;
     NSString *str = [[NSString alloc] initWithBytes:extensions length:len encoding:NSUTF8StringEncoding];
     if (!str || str.length == 0) return nil;
@@ -2079,11 +2704,11 @@ static NSArray<NSString *> *ZeroNativeParseExtensions(const char *extensions, si
     return result.count > 0 ? result : nil;
 }
 
-static size_t ZeroNativeOverflowSize(size_t buffer_len) {
+static size_t NativeSdkOverflowSize(size_t buffer_len) {
     return buffer_len == SIZE_MAX ? SIZE_MAX : buffer_len + 1;
 }
 
-static void ZeroNativeConfigurePanelExtensions(NSSavePanel *panel, NSArray<NSString *> *extensions) {
+static void NativeSdkConfigurePanelExtensions(NSSavePanel *panel, NSArray<NSString *> *extensions) {
     if (!extensions || extensions.count == 0) return;
     if (@available(macOS 11.0, *)) {
         NSMutableArray *types = [NSMutableArray array];
@@ -2095,9 +2720,9 @@ static void ZeroNativeConfigurePanelExtensions(NSSavePanel *panel, NSArray<NSStr
     }
 }
 
-zero_native_appkit_open_dialog_result_t zero_native_appkit_show_open_dialog(zero_native_appkit_host_t *host, const zero_native_appkit_open_dialog_opts_t *opts, char *buffer, size_t buffer_len) {
+native_sdk_appkit_open_dialog_result_t native_sdk_appkit_show_open_dialog(native_sdk_appkit_host_t *host, const native_sdk_appkit_open_dialog_opts_t *opts, char *buffer, size_t buffer_len) {
     (void)host;
-    zero_native_appkit_open_dialog_result_t result = { .count = 0, .bytes_written = 0 };
+    native_sdk_appkit_open_dialog_result_t result = { .count = 0, .bytes_written = 0 };
     @autoreleasepool {
         NSOpenPanel *panel = [NSOpenPanel openPanel];
         if (opts->title && opts->title_len > 0) {
@@ -2110,7 +2735,7 @@ zero_native_appkit_open_dialog_result_t zero_native_appkit_show_open_dialog(zero
         panel.canChooseFiles = YES;
         panel.canChooseDirectories = opts->allow_directories != 0;
         panel.allowsMultipleSelection = opts->allow_multiple != 0;
-        ZeroNativeConfigurePanelExtensions(panel, ZeroNativeParseExtensions(opts->extensions, opts->extensions_len));
+        NativeSdkConfigurePanelExtensions(panel, NativeSdkParseExtensions(opts->extensions, opts->extensions_len));
 
         if ([panel runModal] != NSModalResponseOK) return result;
 
@@ -2130,12 +2755,12 @@ zero_native_appkit_open_dialog_result_t zero_native_appkit_show_open_dialog(zero
             offset += data.length;
             result.count++;
         }
-        result.bytes_written = overflow ? ZeroNativeOverflowSize(buffer_len) : offset;
+        result.bytes_written = overflow ? NativeSdkOverflowSize(buffer_len) : offset;
     }
     return result;
 }
 
-size_t zero_native_appkit_show_save_dialog(zero_native_appkit_host_t *host, const zero_native_appkit_save_dialog_opts_t *opts, char *buffer, size_t buffer_len) {
+size_t native_sdk_appkit_show_save_dialog(native_sdk_appkit_host_t *host, const native_sdk_appkit_save_dialog_opts_t *opts, char *buffer, size_t buffer_len) {
     (void)host;
     @autoreleasepool {
         NSSavePanel *panel = [NSSavePanel savePanel];
@@ -2149,7 +2774,7 @@ size_t zero_native_appkit_show_save_dialog(zero_native_appkit_host_t *host, cons
         if (opts->default_name && opts->default_name_len > 0) {
             panel.nameFieldStringValue = [[NSString alloc] initWithBytes:opts->default_name length:opts->default_name_len encoding:NSUTF8StringEncoding];
         }
-        ZeroNativeConfigurePanelExtensions(panel, ZeroNativeParseExtensions(opts->extensions, opts->extensions_len));
+        NativeSdkConfigurePanelExtensions(panel, NativeSdkParseExtensions(opts->extensions, opts->extensions_len));
 
         if ([panel runModal] != NSModalResponseOK) return 0;
 
@@ -2157,13 +2782,13 @@ size_t zero_native_appkit_show_save_dialog(zero_native_appkit_host_t *host, cons
         NSData *data = [path dataUsingEncoding:NSUTF8StringEncoding];
         if (!data) return 0;
         size_t count = data.length;
-        if (count > buffer_len) return ZeroNativeOverflowSize(buffer_len);
+        if (count > buffer_len) return NativeSdkOverflowSize(buffer_len);
         memcpy(buffer, data.bytes, count);
         return count;
     }
 }
 
-int zero_native_appkit_show_message_dialog(zero_native_appkit_host_t *host, const zero_native_appkit_message_dialog_opts_t *opts) {
+int native_sdk_appkit_show_message_dialog(native_sdk_appkit_host_t *host, const native_sdk_appkit_message_dialog_opts_t *opts) {
     (void)host;
     @autoreleasepool {
         NSAlert *alert = [[NSAlert alloc] init];
@@ -2200,13 +2825,16 @@ int zero_native_appkit_show_message_dialog(zero_native_appkit_host_t *host, cons
     }
 }
 
-void zero_native_appkit_create_tray(zero_native_appkit_host_t *host, const char *icon_path, size_t icon_path_len, const char *tooltip, size_t tooltip_len) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+void native_sdk_appkit_create_tray(native_sdk_appkit_host_t *host, const char *icon_path, size_t icon_path_len, const char *title, size_t title_len, const char *tooltip, size_t tooltip_len) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
     @autoreleasepool {
         if (object.statusItem) {
             [[NSStatusBar systemStatusBar] removeStatusItem:object.statusItem];
         }
-        object.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSSquareStatusItemLength];
+        // A titled menu-bar extra needs variable width; icon-only status
+        // items keep the classic square well.
+        BOOL hasTitle = title != NULL && title_len > 0;
+        object.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:hasTitle ? NSVariableStatusItemLength : NSSquareStatusItemLength];
 
         if (icon_path && icon_path_len > 0) {
             NSString *path = [[NSString alloc] initWithBytes:icon_path length:icon_path_len encoding:NSUTF8StringEncoding];
@@ -2217,7 +2845,10 @@ void zero_native_appkit_create_tray(zero_native_appkit_host_t *host, const char 
                 object.statusItem.button.image = image;
             }
         }
-        if (!object.statusItem.button.image) {
+        if (hasTitle) {
+            object.statusItem.button.title = [[NSString alloc] initWithBytes:title length:title_len encoding:NSUTF8StringEncoding] ?: @"";
+        }
+        if (!object.statusItem.button.image && object.statusItem.button.title.length == 0) {
             object.statusItem.button.title = object.appName.length > 0 ? [object.appName substringToIndex:MIN(1, object.appName.length)] : @"Z";
         }
         if (tooltip && tooltip_len > 0) {
@@ -2226,8 +2857,8 @@ void zero_native_appkit_create_tray(zero_native_appkit_host_t *host, const char 
     }
 }
 
-void zero_native_appkit_update_tray_menu(zero_native_appkit_host_t *host, const uint32_t *item_ids, const char *const *labels, const size_t *label_lens, const int *separators, const int *enabled_flags, size_t count) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+void native_sdk_appkit_update_tray_menu(native_sdk_appkit_host_t *host, const uint32_t *item_ids, const char *const *labels, const size_t *label_lens, const int *separators, const int *enabled_flags, size_t count) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
     @autoreleasepool {
         if (!object.statusItem) return;
         NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
@@ -2249,16 +2880,149 @@ void zero_native_appkit_update_tray_menu(zero_native_appkit_host_t *host, const 
     }
 }
 
-void zero_native_appkit_remove_tray(zero_native_appkit_host_t *host) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+int native_sdk_appkit_set_window_content_min_size(native_sdk_appkit_host_t *host, uint64_t window_id, double min_width, double min_height) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
+    NSWindow *window = object.windows[@(window_id)];
+    if (!window) return 0;
+    // The declared floor is CONTENT size (matches the frame the runtime
+    // reasons about); AppKit adds the chrome on top. Axes <= 0 keep
+    // AppKit's default minimum for that axis.
+    NSSize current = window.contentMinSize;
+    window.contentMinSize = NSMakeSize(min_width > 0 ? min_width : current.width,
+                                       min_height > 0 ? min_height : current.height);
+    return 1;
+}
+
+void native_sdk_appkit_update_tray_title(native_sdk_appkit_host_t *host, const char *title, size_t title_len) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
+    @autoreleasepool {
+        if (!object.statusItem) return;
+        BOOL hasTitle = title != NULL && title_len > 0;
+        NSString *value = hasTitle ? ([[NSString alloc] initWithBytes:title length:title_len encoding:NSUTF8StringEncoding] ?: @"") : @"";
+        object.statusItem.button.title = value;
+        if (!object.statusItem.button.image && value.length == 0) {
+            // Same fallback as create: a bare status item must still show
+            // SOMETHING to stay clickable.
+            object.statusItem.button.title = object.appName.length > 0 ? [object.appName substringToIndex:MIN(1, object.appName.length)] : @"Z";
+        }
+        // Titled extras need variable width; icon-only ones keep the
+        // classic square well (mirrors create's length choice).
+        object.statusItem.length = object.statusItem.button.title.length > 0 ? NSVariableStatusItemLength : NSSquareStatusItemLength;
+    }
+}
+
+void native_sdk_appkit_remove_tray(native_sdk_appkit_host_t *host) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
     if (object.statusItem) {
         [[NSStatusBar systemStatusBar] removeStatusItem:object.statusItem];
         object.statusItem = nil;
     }
 }
 
-void zero_native_appkit_set_tray_callback(zero_native_appkit_host_t *host, zero_native_appkit_tray_callback_t callback, void *context) {
-    ZeroNativeChromiumHost *object = (__bridge ZeroNativeChromiumHost *)host;
+/* Dock icon entry points, CEF engine: the Chromium shell is still a
+ * macOS app with a Dock tile, so the dev-run icon path (including the
+ * Debug-only masked render of raw image sources) applies here exactly
+ * as under the system host. The rgba form copies the caller's
+ * straight-alpha rows into a rep the image owns (the caller frees its
+ * buffer on return); only the NSApp adoption needs the main queue. */
+void native_sdk_appkit_set_dock_icon_rgba(native_sdk_appkit_host_t *host, const uint8_t *pixels, size_t width, size_t height) {
+    (void)host;
+    if (!pixels || width == 0 || height == 0) return;
+    @autoreleasepool {
+        NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL
+                                                                        pixelsWide:(NSInteger)width
+                                                                        pixelsHigh:(NSInteger)height
+                                                                     bitsPerSample:8
+                                                                   samplesPerPixel:4
+                                                                          hasAlpha:YES
+                                                                          isPlanar:NO
+                                                                    colorSpaceName:NSCalibratedRGBColorSpace
+                                                                      bitmapFormat:NSBitmapFormatAlphaNonpremultiplied
+                                                                       bytesPerRow:0
+                                                                      bitsPerPixel:32];
+        if (!rep || !rep.bitmapData) return;
+        const size_t source_stride = width * 4;
+        const size_t dest_stride = (size_t)rep.bytesPerRow;
+        unsigned char *dest = rep.bitmapData;
+        for (size_t y = 0; y < height; y += 1) {
+            memcpy(dest + y * dest_stride, pixels + y * source_stride, source_stride);
+        }
+        NSImage *icon = [[NSImage alloc] initWithSize:NSMakeSize((CGFloat)width, (CGFloat)height)];
+        [icon addRepresentation:rep];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [NSApp setApplicationIconImage:icon];
+        });
+    }
+}
+
+void native_sdk_appkit_set_dock_icon_file(native_sdk_appkit_host_t *host, const char *path, size_t path_len) {
+    (void)host;
+    if (!path || path_len == 0) return;
+    @autoreleasepool {
+        NSString *pathString = [[NSString alloc] initWithBytes:path length:path_len encoding:NSUTF8StringEncoding];
+        if (pathString.length == 0) return;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            NSImage *icon = [[NSImage alloc] initWithContentsOfFile:pathString];
+            if (!icon) return;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [NSApp setApplicationIconImage:icon];
+            });
+        });
+    }
+}
+
+void native_sdk_appkit_set_tray_callback(native_sdk_appkit_host_t *host, native_sdk_appkit_tray_callback_t callback, void *context) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
     object.trayCallback = callback;
     object.trayContext = context;
+}
+
+/* Native context menu, CEF engine: same NSMenu presentation as the
+ * system-engine host, anchored to the window content view (gpu-surface
+ * views are system-engine-only, so `label` resolves to the window). */
+int native_sdk_appkit_show_context_menu(native_sdk_appkit_host_t *host, uint64_t window_id, const char *label, size_t label_len, double x, double y, uint64_t token, const native_sdk_appkit_context_menu_item_t *items, size_t count) {
+    NativeSdkChromiumHost *object = (__bridge NativeSdkChromiumHost *)host;
+    NSWindow *window = object.windows[@(window_id)] ?: (window_id == 1 ? object.window : nil);
+    NSView *view = window.contentView;
+    if (!view || count == 0) return 0;
+
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
+    menu.autoenablesItems = NO;
+    NativeSdkChromiumContextMenuTarget *target = [[NativeSdkChromiumContextMenuTarget alloc] init];
+    for (size_t index = 0; index < count; index += 1) {
+        const native_sdk_appkit_context_menu_item_t item = items[index];
+        if (item.separator) {
+            [menu addItem:[NSMenuItem separatorItem]];
+            continue;
+        }
+        NSString *title = item.label ? [[NSString alloc] initWithBytes:item.label length:item.label_len encoding:NSUTF8StringEncoding] : @"";
+        NSMenuItem *menuItem = [[NSMenuItem alloc] initWithTitle:title ?: @"" action:@selector(contextMenuItemClicked:) keyEquivalent:@""];
+        menuItem.target = target;
+        menuItem.enabled = item.enabled != 0;
+        menuItem.representedObject = @(item.item_id);
+        [menu addItem:menuItem];
+    }
+
+    NSString *eventLabel = label ? [[NSString alloc] initWithBytes:label length:label_len encoding:NSUTF8StringEncoding] : @"";
+    NSPoint location = NSMakePoint(x, view.isFlipped ? y : view.bounds.size.height - y);
+    __weak NativeSdkChromiumHost *weakSelf = object;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NativeSdkChromiumHost *presentSelf = weakSelf;
+        if (!presentSelf) return;
+        [menu popUpMenuPositioningItem:nil atLocation:location inView:view];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NativeSdkChromiumHost *emitSelf = weakSelf;
+            if (!emitSelf) return;
+            const char *labelBytes = eventLabel.UTF8String ?: "";
+            [emitSelf emitEvent:(native_sdk_appkit_event_t){
+                .kind = NATIVE_SDK_APPKIT_EVENT_CONTEXT_MENU_ACTION,
+                .window_id = window_id,
+                .view_label = labelBytes,
+                .view_label_len = [eventLabel lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
+                .widget_id = token,
+                .menu_item_id = target.selectedItemId,
+            }];
+        });
+    });
+    return 1;
 }

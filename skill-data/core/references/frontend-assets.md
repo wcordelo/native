@@ -7,16 +7,16 @@ Use this when working with React, Vue, Svelte, Next.js, Vite, dev servers, HMR, 
 Framework apps should use a dynamic source:
 
 ```zig
-fn source(context: *anyopaque) anyerror!zero_native.WebViewSource {
+fn source(context: *anyopaque) anyerror!native_sdk.WebViewSource {
     const self: *App = @ptrCast(@alignCast(context));
-    return zero_native.frontend.sourceFromEnv(self.env_map, .{
+    return native_sdk.frontend.sourceFromEnv(self.env_map, .{
         .dist = "frontend/dist",
         .entry = "index.html",
     });
 }
 ```
 
-`sourceFromEnv` checks `ZERO_NATIVE_FRONTEND_URL`. If set, the WebView loads the dev server URL. If not set, it serves packaged assets from `dist`.
+`sourceFromEnv` checks `NATIVE_SDK_FRONTEND_URL`. If set, the WebView loads the dev server URL. If not set, it serves packaged assets from `dist`.
 
 ## Manifest frontend config
 
@@ -40,7 +40,7 @@ Fields:
 - `entry`: HTML entry file within `dist`.
 - `spa_fallback`: serve `entry` for unknown routes.
 - `dev.url`: local dev server URL.
-- `dev.command`: command zero-native can spawn.
+- `dev.command`: command the Native SDK can spawn.
 - `dev.ready_path`: path to poll for readiness.
 - `dev.timeout_ms`: readiness timeout.
 
@@ -55,10 +55,10 @@ zig build dev
 Or directly:
 
 ```bash
-zero-native dev --manifest app.zon --binary zig-out/bin/MyApp
+native dev --manifest app.zon --binary zig-out/bin/MyApp
 ```
 
-The dev command starts the frontend process, waits for readiness, sets `ZERO_NATIVE_FRONTEND_URL`, launches the native shell, and terminates the frontend when the shell exits.
+The dev command starts the frontend process, waits for readiness, sets `NATIVE_SDK_FRONTEND_URL`, launches the native shell, and terminates the frontend when the shell exits.
 
 Framework defaults:
 
@@ -70,13 +70,13 @@ Framework defaults:
 For packaged builds, serve local assets from `zero://app`:
 
 ```zig
-return zero_native.frontend.productionSource(.{
+return native_sdk.frontend.productionSource(.{
     .dist = "frontend/dist",
     .entry = "index.html",
 });
 ```
 
-The package/build flow should build the frontend before packaging. `zig build bundle-assets` and `zero-native bundle-assets` copy the configured dist directory into build/package output.
+The package/build flow should build the frontend before packaging. `zig build bundle-assets` and `native bundle-assets` copy the configured dist directory into build/package output.
 
 ## Security and frontend origins
 

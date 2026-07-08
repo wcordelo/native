@@ -1,9 +1,8 @@
 .{
-    .id = "dev.zero_native.native_panels",
+    .id = "dev.native_sdk.native_panels",
     .name = "native-panels",
     .display_name = "Native Panels",
     .version = "0.1.0",
-    .icons = .{ "assets/icon.icns" },
     .platforms = .{ "macos", "linux" },
     .permissions = .{ "view" },
     .capabilities = .{ "webview", "js_bridge", "native_views" },
@@ -11,7 +10,7 @@
         .windows = .{
             .{
                 .label = "main",
-                .title = "zero-native Native Panels",
+                .title = "Native SDK Native Panels",
                 .width = 1040,
                 .height = 680,
                 .restore_policy = "center_on_primary",

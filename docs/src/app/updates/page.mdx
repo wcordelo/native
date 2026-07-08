@@ -1,10 +1,10 @@
 # Updates
 
-zero-native reserves an explicit update configuration in `app.zon` so packaged apps can declare how they discover signed updates.
+The Native SDK reserves an explicit update configuration in `app.zon` so packaged apps can declare how they discover signed updates.
 
 ```zig
 .updates = .{
-    .feed_url = "https://example.com/releases/zero-native-feed.json",
+    .feed_url = "https://example.com/releases/native-sdk-feed.json",
     .public_key = "base64-ed25519-public-key",
     .check_on_start = true,
 },

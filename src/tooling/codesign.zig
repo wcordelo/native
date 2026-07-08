@@ -111,6 +111,10 @@ fn runSign(io: std.Io, args: CodesignArgs) !SignResult {
     return .{ .ok = true, .message = "signed" };
 }
 
+/// Run one shell command and FAIL on a non-zero exit: a codesign that
+/// exits 1 (or a host without codesign at all, exit 127) must surface as
+/// an error so callers record the bundle as unsigned instead of
+/// reporting a signature that does not exist.
 fn runShell(io: std.Io, cmd: []const u8) !void {
     const argv = [_][]const u8{ "sh", "-c", cmd };
     var child = try std.process.spawn(io, .{
@@ -119,7 +123,11 @@ fn runShell(io: std.Io, cmd: []const u8) !void {
         .stdout = .inherit,
         .stderr = .inherit,
     });
-    _ = try child.wait(io);
+    const term = try child.wait(io);
+    switch (term) {
+        .exited => |code| if (code != 0) return error.CommandFailed,
+        else => return error.CommandFailed,
+    }
 }
 
 test "ad-hoc sign command is well-formed" {
@@ -133,11 +141,11 @@ test "identity sign command includes runtime and entitlements" {
     const cmd = try buildSignCommand(&buffer, .{
         .app_path = "/tmp/Test.app",
         .identity = "Developer ID Application: Test",
-        .entitlements = "assets/zero-native.entitlements",
+        .entitlements = "assets/native-sdk.entitlements",
         .hardened_runtime = true,
     });
     try std.testing.expectEqualStrings(
-        "codesign --sign Developer ID Application: Test --force --deep --options runtime --entitlements assets/zero-native.entitlements /tmp/Test.app",
+        "codesign --sign Developer ID Application: Test --force --deep --options runtime --entitlements assets/native-sdk.entitlements /tmp/Test.app",
         cmd,
     );
 }

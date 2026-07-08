@@ -35,6 +35,14 @@ const SigningMode = enum {
     identity,
 };
 
+pub const AppOptions = @import("build/app.zig").AppOptions;
+pub const addApp = @import("build/app.zig").addApp;
+pub const AppArtifacts = @import("build/app.zig").AppArtifacts;
+pub const addAppArtifacts = @import("build/app.zig").addAppArtifacts;
+pub const MobileLibOptions = @import("build/app.zig").MobileLibOptions;
+pub const addMobileLib = @import("build/app.zig").addMobileLib;
+const mobile_export_symbol_names = @import("build/app.zig").mobile_export_symbol_names;
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const host_target = b.graph.host;
@@ -42,7 +50,7 @@ pub fn build(b: *std.Build) void {
     const platform_option = b.option(PlatformOption, "platform", "Desktop backend: auto, null, macos, linux, windows") orelse .auto;
     const trace_option = b.option(TraceOption, "trace", "Trace output: off, events, runtime, all") orelse .events;
     _ = b.option(bool, "debug-overlay", "Enable debug overlay output") orelse false;
-    _ = b.option(bool, "automation", "Enable zero-native automation artifacts") orelse false;
+    _ = b.option(bool, "automation", "Enable Native SDK automation artifacts") orelse false;
     _ = b.option(bool, "webview", "Deprecated compatibility flag; native surfaces are always enabled") orelse true;
     const web_engine_override = b.option(WebEngineOption, "web-engine", "Override app.zon web engine: system, chromium");
     const cef_dir_override = b.option([]const u8, "cef-dir", "Override CEF root directory for Chromium builds");
@@ -52,8 +60,11 @@ pub fn build(b: *std.Build) void {
     const signing_mode = b.option(SigningMode, "signing", "Signing mode: none, adhoc, identity") orelse .none;
     const package_version = packageVersion(b);
     const optimize_name = @tagName(optimize);
-    const app_web_engine = web_engine_tool.readManifestConfig(b.allocator, b.graph.io, "app.zon") catch |err| {
-        std.debug.panic("failed to read app.zon web engine config: {s}", .{@errorName(err)});
+    // Resolve against THIS build's root: as a dependency of a user app the
+    // build runner's cwd is the app project, and a cwd-relative "app.zon"
+    // would read (and panic on) the user's manifest instead of ours.
+    const app_web_engine = web_engine_tool.readManifestConfig(b.allocator, b.graph.io, b.pathFromRoot("app.zon")) catch |err| {
+        std.debug.panic("failed to read the framework's own app.zon web engine config: {s}", .{@errorName(err)});
     };
     const resolved_web_engine = web_engine_tool.resolve(app_web_engine, .{
         .web_engine = if (web_engine_override) |value| webEngineFromBuildOption(value) else null,
@@ -91,6 +102,18 @@ pub fn build(b: *std.Build) void {
     const diagnostics_mod = module(b, target, optimize, "src/primitives/diagnostics/root.zig");
     const platform_info_mod = module(b, target, optimize, "src/primitives/platform_info/root.zig");
     const json_mod = module(b, target, optimize, "src/primitives/json/root.zig");
+    const canvas_mod = module(b, target, optimize, "src/primitives/canvas/root.zig");
+    canvas_mod.addImport("geometry", geometry_mod);
+    canvas_mod.addImport("json", json_mod);
+    if (target.result.os.tag == .macos) {
+        // The estimator-vs-CoreText agreement test (text_metrics_tests.zig)
+        // shapes the bundled face through CoreText; apps already link these
+        // transitively via AppKit.
+        canvas_mod.linkFramework("CoreFoundation", .{});
+        canvas_mod.linkFramework("CoreGraphics", .{});
+        canvas_mod.linkFramework("CoreText", .{});
+        canvas_mod.linkSystemLibrary("c", .{});
+    }
     const debug_mod = module(b, target, optimize, "src/debug/root.zig");
     debug_mod.addImport("app_dirs", app_dirs_mod);
     debug_mod.addImport("trace", trace_mod);
@@ -103,6 +126,7 @@ pub fn build(b: *std.Build) void {
     const diagnostics_tests = testArtifact(b, diagnostics_mod);
     const platform_info_tests = testArtifact(b, platform_info_mod);
     const json_tests = testArtifact(b, json_mod);
+    const canvas_tests = testArtifact(b, canvas_mod);
 
     const desktop_mod = module(b, target, optimize, "src/root.zig");
     desktop_mod.addImport("geometry", geometry_mod);
@@ -113,33 +137,43 @@ pub fn build(b: *std.Build) void {
     desktop_mod.addImport("diagnostics", diagnostics_mod);
     desktop_mod.addImport("platform_info", platform_info_mod);
     desktop_mod.addImport("json", json_mod);
-    desktop_mod.export_symbol_names = &.{
-        "zero_native_app_create",
-        "zero_native_app_destroy",
-        "zero_native_app_start",
-        "zero_native_app_activate",
-        "zero_native_app_deactivate",
-        "zero_native_app_stop",
-        "zero_native_app_resize",
-        "zero_native_app_touch",
-        "zero_native_app_command",
-        "zero_native_app_frame",
-        "zero_native_app_set_asset_root",
-        "zero_native_app_last_command_count",
-        "zero_native_app_last_command_name",
-        "zero_native_app_last_error_name",
-    };
+    desktop_mod.addImport("canvas", canvas_mod);
     const desktop_tests = testArtifact(b, desktop_mod);
+    const desktop_test_shards = desktopTestShardArtifacts(b, desktop_mod);
 
+    // The embeddable static library's root module carries only the C ABI
+    // exports (fixed WebView shell host); user-app canvas libraries are
+    // produced by `addMobileLib` from src/embed/app_exports.zig instead.
+    const embed_exports_mod = module(b, target, optimize, "src/embed/c_exports.zig");
+    embed_exports_mod.addImport("native_sdk", desktop_mod);
+    embed_exports_mod.export_symbol_names = &mobile_export_symbol_names;
     const embed_lib = b.addLibrary(.{
         .linkage = .static,
-        .name = "zero-native",
-        .root_module = desktop_mod,
+        .name = "native-sdk",
+        .root_module = embed_exports_mod,
+        // The embed C ABI (`native_sdk_app_viewport`) is exactly the
+        // f32-heavy SysV signature Zig 0.16.0's self-hosted x86_64 backend
+        // miscompiles (see useLlvmWorkaround in build/app.zig): without
+        // this, Debug x86_64 libs (Android emulators, Intel simulators)
+        // hand clang hosts corrupted inset/keyboard floats. addMobileLib
+        // already forces LLVM there; the fixed-shell lib must match.
+        .use_llvm = @import("build/app.zig").useLlvmWorkaround(target),
     });
     b.installArtifact(embed_lib);
 
     const automation_protocol_mod = module(b, target, optimize, "src/automation/protocol.zig");
     const automation_protocol_tests = testArtifact(b, automation_protocol_mod);
+    // The app-icon pipeline as a standalone module: tooling needs only
+    // the vector core + PNG codec slice of canvas, not the full canvas
+    // module (which links platform frameworks on macOS and would weigh
+    // down the cross-compiled CLI).
+    const app_icon_mod = module(b, target, optimize, "src/primitives/canvas/app_icon.zig");
+    app_icon_mod.addImport("geometry", geometry_mod);
+    // The iOS and Android host sources as embedded bytes: the tooling
+    // module writes and compiles them for `native dev|package --target
+    // ios|android`.
+    const ios_host_mod = module(b, target, optimize, "src/platform/ios/files.zig");
+    const android_host_mod = module(b, target, optimize, "src/platform/android/files.zig");
     const tooling_mod = module(b, target, optimize, "src/tooling/root.zig");
     tooling_mod.addImport("assets", assets_mod);
     tooling_mod.addImport("app_dirs", app_dirs_mod);
@@ -148,16 +182,54 @@ pub fn build(b: *std.Build) void {
     tooling_mod.addImport("debug", debug_mod);
     tooling_mod.addImport("platform_info", platform_info_mod);
     tooling_mod.addImport("trace", trace_mod);
+    tooling_mod.addImport("app_icon", app_icon_mod);
+    tooling_mod.addImport("ios_host", ios_host_mod);
+    tooling_mod.addImport("android_host", android_host_mod);
     const tooling_tests = testArtifact(b, tooling_mod);
 
-    const cli_mod = module(b, target, optimize, "tools/zero-native/main.zig");
+    // Ejected-component identity proofs: a separate test module because
+    // the canonical component sources under src/tooling/components/
+    // import `native_sdk` exactly as they will inside an app after
+    // `native eject component <name>` copies them there.
+    const eject_components_mod = module(b, target, optimize, "src/tooling/components/identity_tests.zig");
+    eject_components_mod.addImport("native_sdk", desktop_mod);
+    const eject_components_tests = testArtifact(b, eject_components_mod);
+
+    const ui_markup_mod = module(b, target, optimize, "src/primitives/canvas/ui_markup.zig");
+    const markup_lsp_mod = module(b, target, optimize, "tools/native-sdk/markup_lsp.zig");
+    markup_lsp_mod.addImport("ui_markup", ui_markup_mod);
+    const markup_lsp_tests = testArtifact(b, markup_lsp_mod);
+
+    const automation_cli_mod = module(b, target, optimize, "tools/native-sdk/automation.zig");
+    automation_cli_mod.addImport("automation_protocol", automation_protocol_mod);
+    automation_cli_mod.addImport("ui_markup", ui_markup_mod);
+    const automation_cli_tests = testArtifact(b, automation_cli_mod);
+
+    // `native version` names the commit the binary was built from, so
+    // binary/framework skew ("your native binary may be stale") is a
+    // one-command check. Falls back to "unknown" outside a git checkout.
+    const cli_build_info = b.addOptions();
+    cli_build_info.addOption([]const u8, "build_commit", cliBuildCommit(b));
+
+    const cli_mod = module(b, target, optimize, "tools/native-sdk/main.zig");
     cli_mod.addImport("tooling", tooling_mod);
     cli_mod.addImport("automation_protocol", automation_protocol_mod);
+    cli_mod.addImport("ui_markup", ui_markup_mod);
+    cli_mod.addImport("markup_lsp", markup_lsp_mod);
+    cli_mod.addOptions("cli_build_info", cli_build_info);
     const cli_exe = b.addExecutable(.{
-        .name = "zero-native",
+        .name = "native",
         .root_module = cli_mod,
     });
     b.installArtifact(cli_exe);
+
+    // `zig build cli` builds and installs ONLY the CLI executable. The
+    // release pipeline cross-compiles it for every supported platform
+    // (packages/native-sdk/scripts/build-binaries.sh), and skipping the
+    // framework libraries, examples, and docs artifacts keeps that
+    // eight-target loop fast.
+    const cli_step = b.step("cli", "Build only the native CLI executable (cross-compile friendly)");
+    cli_step.dependOn(&b.addInstallArtifact(cli_exe, .{}).step);
 
     const host_assets_mod = module(b, host_target, optimize, "src/primitives/assets/root.zig");
     const host_app_dirs_mod = module(b, host_target, optimize, "src/primitives/app_dirs/root.zig");
@@ -169,6 +241,11 @@ pub fn build(b: *std.Build) void {
     host_debug_mod.addImport("app_dirs", host_app_dirs_mod);
     host_debug_mod.addImport("trace", host_trace_mod);
     const host_automation_protocol_mod = module(b, host_target, optimize, "src/automation/protocol.zig");
+    const host_geometry_mod = module(b, host_target, optimize, "src/primitives/geometry/root.zig");
+    const host_app_icon_mod = module(b, host_target, optimize, "src/primitives/canvas/app_icon.zig");
+    host_app_icon_mod.addImport("geometry", host_geometry_mod);
+    const host_ios_host_mod = module(b, host_target, optimize, "src/platform/ios/files.zig");
+    const host_android_host_mod = module(b, host_target, optimize, "src/platform/android/files.zig");
     const host_tooling_mod = module(b, host_target, optimize, "src/tooling/root.zig");
     host_tooling_mod.addImport("assets", host_assets_mod);
     host_tooling_mod.addImport("app_dirs", host_app_dirs_mod);
@@ -177,18 +254,127 @@ pub fn build(b: *std.Build) void {
     host_tooling_mod.addImport("debug", host_debug_mod);
     host_tooling_mod.addImport("platform_info", host_platform_info_mod);
     host_tooling_mod.addImport("trace", host_trace_mod);
-    const host_cli_mod = module(b, host_target, optimize, "tools/zero-native/main.zig");
+    host_tooling_mod.addImport("app_icon", host_app_icon_mod);
+    host_tooling_mod.addImport("ios_host", host_ios_host_mod);
+    host_tooling_mod.addImport("android_host", host_android_host_mod);
+    const host_ui_markup_mod = module(b, host_target, optimize, "src/primitives/canvas/ui_markup.zig");
+    const host_markup_lsp_mod = module(b, host_target, optimize, "tools/native-sdk/markup_lsp.zig");
+    host_markup_lsp_mod.addImport("ui_markup", host_ui_markup_mod);
+    const host_cli_mod = module(b, host_target, optimize, "tools/native-sdk/main.zig");
     host_cli_mod.addImport("tooling", host_tooling_mod);
     host_cli_mod.addImport("automation_protocol", host_automation_protocol_mod);
+    host_cli_mod.addImport("ui_markup", host_ui_markup_mod);
+    host_cli_mod.addImport("markup_lsp", host_markup_lsp_mod);
+    host_cli_mod.addOptions("cli_build_info", cli_build_info);
     const host_cli_exe = b.addExecutable(.{
-        .name = "zero-native",
+        .name = "native",
         .root_module = host_cli_mod,
     });
+    // Docs component-preview generator: renders the built-in component
+    // catalog offscreen through the deterministic reference renderer and
+    // writes theme-aware webp pairs plus the markup vocabulary JSON into
+    // docs/. Regenerate with `zig build docs-component-previews`.
+    const docs_previews_mod = module(b, target, optimize, "tools/docs_component_previews.zig");
+    docs_previews_mod.addImport("native_sdk", desktop_mod);
+    // The eject registry as its own lean module (its imports stay inside
+    // src/tooling/), so the vocab JSON's `ejectable` table is written from
+    // the same rows `native eject component` dispatches on — the docs'
+    // <EjectSection> resolves from that JSON and can never drift.
+    docs_previews_mod.addImport("eject_components", module(b, target, optimize, "src/tooling/eject_components.zig"));
+    const docs_previews_exe = b.addExecutable(.{
+        .name = "docs-component-previews",
+        .root_module = docs_previews_mod,
+    });
+    const run_docs_previews = b.addRunArtifact(docs_previews_exe);
+    run_docs_previews.addArg(b.pathFromRoot("docs/public/components"));
+    run_docs_previews.addArg(b.pathFromRoot("docs/src/lib/component-vocab.json"));
+    run_docs_previews.has_side_effects = true;
+    const docs_previews_step = b.step("docs-component-previews", "Render built-in component previews and vocab JSON into docs/");
+    docs_previews_step.dependOn(&run_docs_previews.step);
+
+    // Render macro-benchmark: deterministic scenarios through the REAL
+    // engine pipeline (UiApp + Runtime + null-platform binary packet
+    // presents), reporting end-to-end and per-stage p50/p90 per
+    // interaction. Baselines should come from
+    // `zig build bench-render -Doptimize=ReleaseFast`.
+    const bench_render_mod = module(b, target, optimize, "tools/bench_render.zig");
+    bench_render_mod.addImport("native_sdk", desktop_mod);
+    const bench_render_exe = b.addExecutable(.{
+        .name = "bench-render",
+        .root_module = bench_render_mod,
+    });
+    const run_bench_render = b.addRunArtifact(bench_render_exe);
+    run_bench_render.has_side_effects = true;
+    // Repo root as cwd so the relative budgets path in the docs/gate
+    // invocation resolves regardless of where `zig build` ran from.
+    run_bench_render.setCwd(b.path("."));
+    // Ratchet mode: `zig build bench-render -Doptimize=ReleaseFast --
+    // --check tools/bench-render-budgets.txt` compares the median e2e
+    // p50 of three suite passes against the committed budgets (the
+    // benchmark refuses --check outside ReleaseFast).
+    if (b.args) |bench_args| run_bench_render.addArgs(bench_args);
+    const bench_render_step = b.step("bench-render", "Run the render macro-benchmark (deterministic scenarios; pass -Doptimize=ReleaseFast for baselines, `-- --check tools/bench-render-budgets.txt` for the budget ratchet)");
+    bench_render_step.dependOn(&run_bench_render.step);
+
+    // Live docs previews: the same scene catalog compiled to
+    // wasm32-freestanding (tools/docs_wasm_preview.zig) so the docs
+    // upgrade the static webp tiles to interactive engine instances.
+    // ReleaseSmall + strip keep the module small enough to lazy-load.
+    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const wasm_optimize: std.builtin.OptimizeMode = .ReleaseSmall;
+    const wasm_geometry_mod = module(b, wasm_target, wasm_optimize, "src/primitives/geometry/root.zig");
+    const wasm_json_mod = module(b, wasm_target, wasm_optimize, "src/primitives/json/root.zig");
+    const wasm_canvas_mod = module(b, wasm_target, wasm_optimize, "src/primitives/canvas/root.zig");
+    wasm_canvas_mod.addImport("geometry", wasm_geometry_mod);
+    wasm_canvas_mod.addImport("json", wasm_json_mod);
+    const wasm_native_mod = module(b, wasm_target, wasm_optimize, "src/root.zig");
+    wasm_native_mod.addImport("geometry", wasm_geometry_mod);
+    wasm_native_mod.addImport("json", wasm_json_mod);
+    wasm_native_mod.addImport("canvas", wasm_canvas_mod);
+    wasm_native_mod.addImport("app_dirs", module(b, wasm_target, wasm_optimize, "src/primitives/app_dirs/root.zig"));
+    wasm_native_mod.addImport("assets", module(b, wasm_target, wasm_optimize, "src/primitives/assets/root.zig"));
+    wasm_native_mod.addImport("trace", module(b, wasm_target, wasm_optimize, "src/primitives/trace/root.zig"));
+    wasm_native_mod.addImport("app_manifest", module(b, wasm_target, wasm_optimize, "src/primitives/app_manifest/root.zig"));
+    wasm_native_mod.addImport("diagnostics", module(b, wasm_target, wasm_optimize, "src/primitives/diagnostics/root.zig"));
+    wasm_native_mod.addImport("platform_info", module(b, wasm_target, wasm_optimize, "src/primitives/platform_info/root.zig"));
+    const docs_wasm_preview_mod = module(b, wasm_target, wasm_optimize, "tools/docs_wasm_preview.zig");
+    docs_wasm_preview_mod.addImport("native_sdk", wasm_native_mod);
+    docs_wasm_preview_mod.strip = true;
+    const docs_wasm_preview_exe = b.addExecutable(.{
+        .name = "component-preview",
+        .root_module = docs_wasm_preview_mod,
+    });
+    docs_wasm_preview_exe.entry = .disabled;
+    docs_wasm_preview_exe.rdynamic = true;
+    // The engine trades heap for fixed capacity but still builds some
+    // sizable stack temporaries (NullPlatform alone is ~800 KB); the
+    // 1 MB wasm default overflows into linear memory silently.
+    docs_wasm_preview_exe.stack_size = 16 * 1024 * 1024;
+    const copy_docs_wasm_preview = b.addUpdateSourceFiles();
+    copy_docs_wasm_preview.addCopyFileToSource(docs_wasm_preview_exe.getEmittedBin(), "docs/public/wasm/component-preview.wasm");
+    const docs_wasm_preview_step = b.step("docs-wasm-preview", "Compile the live component-preview wasm module into docs/public/wasm/");
+    docs_wasm_preview_step.dependOn(&copy_docs_wasm_preview.step);
+
     const file_contains_checker_mod = module(b, host_target, optimize, "tools/check_file_contains.zig");
     const file_contains_checker = b.addExecutable(.{
         .name = "check-file-contains",
         .root_module = file_contains_checker_mod,
     });
+
+    // Registry pin printer: emits the ui_schema table counts and
+    // fingerprints in the exact form ui_schema_tests.zig pins, plus the
+    // next free code per table for reserving codes ahead of parallel
+    // work. `zig build print-pins` after registry additions.
+    const print_pins_mod = module(b, host_target, optimize, "tools/print_pins.zig");
+    print_pins_mod.addImport("ui_schema", module(b, host_target, optimize, "src/primitives/canvas/ui_schema.zig"));
+    const print_pins_exe = b.addExecutable(.{
+        .name = "print-pins",
+        .root_module = print_pins_mod,
+    });
+    const run_print_pins = b.addRunArtifact(print_pins_exe);
+    run_print_pins.has_side_effects = true;
+    const print_pins_step = b.step("print-pins", "Print registry counts and fingerprints in pin-ready form");
+    print_pins_step.dependOn(&run_print_pins.step);
 
     const platform_arg = switch (selected_platform) {
         .auto => unreachable,
@@ -207,45 +393,52 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(diagnostics_tests).step);
     test_step.dependOn(&b.addRunArtifact(platform_info_tests).step);
     test_step.dependOn(&b.addRunArtifact(json_tests).step);
-    test_step.dependOn(&b.addRunArtifact(desktop_tests).step);
+    test_step.dependOn(&b.addRunArtifact(canvas_tests).step);
+    for (desktop_test_shards) |shard_tests| {
+        test_step.dependOn(&b.addRunArtifact(shard_tests).step);
+    }
     test_step.dependOn(&b.addRunArtifact(automation_protocol_tests).step);
     test_step.dependOn(&b.addRunArtifact(tooling_tests).step);
+    test_step.dependOn(&b.addRunArtifact(eject_components_tests).step);
+    test_step.dependOn(&b.addRunArtifact(markup_lsp_tests).step);
+    test_step.dependOn(&b.addRunArtifact(automation_cli_tests).step);
     addFileContainsCheckStep(b, file_contains_checker, test_step, "test-package-types", "Verify package TypeScript platform feature names", &.{
-        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "ZeroNativeCommandInfo" },
-        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "list(): Promise<ZeroNativeCommandInfo[]>" },
-        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "ZeroNativeCreateWebViewViewOptions" },
-        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "Stable runtime view id" },
-        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "update(label: string" },
-        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "focus(options: string | ZeroNativeViewSelector)" },
-        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "close(options: string | ZeroNativeViewSelector)" },
-        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "kind: \"webview\"" },
-        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "url: string" },
-        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "ZeroNativePlatformFeatureSelector" },
-        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "supports(value: ZeroNativePlatformFeature | ZeroNativePlatformFeatureSelector)" },
-        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"native_control_commands\"" },
-        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"nativeControlCommands\"" },
-        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"recent_documents\"" },
-        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"recentDocuments\"" },
-        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"file_drops\"" },
-        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"fileDrops\"" },
-        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"app_activation_events\"" },
-        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"appActivationEvents\"" },
-        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"gpu_surfaces\"" },
-        .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"gpuSurfaces\"" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "NativeSdkCommandInfo" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "list(): Promise<NativeSdkCommandInfo[]>" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "NativeSdkCreateWebViewViewOptions" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "Stable runtime view id" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "update(label: string" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "focus(options: string | NativeSdkViewSelector)" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "close(options: string | NativeSdkViewSelector)" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "kind: \"webview\"" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "url: string" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "NativeSdkPlatformFeatureSelector" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "supports(value: NativeSdkPlatformFeature | NativeSdkPlatformFeatureSelector)" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "\"native_control_commands\"" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "\"nativeControlCommands\"" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "\"recent_documents\"" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "\"recentDocuments\"" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "\"file_drops\"" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "\"fileDrops\"" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "\"app_activation_events\"" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "\"appActivationEvents\"" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "\"gpu_surfaces\"" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "\"gpuSurfaces\"" },
+        .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "gpuFirstFrameLatencyNs: number" },
     });
     addFileContainsCheckStep(b, file_contains_checker, test_step, "test-bridge-view-selector-helpers", "Verify injected view helpers accept string selectors", &.{
         .{ .path = "src/platform/macos/appkit_host.m", .pattern = "viewSelectorPayload(options)" },
         .{ .path = "src/platform/macos/cef_host.mm", .pattern = "viewSelectorPayload(options)" },
         .{ .path = "src/platform/linux/gtk_host.c", .pattern = "viewSelectorPayload(options)" },
         .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "viewSelectorPayload(options)" },
-        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "focus:function(options){return invoke('zero-native.view.focus',viewSelectorPayload(options))" },
-        .{ .path = "src/platform/macos/cef_host.mm", .pattern = "focus:function(options){return invoke('zero-native.view.focus',viewSelectorPayload(options))" },
-        .{ .path = "src/platform/linux/gtk_host.c", .pattern = "focus:function(options){return invoke('zero-native.view.focus',viewSelectorPayload(options))" },
-        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "focus:function(options){return invoke('zero-native.view.focus',viewSelectorPayload(options))" },
-        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "close:function(options){return invoke('zero-native.view.close',viewSelectorPayload(options))" },
-        .{ .path = "src/platform/macos/cef_host.mm", .pattern = "close:function(options){return invoke('zero-native.view.close',viewSelectorPayload(options))" },
-        .{ .path = "src/platform/linux/gtk_host.c", .pattern = "close:function(options){return invoke('zero-native.view.close',viewSelectorPayload(options))" },
-        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "close:function(options){return invoke('zero-native.view.close',viewSelectorPayload(options))" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "focus:function(options){return invoke('native-sdk.view.focus',viewSelectorPayload(options))" },
+        .{ .path = "src/platform/macos/cef_host.mm", .pattern = "focus:function(options){return invoke('native-sdk.view.focus',viewSelectorPayload(options))" },
+        .{ .path = "src/platform/linux/gtk_host.c", .pattern = "focus:function(options){return invoke('native-sdk.view.focus',viewSelectorPayload(options))" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "focus:function(options){return invoke('native-sdk.view.focus',viewSelectorPayload(options))" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "close:function(options){return invoke('native-sdk.view.close',viewSelectorPayload(options))" },
+        .{ .path = "src/platform/macos/cef_host.mm", .pattern = "close:function(options){return invoke('native-sdk.view.close',viewSelectorPayload(options))" },
+        .{ .path = "src/platform/linux/gtk_host.c", .pattern = "close:function(options){return invoke('native-sdk.view.close',viewSelectorPayload(options))" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "close:function(options){return invoke('native-sdk.view.close',viewSelectorPayload(options))" },
     });
     addFileContainsCheckStep(b, file_contains_checker, test_step, "test-docs-command-contracts", "Verify command docs match native view update contracts", &.{
         .{ .path = "docs/src/app/commands/page.mdx", .pattern = ".text = \"Refreshed\"" },
@@ -254,6 +447,7 @@ pub fn build(b: *std.Build) void {
     addFileContainsCheckStep(b, file_contains_checker, test_step, "test-docs-native-view-contracts", "Verify native surface docs describe view identity", &.{
         .{ .path = "docs/src/app/native-surfaces/page.mdx", .pattern = "ViewInfo.id" },
         .{ .path = "docs/src/app/native-surfaces/page.mdx", .pattern = "window.zero.views.update(\"status\"" },
+        .{ .path = "docs/src/app/native-surfaces/page.mdx", .pattern = "first-frame latency budget" },
     });
     addFileContainsCheckStep(b, file_contains_checker, test_step, "test-docs-shell-manifest-contracts", "Verify app.zon docs describe shell compatibility window labels", &.{
         .{ .path = "docs/src/app/app-zon/page.mdx", .pattern = "labels must stay unique across both lists" },
@@ -264,10 +458,34 @@ pub fn build(b: *std.Build) void {
         .{ .path = "src/platform/linux/gtk_host.c", .pattern = "update:function(options,patch)" },
         .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "update:function(options,patch)" },
     });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-linux-gpu-frame-emission-below-paint", "Verify the Linux GPU frame emission is scheduled below layout and paint priorities", &.{
+        // A saturated demand-driven frame loop (cycle cost > frame
+        // interval => every present re-arms at delay 0) scheduled at
+        // G_PRIORITY_DEFAULT would be ready on every main-loop
+        // iteration and starve GTK's layout/paint sources: presents
+        // land and queue_draw keeps inviting a repaint, but the glass
+        // freezes on stale pixels for as long as the loop stays armed.
+        // The emission must stay below GDK_PRIORITY_REDRAW so every
+        // presented frame paints before the next frame event.
+        .{ .path = "src/platform/linux/gtk_host.c", .pattern = "view->gpu_emit_source = g_timeout_add_full(G_PRIORITY_DEFAULT_IDLE," },
+        .{ .path = "src/platform/linux/gtk_host.c", .pattern = "paint (GDK_PRIORITY_REDRAW," },
+        .{ .path = "src/platform/linux/gtk_host.c", .pattern = "static void native_sdk_gpu_surface_schedule_frame_emission" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-linux-audio-buffering-clears-on-noop-resume", "Verify the Linux audio buffering flag drops when the 100% resume completes synchronously", &.{
+        // The buffering flag normally drops at the PLAYING
+        // state-changed message. When the refill's earlier PAUSED
+        // request never completed, the 100% resume is a no-op that
+        // posts no message; a non-ASYNC set_state result is the only
+        // signal, and the flag must drop on it or it rides every
+        // position tick for the rest of the track.
+        .{ .path = "src/platform/linux/gtk_host.c", .pattern = "const int change = gst->element_set_state(audio->playbin, NATIVE_SDK_GST_STATE_PLAYING);" },
+        .{ .path = "src/platform/linux/gtk_host.c", .pattern = "change != NATIVE_SDK_GST_STATE_CHANGE_ASYNC" },
+        .{ .path = "src/platform/linux/gtk_host.c", .pattern = "#define NATIVE_SDK_GST_STATE_CHANGE_ASYNC 2" },
+    });
     addFileContainsCheckStep(b, file_contains_checker, test_step, "test-windows-packaged-assets-webview2", "Verify Windows packaged assets are served through WebView2 request interception", &.{
-        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "constexpr const char *kAssetVirtualOrigin = \"https://zero-native-app.localhost\";" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "constexpr const char *kAssetVirtualOrigin = \"https://native-sdk-app.localhost\";" },
         .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "return virtualAssetEntryUrl(webview.asset_entry);" },
-        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "AddWebResourceRequestedFilter(L\"https://zero-native-app.localhost/*\"" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "AddWebResourceRequestedFilter(L\"https://native-sdk-app.localhost/*\"" },
         .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "assetWebResourceResponse(environment_ref.Get(), found->second, uri)" },
         .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "bridgeOriginForWebViewUrl(source_webview->second, source_url)" },
         .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "webview.spa_fallback = spa_fallback != 0;" },
@@ -280,14 +498,213 @@ pub fn build(b: *std.Build) void {
         .{ .path = "src/platform/macos/cef_host.mm", .pattern = "bridgeOriginForWindowId:window_id_ webViewLabel:labelString sourceURL:sourceURLString" },
     });
     addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-native-accessibility-roles", "Verify AppKit native views publish accessibility roles", &.{
-        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "ZeroNativeAccessibilityRoleForNativeViewKind" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NativeSdkAccessibilityRoleForNativeViewKind" },
         .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NSAccessibilityToolbarRole" },
         .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NSAccessibilityProgressIndicatorRole" },
-        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "view.accessibilityRole = ZeroNativeAccessibilityRoleForNativeViewKind(kind)" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "view.accessibilityRole = NativeSdkAccessibilityRoleForNativeViewKind(kind)" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-gpu-input-repaints-retained-canvas", "Verify GPU input wakes retained canvas frames", &.{
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "- (void)requestRetainedCanvasFrame" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "[self requestRetainedCanvasFrame];" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-gpu-input-paces-retained-canvas", "Verify GPU input frame requests are paced to the display interval", &.{
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NativeSdkRetainedFrameIntervalNanoseconds" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "retainedFrameLastEmitNs" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "queuePointerMotionInputEvent:(NSEvent *)event" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "pendingPointerMotionKind = kind" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "emitQueuedPointerMotionInputEvent" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "queueScrollInputEvent:(NSEvent *)event" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "pendingScrollDeltaY += deltaY" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "emitQueuedScrollInputEvent" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "dispatch_after(dispatch_time(DISPATCH_TIME_NOW" },
+        // The single per-surface frame-event scheduler: every producer
+        // (requests, completions, occluded completions) coalesces into
+        // one paced emission per display interval.
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "- (void)scheduleFrameEventEmission" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "- (void)emitScheduledFrameEvent" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-gpu-occluded-frame-heartbeat", "Verify occluded windows throttle frame completions to a heartbeat and restore full cadence on reveal", &.{
+        // macOS: occluded surfaces pace logical completions on the ~1 Hz
+        // heartbeat (never stopping — on_frame-driven models stay gently
+        // current), de-occlusion supersedes the parked emission for an
+        // immediate return to the display grid, and heartbeat completions
+        // are flagged so the runtime never stamps input latency from them.
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NativeSdkOccludedFrameHeartbeatNs = 1000000000ull" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "- (BOOL)occludedFramePacingActive" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "heartbeatPaced ? NativeSdkOccludedFrameHeartbeatNs" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "self.frameEventEmissionGeneration += 1" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "occluded:[self occludedFramePacingActive]" },
+        // Exempt producers (a real present's completion, an input's
+        // responding frame) fire at grid promptness — neither can
+        // sustain a spin.
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "scheduleFrameEventEmissionForPresentCompletion:YES" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "- (void)noteGpuSurfaceInputActivity" },
+        // Windows: the same throttle keyed on the one reliable Win32
+        // occlusion signal (minimize); restore re-arms the pending
+        // one-shot timer at the frame-grid delay, and the input /
+        // first-present exemptions ride one prompt-frame flag.
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "kGpuOccludedHeartbeatNs = 1000000000ull" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "gpuSurfaceOccludedPacingActive" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "IsIconic(root)" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "gpu_prompt_frame_pending" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "native_sdk_windows_note_gpu_surface_input" },
+        // The runtime side of the measurement honesty: occluded logical
+        // completions resolve pending inputs without a latency stamp,
+        // and every dispatched input notes the host for a prompt
+        // responding frame.
+        .{ .path = "src/runtime/gpu_surface_events.zig", .pattern = "resolveGpuSurfaceInputForOccludedFrame" },
+        .{ .path = "src/runtime/gpu_surface_events.zig", .pattern = "noteGpuSurfaceInput" },
+        // GTK: no reliable cross-backend occlusion signal — the decision
+        // to leave full cadence is documented at the scheduler, not
+        // implicit.
+        .{ .path = "src/platform/linux/gtk_host.c", .pattern = "No occluded/minimized throttle here, DELIBERATELY" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-gpu-drawable-integral-pixels", "Verify AppKit GPU surfaces use integral drawable pixels", &.{
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "ceil(size.width * scale)" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "ceil(size.height * scale)" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "self.metalLayer.drawableSize = drawableSize" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-gpu-resize-repaints-retained-canvas", "Verify AppKit GPU resize requests a correctly sized retained frame", &.{
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "_metalLayer.contentsGravity = kCAGravityTopLeft" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "if (changed) {" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "[self requestRetainedCanvasFrame];" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "canvasTextureMatchesDrawable" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-gpu-packet-transforms", "Verify AppKit GPU packet presenter applies command transforms", &.{
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NativeSdkPacketApplyTransform(command[@\"transform\"])" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "[affine setTransformStruct:transform]" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "[affine concat]" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-gpu-packet-paths", "Verify AppKit GPU packet presenter draws path commands", &.{
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "[kind isEqualToString:@\"path\"]" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "[verb isEqualToString:@\"quad_to\"]" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "[kind isEqualToString:@\"fill_path\"]" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "[kind isEqualToString:@\"stroke_path\"]" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-gpu-packet-corner-radii", "Verify AppKit GPU packet presenter honors per-corner radii", &.{
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NativeSdkPacketRoundedRectPath" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "CGFloat topRight = NativeSdkPacketRadiusAt(radiusValue, 1, maxRadius)" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "CGFloat bottomLeft = NativeSdkPacketRadiusAt(radiusValue, 3, maxRadius)" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "return NativeSdkPacketRoundedRectPath(rect, shape[@\"radius\"])" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-gpu-packet-load-frames", "Verify AppKit GPU packet presenter handles retained load frames", &.{
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "canvasPacketPixels" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "[loadAction isEqualToString:@\"load\"]" },
+        // Retained-backing discipline: dirty updates require the validity
+        // flag, and every present that mutates the backing clears it until
+        // the draw succeeds — a failed draw can never leak stale pixels
+        // around a later scissor.
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "!self.canvasPacketPixelsValid" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "self.canvasPacketPixelsValid = YES" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "hasDirtyRect:uploadDirtyRect" },
+    });
+    // Version prose is machine-checked: the wire-format v2/v3 drift (spec
+    // comments and changelog naming a version the constant had moved past)
+    // shipped once, so the constant and every prose site that names the
+    // version are pinned together. Bumping `binary_packet_version` fails
+    // this step until the encoder comment, the host decoder comment, and
+    // the patterns below move with it.
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-wire-format-version-prose", "Verify wire-format version prose matches the packet version constant", &.{
+        .{ .path = "src/primitives/canvas/serialization.zig", .pattern = "pub const binary_packet_version: u8 = 3;" },
+        .{ .path = "src/primitives/canvas/serialization.zig", .pattern = "Compact binary gpu-surface packet encoding (wire format v3)." },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "Compact binary gpu-surface packet decoding (wire format v3)." },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-gpu-packet-blur-effects", "Verify AppKit GPU packet presenter applies blur effects", &.{
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NativeSdkPacketApplyBlur" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "CGBitmapContextGetData(context)" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NSIntersectionRect(rect, clipRect)" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NativeSdkPacketTransformRect(transformValue, NativeSdkPacketRect(effect[@\"rect\"]))" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "return NativeSdkPacketApplyBlur(effect, opacity, context, scale, transformValue, hasClip, clipRect)" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-gpu-packet-text-layout", "Verify AppKit GPU packet presenter honors text layout metadata", &.{
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NSMutableParagraphStyle" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NativeSdkPacketTextLineBreakMode" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NativeSdkPacketTextAlignment" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NativeSdkPacketNumber(layout[@\"maxWidth\"], 0)" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "[value drawWithRect:NSMakeRect(origin.x, origin.y - size, textWidth, textHeight)" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-gpu-packet-font-assets", "Verify AppKit GPU packet text registers bundled font assets", &.{
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "#import <CoreText/CoreText.h>" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "CTFontManagerRegisterFontsForURL" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "@[ @\"fonts\", @\"Fonts\", @\"assets/fonts\" ]" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NativeSdkRegisterBundledFonts();" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NativeSdkPacketPreferredFont(text, size)" },
+        .{ .path = "src/tooling/templates.zig", .pattern = "app_mod.linkFramework(\"CoreText\", .{});" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-gpu-packet-span-fonts", "Verify AppKit packet text resolves reserved span font ids to real weighted and italic faces", &.{
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "static NSFont *NativeSdkItalicSansFont(NSFont *font)" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "static NSFont *NativeSdkWeightedSansFont(" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NativeSdkWeightedSansFont(@[ @\"Geist-Medium\", @\"Geist Medium\" ], base, NSFontWeightMedium, NO, size)" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NativeSdkWeightedSansFont(@[ @\"Geist-Bold\", @\"Geist Bold\" ], base, NSFontWeightBold, YES, size)" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NativeSdkItalicSansFont(base)" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NativeSdkItalicSansFont(NativeSdkWeightedSansFont(@[ @\"Geist-Bold\", @\"Geist Bold\" ], base, NSFontWeightBold, YES, size))" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-gpu-widget-cursor-bridge", "Verify AppKit GPU widgets apply retained cursor intent", &.{
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "native_sdk_appkit_set_view_cursor" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "resetCursorRects" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NSTrackingMouseMoved" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NATIVE_SDK_APPKIT_GPU_INPUT_POINTER_CANCEL" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "_surfaceCursor = cursor ?: [NSCursor arrowCursor]" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NSCursor pointingHandCursor" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-gpu-widget-accessibility-actions", "Verify AppKit GPU widget accessibility actions route to the runtime", &.{
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "accessibilityPerformPress" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "emitWidgetAccessibilityActionWithId" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NATIVE_SDK_APPKIT_EVENT_WIDGET_ACCESSIBILITY_ACTION" },
+        // The per-element action gate: without it AppKit derives the
+        // advertised action list from the CLASS's selectors, so every
+        // widget element (a static label included) offers
+        // press/increment/decrement/cancel and performing an
+        // unsupported one reports success while actuating nothing.
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "isAccessibilitySelectorAllowed" },
+        // An assistive client's AXFocused WRITE must move the app's
+        // real focus, not just flip a flag on the snapshot element.
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "setAccessibilityFocused" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-gpu-widget-accessibility-text-ranges", "Verify AppKit GPU widget accessibility publishes text selection ranges", &.{
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "accessibilitySelectedTextRange" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "accessibilitySelectedTextRanges" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "accessibilityVisibleCharacterRange" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-gpu-widget-accessibility-grid-metrics", "Verify AppKit GPU widget accessibility publishes grid and scroll metrics", &.{
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "accessibilityRowIndexRange" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "accessibilityColumnIndexRange" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "accessibilityRowCount" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "accessibilityMaxValue" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-gpu-widget-ime-bridge", "Verify AppKit GPU widgets route native text input and IME composition", &.{
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NSTextInputClient" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "insertText:(id)string replacementRange" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "setMarkedText:(id)string selectedRange" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NATIVE_SDK_APPKIT_GPU_INPUT_IME_SET_COMPOSITION" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-windows-gpu-widget-ime-bridge", "Verify the Windows GPU host routes WM_IME composition onto the shared IME event kinds", &.{
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "case WM_IME_STARTCOMPOSITION:" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "case WM_IME_COMPOSITION:" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "case WM_IME_ENDCOMPOSITION:" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "kGpuInputImeSetComposition = 8" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "kGpuInputImeCommitComposition = 9" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "kGpuInputImeCancelComposition = 10" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "gpuImeCommitAction(pending, result)" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "ISC_SHOWUICOMPOSITIONWINDOW" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-gpu-widget-text-command-bridge", "Verify AppKit GPU text widgets route native text commands", &.{
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "- (void)selectAll:(id)sender" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "@selector(selectAll:)" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "emitSyntheticKeyDownWithKey:@\"a\" modifiers:(NativeSdkShortcutModifierPrimary | NativeSdkShortcutModifierCommand)" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-appearance-bridge", "Verify AppKit reports system light and dark appearance changes", &.{
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "effectiveAppearance" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "accessibilityDisplayShouldReduceMotion" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "accessibilityDisplayShouldIncreaseContrast" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NATIVE_SDK_APPKIT_EVENT_APPEARANCE_CHANGED" },
+        .{ .path = "src/platform/macos/root.zig", .pattern = ".reduce_motion = event.reduce_motion != 0" },
+        .{ .path = "src/platform/macos/root.zig", .pattern = ".high_contrast = event.high_contrast != 0" },
+        .{ .path = "src/platform/macos/root.zig", .pattern = ".appearance_changed => state.emit" },
     });
     addFileContainsCheckStep(b, file_contains_checker, test_step, "test-docs-builtin-bridge-policy", "Verify bridge policy docs include guarded dialog commands", &.{
-        .{ .path = "docs/src/app/security/page.mdx", .pattern = ".{ .name = \"zero-native.dialog.saveFile\"" },
-        .{ .path = "docs/src/app/bridge/builtin-commands/page.mdx", .pattern = ".{ .name = \"zero-native.dialog.saveFile\"" },
+        .{ .path = "docs/src/app/security/page.mdx", .pattern = ".{ .name = \"native-sdk.dialog.saveFile\"" },
+        .{ .path = "docs/src/app/bridge/builtin-commands/page.mdx", .pattern = ".{ .name = \"native-sdk.dialog.saveFile\"" },
     });
 
     addTestStep(b, "test-geometry", "Run geometry module tests", geometry_tests);
@@ -298,24 +715,30 @@ pub fn build(b: *std.Build) void {
     addTestStep(b, "test-diagnostics", "Run diagnostics module tests", diagnostics_tests);
     addTestStep(b, "test-platform-info", "Run platform info module tests", platform_info_tests);
     addTestStep(b, "test-json", "Run JSON primitive tests", json_tests);
-    addTestStep(b, "test-desktop", "Run zero-native framework tests", desktop_tests);
+    addTestStep(b, "test-canvas", "Run canvas display list tests", canvas_tests);
+    addTestStep(b, "test-desktop", "Run Native SDK framework tests", desktop_tests);
+    for (desktop_test_shard_specs, desktop_test_shards) |spec, shard_tests| {
+        addTestStep(b, b.fmt("test-desktop-{s}", .{spec.name}), spec.description, shard_tests);
+    }
     addTestStep(b, "test-automation-protocol", "Run automation protocol tests", automation_protocol_tests);
-    addTestStep(b, "test-tooling", "Run zero-native tooling tests", tooling_tests);
+    addTestStep(b, "test-automation-cli", "Run native automate CLI tests", automation_cli_tests);
+    addTestStep(b, "test-tooling", "Run Native SDK tooling tests", tooling_tests);
+    addTestStep(b, "test-eject-components", "Run ejected-component widget-identity tests", eject_components_tests);
 
     const run_hello = b.addSystemCommand(&.{ "zig", "build", "run", b.fmt("-Dplatform={s}", .{platform_arg}), b.fmt("-Dtrace={s}", .{@tagName(trace_option)}) });
     run_hello.setCwd(b.path("examples/hello"));
-    const run_hello_step = b.step("run-hello", "Run the zero-native hello WebView example");
+    const run_hello_step = b.step("run-hello", "Run the native-sdk hello WebView example");
     run_hello_step.dependOn(&run_hello.step);
 
-    const run_webview = b.addSystemCommand(&.{ "zig", "build", "run", b.fmt("-Dplatform={s}", .{platform_arg}), b.fmt("-Dtrace={s}", .{@tagName(trace_option)}), b.fmt("-Dweb-engine={s}", .{@tagName(web_engine)}), b.fmt("-Dcef-dir={s}", .{cef_dir}) });
+    const run_webview = b.addSystemCommand(&.{ "zig", "build", "run", b.fmt("-Dplatform={s}", .{platform_arg}), b.fmt("-Dtrace={s}", .{@tagName(trace_option)}), b.fmt("-Dweb-engine={s}", .{@tagName(web_engine)}), b.fmt("-Dcef-dir={s}", .{exampleCefDir(b, cef_dir)}) });
     run_webview.setCwd(b.path("examples/webview"));
-    const run_webview_step = b.step("run-webview", "Run the zero-native WebView example");
+    const run_webview_step = b.step("run-webview", "Run the native-sdk WebView example");
     run_webview_step.dependOn(&run_webview.step);
 
     const browser_cef_dir = cef_dir_override orelse defaultCefDir(selected_platform, "third_party/cef/macos");
-    const run_browser = b.addSystemCommand(&.{ "zig", "build", "run", b.fmt("-Dplatform={s}", .{platform_arg}), b.fmt("-Dtrace={s}", .{@tagName(trace_option)}), b.fmt("-Dweb-engine={s}", .{@tagName(browser_web_engine)}), b.fmt("-Dcef-dir={s}", .{browser_cef_dir}) });
+    const run_browser = b.addSystemCommand(&.{ "zig", "build", "run", b.fmt("-Dplatform={s}", .{platform_arg}), b.fmt("-Dtrace={s}", .{@tagName(trace_option)}), b.fmt("-Dweb-engine={s}", .{@tagName(browser_web_engine)}), b.fmt("-Dcef-dir={s}", .{exampleCefDir(b, browser_cef_dir)}) });
     run_browser.setCwd(b.path("examples/browser"));
-    const run_browser_step = b.step("run-browser", "Run the zero-native browser example");
+    const run_browser_step = b.step("run-browser", "Run the native-sdk browser example");
     run_browser_step.dependOn(&run_browser.step);
 
     const build_webview_system = b.addSystemCommand(&.{ "zig", "build", b.fmt("-Dplatform={s}", .{platform_arg}), "-Dweb-engine=system" });
@@ -329,10 +752,10 @@ pub fn build(b: *std.Build) void {
     browser_system_link_step.dependOn(&build_browser_system.step);
 
     const frontend_examples_step = b.step("test-examples-frontends", "Run frontend example tests");
-    addExampleTestStep(b, frontend_examples_step, "test-example-next", "Run Next example tests", "examples/next");
-    addExampleTestStep(b, frontend_examples_step, "test-example-react", "Run React example tests", "examples/react");
-    addExampleTestStep(b, frontend_examples_step, "test-example-svelte", "Run Svelte example tests", "examples/svelte");
-    addExampleTestStep(b, frontend_examples_step, "test-example-vue", "Run Vue example tests", "examples/vue");
+    addExampleTestStep(b, host_cli_exe, frontend_examples_step, "test-example-next", "Run Next example tests", "examples/next", .owned);
+    addExampleTestStep(b, host_cli_exe, frontend_examples_step, "test-example-react", "Run React example tests", "examples/react", .owned);
+    addExampleTestStep(b, host_cli_exe, frontend_examples_step, "test-example-svelte", "Run Svelte example tests", "examples/svelte", .owned);
+    addExampleTestStep(b, host_cli_exe, frontend_examples_step, "test-example-vue", "Run Vue example tests", "examples/vue", .owned);
     addFileContainsCheckStep(b, file_contains_checker, frontend_examples_step, "test-example-frontend-positioning", "Verify frontend example native shell positioning", &.{
         .{ .path = "examples/next/README.md", .pattern = "opens the native app shell with WebView content." },
         .{ .path = "examples/react/README.md", .pattern = "opens the native app shell with WebView content." },
@@ -341,23 +764,40 @@ pub fn build(b: *std.Build) void {
     });
 
     const native_examples_step = b.step("test-examples-native", "Run native-first example tests");
-    addExampleTestStep(b, native_examples_step, "test-example-command-app", "Run command app example tests", "examples/command-app");
-    addExampleTestStep(b, native_examples_step, "test-example-native-shell", "Run native shell example tests", "examples/native-shell");
-    addExampleTestStep(b, native_examples_step, "test-example-native-panels", "Run native panels example tests", "examples/native-panels");
-    addExampleTestStep(b, native_examples_step, "test-example-capabilities", "Run capabilities example tests", "examples/capabilities");
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-command-app", "Run command app example tests", "examples/command-app", .owned);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-native-shell", "Run native shell example tests", "examples/native-shell", .owned);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-native-panels", "Run native panels example tests", "examples/native-panels", .owned);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-gpu-surface", "Run GPU surface example tests", "examples/gpu-surface", .managed);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-gpu-dashboard", "Run GPU dashboard example tests", "examples/gpu-dashboard", .managed);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-gpu-components", "Run GPU components example tests", "examples/gpu-components", .managed);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-ui-inbox", "Run ui builder inbox example tests", "examples/ui-inbox", .owned);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-kanban", "Run ui builder kanban example tests", "examples/kanban", .managed);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-habits", "Run markup habits example tests", "examples/habits", .managed);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-soundboard", "Run soundboard example tests", "examples/soundboard", .managed);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-deck", "Run deck example tests", "examples/deck", .managed);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-markdown-viewer", "Run markdown viewer example tests", "examples/markdown-viewer", .managed);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-calculator", "Run calculator example tests", "examples/calculator", .managed);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-notes", "Run notes example tests", "examples/notes", .managed);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-split-collapse", "Run split collapse example tests", "examples/split-collapse", .managed);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-system-monitor", "Run system monitor example tests", "examples/system-monitor", .managed);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-effects-probe", "Run effects probe example tests", "examples/effects-probe", .managed);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-feed", "Run feed example tests", "examples/feed", .managed);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-canvas-preview", "Run canvas preview example tests", "examples/canvas-preview", .managed);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-capabilities", "Run capabilities example tests", "examples/capabilities", .owned);
     addFileContainsCheckStep(b, file_contains_checker, native_examples_step, "test-example-capabilities-events", "Verify capabilities example event bridge names", &.{
-        .{ .path = "examples/capabilities/src/main.zig", .pattern = "zero-native:drop:files" },
+        .{ .path = "examples/capabilities/src/main.zig", .pattern = "native-sdk:drop:files" },
     });
 
     const mobile_examples_step = b.step("test-examples-mobile", "Verify mobile example project layouts");
     addLayoutCheckStep(b, mobile_examples_step, "test-example-ios-layout", "Verify iOS example layout", &.{
         "examples/ios/README.md",
         "examples/ios/app.zon",
-        "examples/ios/ZeroNativeIOSExample.xcodeproj/project.pbxproj",
-        "examples/ios/ZeroNativeIOSExample/AppDelegate.swift",
-        "examples/ios/ZeroNativeIOSExample/SceneDelegate.swift",
-        "examples/ios/ZeroNativeIOSExample/ZeroNativeHostViewController.swift",
-        "examples/ios/ZeroNativeIOSExample/zero_native.h",
+        "examples/ios/NativeSdkIOSExample.xcodeproj/project.pbxproj",
+        "examples/ios/NativeSdkIOSExample/AppDelegate.swift",
+        "examples/ios/NativeSdkIOSExample/SceneDelegate.swift",
+        "examples/ios/NativeSdkIOSExample/NativeSdkHostViewController.swift",
+        "examples/ios/NativeSdkIOSExample/native_sdk.h",
+        "examples/ios/NativeSdkIOSExample/NativeSdkDyldShim.c",
     });
     addLayoutCheckStep(b, mobile_examples_step, "test-example-android-layout", "Verify Android example layout", &.{
         "examples/android/README.md",
@@ -366,15 +806,108 @@ pub fn build(b: *std.Build) void {
         "examples/android/build.gradle",
         "examples/android/app/build.gradle",
         "examples/android/app/src/main/AndroidManifest.xml",
-        "examples/android/app/src/main/java/dev/zero_native/examples/android/MainActivity.kt",
+        "examples/android/app/src/main/java/dev/native_sdk/examples/android/MainActivity.kt",
         "examples/android/app/src/main/cpp/CMakeLists.txt",
-        "examples/android/app/src/main/cpp/zero_native_jni.c",
-        "examples/android/app/src/main/cpp/zero_native.h",
+        "examples/android/app/src/main/cpp/native_sdk_jni.c",
+        "examples/android/app/src/main/cpp/native_sdk.h",
     });
     addLayoutCheckStep(b, mobile_examples_step, "test-example-mobile-shell-layout", "Verify shared mobile-shell metadata", &.{
         "examples/mobile-shell/README.md",
         "examples/mobile-shell/app.zon",
     });
+
+    // Host-tier packaged project pin: `native package --target ios` must
+    // keep emitting the complete, deterministic Xcode project (toolkit
+    // host sources, Info.plist, asset catalog, scheme) — drift is caught
+    // here. --binary stubs the embed library with the fixed-shell lib so
+    // the check needs no iOS cross-compile.
+    const package_ios_layout_run = b.addRunArtifact(host_cli_exe);
+    package_ios_layout_run.setCwd(b.path("examples/calculator"));
+    package_ios_layout_run.setEnvironmentVariable("NATIVE_SDK_PATH", b.pathFromRoot("."));
+    package_ios_layout_run.addArgs(&.{ "package", "--target", "ios", "--output", "zig-out/package/test-ios-layout", "--binary" });
+    package_ios_layout_run.addFileArg(embed_lib.getEmittedBin());
+    package_ios_layout_run.has_side_effects = true;
+    const package_ios_layout_step = b.step("test-package-ios-layout", "Verify the generated iOS host project layout");
+    const package_ios_layout_paths = [_][]const u8{
+        "examples/calculator/zig-out/package/test-ios-layout/calculator.xcodeproj/project.pbxproj",
+        "examples/calculator/zig-out/package/test-ios-layout/calculator.xcodeproj/xcshareddata/xcschemes/calculator.xcscheme",
+        "examples/calculator/zig-out/package/test-ios-layout/Host/uikit_host.m",
+        "examples/calculator/zig-out/package/test-ios-layout/Host/native_sdk_app.h",
+        "examples/calculator/zig-out/package/test-ios-layout/Host/Info.plist",
+        "examples/calculator/zig-out/package/test-ios-layout/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
+        "examples/calculator/zig-out/package/test-ios-layout/Assets.xcassets/AppIcon.appiconset/Contents.json",
+        "examples/calculator/zig-out/package/test-ios-layout/Libraries/libnative-sdk.a",
+        "examples/calculator/zig-out/package/test-ios-layout/README.md",
+        "examples/calculator/zig-out/package/test-ios-layout/package-manifest.zon",
+    };
+    for (package_ios_layout_paths) |path| {
+        const check = b.addSystemCommand(&.{ "test", "-f", path });
+        check.step.dependOn(&package_ios_layout_run.step);
+        package_ios_layout_step.dependOn(&check.step);
+        mobile_examples_step.dependOn(&check.step);
+    }
+    const package_ios_layout_contents = [_]FileContainsCheck{
+        .{ .path = "examples/calculator/zig-out/package/test-ios-layout/calculator.xcodeproj/project.pbxproj", .pattern = "PRODUCT_BUNDLE_IDENTIFIER = \"dev.native-sdk.calculator\";" },
+        .{ .path = "examples/calculator/zig-out/package/test-ios-layout/Host/Info.plist", .pattern = "UILaunchScreen" },
+        .{ .path = "examples/calculator/zig-out/package/test-ios-layout/Host/uikit_host.m", .pattern = "native_sdk_app_render_pixels" },
+    };
+    for (package_ios_layout_contents) |check_value| {
+        const check = b.addRunArtifact(file_contains_checker);
+        check.setCwd(b.path("."));
+        check.addArg(check_value.path);
+        check.addArg(check_value.pattern);
+        check.step.dependOn(&package_ios_layout_run.step);
+        package_ios_layout_step.dependOn(&check.step);
+        mobile_examples_step.dependOn(&check.step);
+    }
+    // Host-tier packaged project pin, Android: `native package --target
+    // android` must keep emitting the complete generated host project
+    // (toolkit host sources, app.zon-derived manifest, launcher icons) —
+    // drift is caught here. --binary stubs the embed library with the
+    // fixed-shell lib so the check needs no Android cross-compile, and
+    // ANDROID_HOME points at a nonexistent SDK so the deterministic
+    // project-only path runs everywhere (the APK assembly is exercised
+    // by the live loops, not CI).
+    const package_android_layout_run = b.addRunArtifact(host_cli_exe);
+    package_android_layout_run.setCwd(b.path("examples/calculator"));
+    package_android_layout_run.setEnvironmentVariable("NATIVE_SDK_PATH", b.pathFromRoot("."));
+    package_android_layout_run.setEnvironmentVariable("ANDROID_HOME", b.pathFromRoot("zig-out/no-android-sdk"));
+    package_android_layout_run.addArgs(&.{ "package", "--target", "android", "--output", "zig-out/package/test-android-layout", "--binary" });
+    package_android_layout_run.addFileArg(embed_lib.getEmittedBin());
+    package_android_layout_run.has_side_effects = true;
+    const package_android_layout_step = b.step("test-package-android-layout", "Verify the generated Android host project layout");
+    const package_android_layout_paths = [_][]const u8{
+        "examples/calculator/zig-out/package/test-android-layout/AndroidManifest.xml",
+        "examples/calculator/zig-out/package/test-android-layout/Host/NativeSdkActivity.java",
+        "examples/calculator/zig-out/package/test-android-layout/Host/android_host.c",
+        "examples/calculator/zig-out/package/test-android-layout/Host/native_sdk_app.h",
+        "examples/calculator/zig-out/package/test-android-layout/res/mipmap-mdpi/ic_launcher.png",
+        "examples/calculator/zig-out/package/test-android-layout/res/mipmap-xxxhdpi/ic_launcher.png",
+        "examples/calculator/zig-out/package/test-android-layout/Libraries/libnative-sdk.a",
+        "examples/calculator/zig-out/package/test-android-layout/README.md",
+        "examples/calculator/zig-out/package/test-android-layout/package-manifest.zon",
+    };
+    for (package_android_layout_paths) |path| {
+        const check = b.addSystemCommand(&.{ "test", "-f", path });
+        check.step.dependOn(&package_android_layout_run.step);
+        package_android_layout_step.dependOn(&check.step);
+        mobile_examples_step.dependOn(&check.step);
+    }
+    const package_android_layout_contents = [_]FileContainsCheck{
+        .{ .path = "examples/calculator/zig-out/package/test-android-layout/AndroidManifest.xml", .pattern = "package=\"dev.native_sdk.calculator\"" },
+        .{ .path = "examples/calculator/zig-out/package/test-android-layout/AndroidManifest.xml", .pattern = "dev.native_sdk.host.NativeSdkActivity" },
+        .{ .path = "examples/calculator/zig-out/package/test-android-layout/Host/NativeSdkActivity.java", .pattern = "InputMethodManager" },
+        .{ .path = "examples/calculator/zig-out/package/test-android-layout/Host/android_host.c", .pattern = "native_sdk_app_render_pixels" },
+    };
+    for (package_android_layout_contents) |check_value| {
+        const check = b.addRunArtifact(file_contains_checker);
+        check.setCwd(b.path("."));
+        check.addArg(check_value.path);
+        check.addArg(check_value.pattern);
+        check.step.dependOn(&package_android_layout_run.step);
+        package_android_layout_step.dependOn(&check.step);
+        mobile_examples_step.dependOn(&check.step);
+    }
     addFileContainsCheckStep(b, file_contains_checker, mobile_examples_step, "test-example-mobile-shell-metadata", "Verify shared mobile-shell metadata values", &.{
         .{ .path = "examples/mobile-shell/app.zon", .pattern = ".platforms = .{ \"ios\", \"android\" }" },
         .{ .path = "examples/mobile-shell/app.zon", .pattern = ".capabilities = .{ \"webview\", \"native_views\", \"native_module\" }" },
@@ -391,13 +924,54 @@ pub fn build(b: *std.Build) void {
         .{ .path = "examples/android/app.zon", .pattern = ".id = \"mobile.refresh\"" },
         .{ .path = "examples/android/app.zon", .pattern = ".label = \"mobile-header\"" },
     });
+    addFileContainsCheckStep(b, file_contains_checker, mobile_examples_step, "test-example-android-widget-ime", "Verify Android retained widget IME and action bridge", &.{
+        .{ .path = "examples/android/app/src/main/java/dev/native_sdk/examples/android/MainActivity.kt", .pattern = "override fun onCreateInputConnection" },
+        .{ .path = "examples/android/app/src/main/java/dev/native_sdk/examples/android/MainActivity.kt", .pattern = "nativeIme(nativeApp, kind, text, cursor)" },
+        .{ .path = "examples/android/app/src/main/java/dev/native_sdk/examples/android/MainActivity.kt", .pattern = "WIDGET_ACTION_KIND_SET_COMPOSITION = 7" },
+        .{ .path = "examples/android/app/src/main/java/dev/native_sdk/examples/android/MainActivity.kt", .pattern = "WIDGET_ACTION_DRAG = 1 shl 8" },
+        .{ .path = "examples/android/app/src/main/java/dev/native_sdk/examples/android/MainActivity.kt", .pattern = "WIDGET_ACTION_DROP_FILES = 1 shl 9" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, mobile_examples_step, "test-example-mobile-widget-abi", "Verify mobile examples use stable widget ABI lookups", &.{
+        .{ .path = "examples/ios/NativeSdkIOSExample/native_sdk.h", .pattern = "native_sdk_viewport_state_t" },
+        .{ .path = "examples/ios/NativeSdkIOSExample/native_sdk.h", .pattern = "native_sdk_app_scroll" },
+        .{ .path = "examples/ios/NativeSdkIOSExample/native_sdk.h", .pattern = "native_sdk_app_set_text_measure" },
+        .{ .path = "examples/android/app/src/main/cpp/native_sdk.h", .pattern = "native_sdk_app_set_text_measure" },
+        .{ .path = "examples/mobile-canvas/ios/native_sdk_app.h", .pattern = "native_sdk_app_set_text_measure" },
+        .{ .path = "examples/ios/NativeSdkIOSExample/NativeSdkHostViewController.swift", .pattern = "native_sdk_app_widget_semantics_by_id" },
+        .{ .path = "examples/android/app/src/main/cpp/native_sdk.h", .pattern = "native_sdk_app_widget_semantics_by_id" },
+        .{ .path = "examples/android/app/src/main/java/dev/native_sdk/examples/android/MainActivity.kt", .pattern = "nativeScroll(nativeApp" },
+        .{ .path = "examples/android/app/src/main/java/dev/native_sdk/examples/android/MainActivity.kt", .pattern = "nativeWidgetSemanticsByIdFields" },
+        .{ .path = "examples/android/app/src/main/cpp/native_sdk_jni.c", .pattern = "native_sdk_app_widget_semantics_by_id" },
+        .{ .path = "examples/android/app/src/main/cpp/native_sdk_jni.c", .pattern = "native_sdk_app_scroll" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, mobile_examples_step, "test-example-mobile-canvas-span-fonts", "Verify the iOS embed shim measures reserved span font ids with the macOS face mapping", &.{
+        .{ .path = "examples/mobile-canvas/ios/main.m", .pattern = "static UIFont *NativeSdkItalicSansFont(UIFont *font)" },
+        .{ .path = "examples/mobile-canvas/ios/main.m", .pattern = "static UIFont *NativeSdkWeightedSansFont(" },
+        .{ .path = "examples/mobile-canvas/ios/main.m", .pattern = "NativeSdkWeightedSansFont(@[ @\"Geist-Medium\", @\"Geist Medium\" ], UIFontWeightMedium, size)" },
+        .{ .path = "examples/mobile-canvas/ios/main.m", .pattern = "NativeSdkWeightedSansFont(@[ @\"Geist-Bold\", @\"Geist Bold\" ], UIFontWeightBold, size)" },
+        .{ .path = "examples/mobile-canvas/ios/main.m", .pattern = "NativeSdkItalicSansFont(NativeSdkWeightedSansFont(@[ @\"Geist-Bold\", @\"Geist Bold\" ], UIFontWeightBold, size))" },
+    });
+
+    const build_mobile_canvas_lib = b.addSystemCommand(&.{ "zig", "build", "lib" });
+    build_mobile_canvas_lib.setCwd(b.path("examples/mobile-canvas"));
+    const mobile_canvas_lib_step = b.step("test-example-mobile-canvas-lib", "Build the mobile-canvas embed static library through addMobileLib");
+    mobile_canvas_lib_step.dependOn(&build_mobile_canvas_lib.step);
+    mobile_examples_step.dependOn(&build_mobile_canvas_lib.step);
+
+    // Android cross-compile proof: pure Zig (no NDK sysroot — the static
+    // lib links no libc), PIC so the objects can land in the shim's .so.
+    const build_mobile_canvas_lib_android = b.addSystemCommand(&.{ "zig", "build", "lib", "-Dtarget=aarch64-linux-android" });
+    build_mobile_canvas_lib_android.setCwd(b.path("examples/mobile-canvas"));
+    const mobile_canvas_lib_android_step = b.step("test-example-mobile-canvas-lib-android", "Cross-compile the mobile-canvas embed static library for aarch64-linux-android");
+    mobile_canvas_lib_android_step.dependOn(&build_mobile_canvas_lib_android.step);
+    mobile_examples_step.dependOn(&build_mobile_canvas_lib_android.step);
 
     const examples_step = b.step("test-examples", "Run all example tests and layout checks");
     examples_step.dependOn(frontend_examples_step);
     examples_step.dependOn(native_examples_step);
     examples_step.dependOn(mobile_examples_step);
 
-    const build_webview_cef = b.addSystemCommand(&.{ "zig", "build", "-Dplatform=macos", "-Dweb-engine=chromium", b.fmt("-Dcef-dir={s}", .{cef_dir}) });
+    const build_webview_cef = b.addSystemCommand(&.{ "zig", "build", "-Dplatform=macos", "-Dweb-engine=chromium", b.fmt("-Dcef-dir={s}", .{exampleCefDir(b, cef_dir)}) });
     build_webview_cef.setCwd(b.path("examples/webview"));
     const webview_cef_link_step = b.step("test-webview-cef-link", "Build the WebView example with Chromium/CEF");
     webview_cef_link_step.dependOn(&build_webview_cef.step);
@@ -413,40 +987,44 @@ pub fn build(b: *std.Build) void {
         \\cli="$1"
         \\case "$cli" in /*) ;; *) cli="../../$cli" ;; esac
         \\request='{"id":"smoke","command":"native.ping","payload":{"source":"smoke"}}'
-        \\response_file=".zig-cache/zero-native-automation/bridge-response.txt"
-        \\mkdir -p .zig-cache/zero-native-automation
-        \\rm -f .zig-cache/zero-native-automation/snapshot.txt .zig-cache/zero-native-automation/windows.txt .zig-cache/zero-native-automation/command.txt "$response_file"
-        \\printf 'bridge %s\n' "$request" > .zig-cache/zero-native-automation/command.txt
-        \\"$app" > .zig-cache/zero-native-webview-smoke.log 2>&1 &
+        \\response_file=".zig-cache/native-sdk-automation/bridge-response.txt"
+        \\mkdir -p .zig-cache/native-sdk-automation
+        \\rm -f .zig-cache/native-sdk-automation/snapshot.txt .zig-cache/native-sdk-automation/windows.txt .zig-cache/native-sdk-automation/command*.txt "$response_file"
+        \\printf 'bridge %s\n' "$request" > .zig-cache/native-sdk-automation/command-1.txt
+        \\"$app" > .zig-cache/native-sdk-webview-smoke.log 2>&1 &
         \\pid=$!
-        \\trap 'kill "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true' EXIT
+        \\trap 'status=$?; kill "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true; if [ "$status" -ne 0 ]; then echo "---- app log (.zig-cache/native-sdk-webview-smoke.log) ----" >&2; cat .zig-cache/native-sdk-webview-smoke.log >&2 2>/dev/null || true; fi' EXIT
         \\snapshot="$("$cli" automate wait 2>&1)"
         \\case "$snapshot" in *"ready=true"*) ;; *) echo "automation snapshot was not ready" >&2; exit 1 ;; esac
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ] && ! grep -q 'name="webview.load"' .zig-cache/native-sdk-webview-smoke.log; do attempts=$((attempts + 1)); sleep 0.1; done
+        \\grep -q 'name="webview.load"' .zig-cache/native-sdk-webview-smoke.log || { echo "main window never loaded its webview source (blank window)" >&2; exit 1; }
+        \\if grep -q 'name="dispatch.error"' .zig-cache/native-sdk-webview-smoke.log; then echo "runtime recorded a dispatch error during startup" >&2; exit 1; fi
         \\attempts=0
         \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
         \\response="$(cat "$response_file" 2>/dev/null || true)"
         \\case "$response" in *'"ok":true'*) ;; *) echo "native.ping did not succeed: $response" >&2; exit 1 ;; esac
         \\case "$response" in *'pong from Zig'*) ;; *) echo "native.ping response was unexpected: $response" >&2; exit 1 ;; esac
         \\rm -f "$response_file"
-        \\printf 'bridge %s\n' '{"id":"webview-create","command":"zero-native.webview.create","payload":{"label":"smoke","url":"https://example.com","frame":{"x":24,"y":24,"width":320,"height":220}}}' > .zig-cache/zero-native-automation/command.txt
+        \\printf 'bridge %s\n' '{"id":"webview-create","command":"native-sdk.webview.create","payload":{"label":"smoke","url":"https://example.com","frame":{"x":24,"y":24,"width":320,"height":220}}}' > .zig-cache/native-sdk-automation/command-1.txt
         \\attempts=0
         \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
         \\response="$(cat "$response_file" 2>/dev/null || true)"
         \\case "$response" in *'"ok":true'*) ;; *) echo "webview create did not succeed: $response" >&2; exit 1 ;; esac
         \\rm -f "$response_file"
-        \\printf 'bridge %s\n' '{"id":"webview-resize","command":"zero-native.webview.setFrame","payload":{"label":"smoke","frame":{"x":36,"y":36,"width":420,"height":260}}}' > .zig-cache/zero-native-automation/command.txt
+        \\printf 'bridge %s\n' '{"id":"webview-resize","command":"native-sdk.webview.setFrame","payload":{"label":"smoke","frame":{"x":36,"y":36,"width":420,"height":260}}}' > .zig-cache/native-sdk-automation/command-1.txt
         \\attempts=0
         \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
         \\response="$(cat "$response_file" 2>/dev/null || true)"
         \\case "$response" in *'"ok":true'*) ;; *) echo "webview resize did not succeed: $response" >&2; exit 1 ;; esac
         \\rm -f "$response_file"
-        \\printf 'bridge %s\n' '{"id":"webview-navigate","command":"zero-native.webview.navigate","payload":{"label":"smoke","url":"https://example.com/?smoke=1"}}' > .zig-cache/zero-native-automation/command.txt
+        \\printf 'bridge %s\n' '{"id":"webview-navigate","command":"native-sdk.webview.navigate","payload":{"label":"smoke","url":"https://example.com/?smoke=1"}}' > .zig-cache/native-sdk-automation/command-1.txt
         \\attempts=0
         \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
         \\response="$(cat "$response_file" 2>/dev/null || true)"
         \\case "$response" in *'"ok":true'*) ;; *) echo "webview navigate did not succeed: $response" >&2; exit 1 ;; esac
         \\rm -f "$response_file"
-        \\printf 'bridge %s\n' '{"id":"webview-close","command":"zero-native.webview.close","payload":{"label":"smoke"}}' > .zig-cache/zero-native-automation/command.txt
+        \\printf 'bridge %s\n' '{"id":"webview-close","command":"native-sdk.webview.close","payload":{"label":"smoke"}}' > .zig-cache/native-sdk-automation/command-1.txt
         \\attempts=0
         \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
         \\response="$(cat "$response_file" 2>/dev/null || true)"
@@ -470,17 +1048,17 @@ pub fn build(b: *std.Build) void {
         \\app="zig-out/bin/native-shell"
         \\cli="$1"
         \\case "$cli" in /*) ;; *) cli="../../$cli" ;; esac
-        \\automation_dir=".zig-cache/zero-native-automation"
+        \\automation_dir=".zig-cache/native-sdk-automation"
         \\response_file="$automation_dir/bridge-response.txt"
         \\mkdir -p "$automation_dir"
-        \\rm -f "$automation_dir/snapshot.txt" "$automation_dir/accessibility.txt" "$automation_dir/windows.txt" "$automation_dir/command.txt" "$response_file"
-        \\"$app" > .zig-cache/zero-native-native-shell-smoke.log 2>&1 &
+        \\rm -f "$automation_dir/snapshot.txt" "$automation_dir/accessibility.txt" "$automation_dir/windows.txt" "$automation_dir"/command*.txt "$response_file"
+        \\"$app" > .zig-cache/native-sdk-native-shell-smoke.log 2>&1 &
         \\pid=$!
-        \\trap 'kill "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true' EXIT
+        \\trap 'status=$?; kill "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true; if [ "$status" -ne 0 ]; then echo "---- app log (.zig-cache/native-sdk-native-shell-smoke.log) ----" >&2; cat .zig-cache/native-sdk-native-shell-smoke.log >&2 2>/dev/null || true; fi' EXIT
         \\ready="$("$cli" automate wait 2>&1)"
         \\case "$ready" in *"ready=true"*) ;; *) echo "native-shell automation snapshot was not ready" >&2; exit 1 ;; esac
         \\snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
-        \\case "$snapshot" in *'window @w1 "zero-native Native Shell"'*) ;; *) echo "native-shell window was missing from snapshot" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'window @w1 "Native SDK Native Shell"'*) ;; *) echo "native-shell window was missing from snapshot" >&2; exit 1 ;; esac
         \\case "$snapshot" in *'view @w1/toolbar kind=toolbar'*) ;; *) echo "toolbar view was missing from snapshot" >&2; exit 1 ;; esac
         \\case "$snapshot" in *'view @w1/sidebar kind=sidebar'*) ;; *) echo "sidebar view was missing from snapshot" >&2; exit 1 ;; esac
         \\case "$snapshot" in *'view @w1/main kind=webview'*) ;; *) echo "main WebView was missing from snapshot" >&2; exit 1 ;; esac
@@ -520,16 +1098,16 @@ pub fn build(b: *std.Build) void {
         \\attempts=0
         \\while [ "$attempts" -lt 50 ]; do
         \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
-        \\  case "$snapshot" in *'window @w1 "zero-native Native Shell" bounds=('*' 900x640)'*) break ;; esac
+        \\  case "$snapshot" in *'window @w1 "Native SDK Native Shell" bounds=('*' 900x640)'*) break ;; esac
         \\  attempts=$((attempts + 1))
         \\  sleep 0.1
         \\done
-        \\case "$snapshot" in *'window @w1 "zero-native Native Shell" bounds=('*' 900x640)'*) ;; *) echo "native-shell window resize was not reflected in snapshot" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'window @w1 "Native SDK Native Shell" bounds=('*' 900x640)'*) ;; *) echo "native-shell window resize was not reflected in snapshot" >&2; exit 1 ;; esac
         \\case "$snapshot" in *'view @w1/toolbar kind=toolbar'*'bounds=(0,0 900x52)'*) ;; *) echo "native-shell toolbar did not relayout after resize" >&2; exit 1 ;; esac
         \\case "$snapshot" in *'view @w1/main kind=webview'*'bounds=(240,52 660x548)'*) ;; *) echo "native-shell main WebView did not relayout after resize" >&2; exit 1 ;; esac
         \\case "$snapshot" in *'view @w1/statusbar kind=statusbar'*'bounds=(240,600 660x40)'*) ;; *) echo "native-shell statusbar did not relayout after resize" >&2; exit 1 ;; esac
         \\rm -f "$response_file"
-        \\printf 'bridge %s\n' '{"id":"native-shell-refresh","command":"zero-native.command.invoke","payload":{"name":"app.refresh"}}' > "$automation_dir/command.txt"
+        \\printf 'bridge %s\n' '{"id":"native-shell-refresh","command":"native-sdk.command.invoke","payload":{"name":"app.refresh"}}' > "$automation_dir/command-1.txt"
         \\attempts=0
         \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
         \\response="$(cat "$response_file" 2>/dev/null || true)"
@@ -596,8 +1174,809 @@ pub fn build(b: *std.Build) void {
     native_shell_smoke_run.step.dependOn(&cli_exe.step);
     native_shell_smoke_step.dependOn(&native_shell_smoke_run.step);
 
+    const gpu_surface_smoke_step = b.step("test-gpu-surface-smoke", "Run macOS GPU surface automation smoke test");
+    // The GPU smoke apps are managed examples (no build.zig of their own),
+    // so their binaries come from the CLI verb. -Doptimize=Debug keeps the
+    // smoke binary at the debug shape the in-dir builds used (`native
+    // build` injects ReleaseFast when no optimize flag is passed).
+    const gpu_surface_smoke_build = managedExampleRun(b, cli_exe, &.{ "build", "-Dplatform=macos", "-Dweb-engine=system", "-Dautomation=true", "-Doptimize=Debug" });
+    gpu_surface_smoke_build.setCwd(b.path("examples/gpu-surface"));
+    const gpu_surface_smoke_run = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\set -eu
+        \\cd examples/gpu-surface
+        \\app="zig-out/bin/gpu-surface"
+        \\cli="$1"
+        \\case "$cli" in /*) ;; *) cli="../../$cli" ;; esac
+        \\automation_dir=".zig-cache/native-sdk-automation"
+        \\mkdir -p "$automation_dir"
+        \\# Startup latencies are load-sensitive on shared CI/agent machines.
+        \\# NATIVE_SDK_SMOKE_BUDGET_MS raises the first-frame latency budget (default
+        \\# stays 150 ms) and the automation-ready ceiling (default stays
+        \\# 500 ms; the ceiling never drops below it) without weakening the
+        \\# local defaults; every correctness assertion stays strict.
+        \\smoke_budget_ms="${NATIVE_SDK_SMOKE_BUDGET_MS:-150}"
+        \\case "$smoke_budget_ms" in ''|*[!0-9]*) echo "NATIVE_SDK_SMOKE_BUDGET_MS must be a positive integer of milliseconds: $smoke_budget_ms" >&2; exit 1 ;; esac
+        \\if [ "$smoke_budget_ms" -le 0 ]; then echo "NATIVE_SDK_SMOKE_BUDGET_MS must be a positive integer of milliseconds: $smoke_budget_ms" >&2; exit 1; fi
+        \\smoke_budget_ns=$((smoke_budget_ms * 1000000))
+        \\ready_budget_ms="$smoke_budget_ms"
+        \\if [ "$ready_budget_ms" -lt 500 ]; then ready_budget_ms=500; fi
+        \\ready_budget_ns=$((ready_budget_ms * 1000000))
+        \\rm -f "$automation_dir/snapshot.txt" "$automation_dir/accessibility.txt" "$automation_dir/windows.txt" "$automation_dir"/command*.txt
+        \\"$app" > .zig-cache/native-sdk-gpu-surface-smoke.log 2>&1 &
+        \\pid=$!
+        \\trap 'status=$?; kill "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true; if [ "$status" -ne 0 ]; then echo "---- app log (.zig-cache/native-sdk-gpu-surface-smoke.log) ----" >&2; cat .zig-cache/native-sdk-gpu-surface-smoke.log >&2 2>/dev/null || true; fi' EXIT
+        \\ready="$("$cli" automate wait 2>&1)"
+        \\case "$ready" in *"ready=true"*) ;; *) echo "gpu-surface automation snapshot was not ready" >&2; exit 1 ;; esac
+        \\ready_uptime="$(printf '%s\n' "$ready" | sed -n 's/.*runtime_uptime_ns=\([0-9][0-9]*\).*/\1/p')"
+        \\case "$ready_uptime" in ''|*[!0-9]*) echo "gpu-surface automation ready uptime was missing" >&2; exit 1 ;; esac
+        \\if [ "$ready_uptime" -le 0 ] || [ "$ready_uptime" -gt "$ready_budget_ns" ]; then echo "gpu-surface automation ready exceeded $ready_budget_ms ms: $ready_uptime ns" >&2; exit 1; fi
+        \\snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\case "$snapshot" in *'window @w1 "Native SDK GPU Surface"'*) ;; *) echo "gpu-surface window was missing from snapshot" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'view @w1/canvas kind=gpu_surface'*'accessibility_label="Animated GPU surface"'*) ;; *) echo "gpu_surface view was missing from snapshot" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'view @w1/inspector kind=webview'*) ;; *) echo "inspector WebView was missing from snapshot" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'view @w1/toolbar kind=toolbar'*) ;; *) echo "toolbar view was missing from snapshot" >&2; exit 1 ;; esac
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  case "$snapshot" in *'GPU frame 1 from canvas.'*) break ;; esac
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\case "$snapshot" in *'view @w1/status-label kind=label'*'GPU frame 1 from canvas.'*) ;; *) echo "gpu-surface frame event did not reach the runtime" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'view @w1/canvas kind=gpu_surface'*'gpu_nonblank=true'*) ;; *) echo "gpu-surface frame was not verified as nonblank" >&2; exit 1 ;; esac
+        \\first_frame_latency="$(printf '%s\n' "$snapshot" | sed -n 's/.*view @w1\/canvas kind=gpu_surface.* gpu_first_frame_latency_ns=\([0-9][0-9]*\).*/\1/p')"
+        \\case "$first_frame_latency" in ''|*[!0-9]*) echo "gpu-surface first frame latency was missing" >&2; exit 1 ;; esac
+        \\if [ "$first_frame_latency" -le 0 ] || [ "$first_frame_latency" -gt "$smoke_budget_ns" ]; then echo "gpu-surface first frame exceeded $smoke_budget_ms ms: $first_frame_latency ns" >&2; exit 1; fi
+        \\# The runtime publishes its own fixed 150 ms budget verdict. Within that
+        \\# budget the verdict must agree exactly; beyond it (reachable only when
+        \\# NATIVE_SDK_SMOKE_BUDGET_MS > 150) the runtime must report the overrun honestly.
+        \\if [ "$first_frame_latency" -le 150000000 ]; then
+        \\  case "$snapshot" in *'view @w1/canvas kind=gpu_surface'*'gpu_first_frame_latency_budget_ns=150000000'*'gpu_first_frame_latency_budget_exceeded=0'*'gpu_first_frame_latency_budget_ok=true'*) ;; *) echo "gpu-surface first frame exceeded the latency budget" >&2; exit 1 ;; esac
+        \\else
+        \\  case "$snapshot" in *'view @w1/canvas kind=gpu_surface'*'gpu_first_frame_latency_budget_ns=150000000'*'gpu_first_frame_latency_budget_ok=false'*) ;; *) echo "gpu-surface runtime did not report the first-frame budget overrun" >&2; exit 1 ;; esac
+        \\fi
+        \\"$cli" automate native-command gpu.refresh refresh >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  case "$snapshot" in *'GPU surface refreshed from toolbar. Count 1.'*) break ;; esac
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\case "$snapshot" in *'view @w1/status-label kind=label'*'GPU surface refreshed from toolbar. Count 1.'*) ;; *) echo "gpu-surface refresh command did not update status" >&2; exit 1 ;; esac
+        \\"$cli" automate resize 960 620 >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  case "$snapshot" in *'window @w1 "Native SDK GPU Surface" bounds=('*' 960x620)'*) break ;; esac
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\case "$snapshot" in *'window @w1 "Native SDK GPU Surface" bounds=('*' 960x620)'*) ;; *) echo "gpu-surface window resize was not reflected in snapshot" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'view @w1/canvas kind=gpu_surface'*'bounds=(0,0 680x534)'*) ;; *) echo "gpu_surface view did not relayout after resize" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'view @w1/inspector kind=webview'*'bounds=(680,52 280x534)'*) ;; *) echo "inspector WebView did not relayout after resize" >&2; exit 1 ;; esac
+        \\echo "gpu-surface smoke ok"
+        ,
+        "sh",
+    });
+    gpu_surface_smoke_run.addFileArg(cli_exe.getEmittedBin());
+    gpu_surface_smoke_run.step.dependOn(&gpu_surface_smoke_build.step);
+    gpu_surface_smoke_run.step.dependOn(&cli_exe.step);
+    gpu_surface_smoke_step.dependOn(&gpu_surface_smoke_run.step);
+
+    const writeback_smoke_step = b.step("test-writeback-smoke", "Run macOS provenance + write-back automation smoke test");
+    // Debug on purpose: the write-back loop lives on the markup
+    // interpreter + hot-reload watch, which apps enable in Debug
+    // (kanban's dev_markup_reload) - the release engine is compiled and
+    // watchless by design.
+    const writeback_smoke_build = managedExampleRun(b, cli_exe, &.{ "build", "-Dplatform=macos", "-Dweb-engine=system", "-Dautomation=true", "-Doptimize=Debug" });
+    writeback_smoke_build.setCwd(b.path("examples/kanban"));
+    const writeback_smoke_run = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\set -eu
+        \\cd examples/kanban
+        \\app="zig-out/bin/kanban"
+        \\cli="$1"
+        \\case "$cli" in /*) ;; *) cli="../../$cli" ;; esac
+        \\automation_dir=".zig-cache/native-sdk-automation"
+        \\mkdir -p "$automation_dir"
+        \\rm -f "$automation_dir/snapshot.txt" "$automation_dir"/command*.txt "$automation_dir/provenance.txt"
+        \\# The smoke edits src/board.native through the write-back verb and restores
+        \\# it through the same verb; the trap restores from the backup on ANY
+        \\# failure so an aborted run never leaves the example dirty.
+        \\cp src/board.native .zig-cache/board.native.smoke-backup
+        \\"$app" > .zig-cache/native-sdk-writeback-smoke.log 2>&1 &
+        \\pid=$!
+        \\trap 'status=$?; kill "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true; cp .zig-cache/board.native.smoke-backup src/board.native; if [ "$status" -ne 0 ]; then echo "---- app log (.zig-cache/native-sdk-writeback-smoke.log) ----" >&2; cat .zig-cache/native-sdk-writeback-smoke.log >&2 2>/dev/null || true; fi' EXIT
+        \\"$cli" automate assert --timeout-ms 30000 'ready=true' >/dev/null
+        \\snapshot="$(cat "$automation_dir/snapshot.txt")"
+        \\button_id="$(printf '%s\n' "$snapshot" | sed -n 's/.*widget @w1\/kanban-canvas#\([0-9][0-9]*\) role=button name="Add card".*/\1/p' | head -n 1)"
+        \\case "$button_id" in ''|*[!0-9]*) echo "writeback smoke: Add card button id was missing from the snapshot" >&2; exit 1 ;; esac
+        \\# 1. Provenance: the button reports its authored span in the root file.
+        \\provenance="$("$cli" automate provenance kanban-canvas "$button_id" 2>/dev/null)"
+        \\case "$provenance" in *"authored=markup"*"root=src/board.native"*) ;; *) echo "writeback smoke: button provenance was not markup-authored: $provenance" >&2; exit 1 ;; esac
+        \\case "$provenance" in *"node file=src/board.native"*) ;; *) echo "writeback smoke: button provenance named the wrong file: $provenance" >&2; exit 1 ;; esac
+        \\# 2. Template + import chain: a card title reports its definition site in
+        \\# the component file plus the <use> site in the root file, with the
+        \\# for-loop iteration key.
+        \\card_id="$(printf '%s\n' "$snapshot" | sed -n 's/.*widget @w1\/kanban-canvas#\([0-9][0-9]*\) role=text name="Sketch the board layout".*/\1/p' | head -n 1)"
+        \\case "$card_id" in ''|*[!0-9]*) echo "writeback smoke: card text id was missing from the snapshot" >&2; exit 1 ;; esac
+        \\card_provenance="$("$cli" automate provenance kanban-canvas "$card_id" 2>/dev/null)"
+        \\case "$card_provenance" in *"node file=src/components/board-column.native"*) ;; *) echo "writeback smoke: card provenance missed the component file: $card_provenance" >&2; exit 1 ;; esac
+        \\case "$card_provenance" in *"use file=src/board.native"*) ;; *) echo "writeback smoke: card provenance missed the use-site chain: $card_provenance" >&2; exit 1 ;; esac
+        \\case "$card_provenance" in *"keys="*) ;; *) echo "writeback smoke: card provenance missed the iteration key: $card_provenance" >&2; exit 1 ;; esac
+        \\# 3. Write-back: flip the button label through the verb; the app's own
+        \\# hot-reload watch picks the file change up and repaints.
+        \\"$cli" automate edit kanban-canvas "$button_id" set-text "Add task" >/dev/null 2>&1
+        \\"$cli" automate assert --timeout-ms 15000 'role=button name="Add task"' >/dev/null
+        \\# The file diff is byte-exact: exactly the label bytes changed.
+        \\sed 's/>Add card</>Add task</' .zig-cache/board.native.smoke-backup > .zig-cache/board.native.smoke-expected
+        \\cmp -s .zig-cache/board.native.smoke-expected src/board.native || { echo "writeback smoke: the edit was not minimal-diff" >&2; exit 1; }
+        \\# 4. Flip it back through the same verb: the structural id survived the
+        \\# reload (text is not identity), and the file restores byte-identical.
+        \\"$cli" automate edit kanban-canvas "$button_id" set-text "Add card" >/dev/null 2>&1
+        \\"$cli" automate assert --timeout-ms 15000 'role=button name="Add card"' >/dev/null
+        \\cmp -s .zig-cache/board.native.smoke-backup src/board.native || { echo "writeback smoke: the flip-back did not restore the file byte-identically" >&2; exit 1; }
+        \\# 5. Refusal: an edit that fails validation leaves the file untouched.
+        \\if "$cli" automate edit kanban-canvas "$button_id" set-attr bogus 1 >/dev/null 2>&1; then echo "writeback smoke: an invalid edit was not refused" >&2; exit 1; fi
+        \\cmp -s .zig-cache/board.native.smoke-backup src/board.native || { echo "writeback smoke: a refused edit touched the file" >&2; exit 1; }
+        \\echo "writeback smoke ok"
+        ,
+        "sh",
+    });
+    writeback_smoke_run.addFileArg(cli_exe.getEmittedBin());
+    writeback_smoke_run.step.dependOn(&writeback_smoke_build.step);
+    writeback_smoke_run.step.dependOn(&cli_exe.step);
+    writeback_smoke_step.dependOn(&writeback_smoke_run.step);
+
+    const gpu_dashboard_smoke_step = b.step("test-gpu-dashboard-smoke", "Run macOS GPU dashboard automation smoke test");
+    const gpu_dashboard_smoke_build = managedExampleRun(b, cli_exe, &.{ "build", "-Dplatform=macos", "-Dweb-engine=system", "-Dautomation=true", "-Doptimize=Debug" });
+    gpu_dashboard_smoke_build.setCwd(b.path("examples/gpu-dashboard"));
+    const gpu_dashboard_smoke_run = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\set -eu
+        \\cd examples/gpu-dashboard
+        \\app="zig-out/bin/gpu-dashboard"
+        \\cli="$1"
+        \\case "$cli" in /*) ;; *) cli="../../$cli" ;; esac
+        \\automation_dir=".zig-cache/native-sdk-automation"
+        \\mkdir -p "$automation_dir"
+        \\# First-frame latency is load-sensitive: a cold file cache or CI/agent
+        \\# machine contention can blow the 150 ms budget while the frame itself
+        \\# is presented and correct. Load tolerance without weakening the proof:
+        \\#   (a) NATIVE_SDK_SMOKE_BUDGET_MS raises the smoke's latency budget (default
+        \\#       stays 150 ms) and the automation-ready ceiling (default stays
+        \\#       500 ms; the ceiling never drops below it), and
+        \\#   (b) a budget-only overrun relaunches the app once and re-measures.
+        \\# Every correctness assertion (frame presented, packet-representable,
+        \\# retained content, widget semantics) stays strict on whichever launch
+        \\# survives, and the runtime's own fixed 150 ms budget verdict is still
+        \\# asserted verbatim whenever the measured latency is within 150 ms.
+        \\smoke_budget_ms="${NATIVE_SDK_SMOKE_BUDGET_MS:-150}"
+        \\case "$smoke_budget_ms" in ''|*[!0-9]*) echo "NATIVE_SDK_SMOKE_BUDGET_MS must be a positive integer of milliseconds: $smoke_budget_ms" >&2; exit 1 ;; esac
+        \\if [ "$smoke_budget_ms" -le 0 ]; then echo "NATIVE_SDK_SMOKE_BUDGET_MS must be a positive integer of milliseconds: $smoke_budget_ms" >&2; exit 1; fi
+        \\smoke_budget_ns=$((smoke_budget_ms * 1000000))
+        \\ready_budget_ms="$smoke_budget_ms"
+        \\if [ "$ready_budget_ms" -lt 500 ]; then ready_budget_ms=500; fi
+        \\ready_budget_ns=$((ready_budget_ms * 1000000))
+        \\pid=""
+        \\trap 'status=$?; kill "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true; if [ "$status" -ne 0 ]; then echo "---- app log (.zig-cache/native-sdk-gpu-dashboard-smoke.log) ----" >&2; cat .zig-cache/native-sdk-gpu-dashboard-smoke.log >&2 2>/dev/null || true; fi' EXIT
+        \\stop_app() {
+        \\  kill "$pid" >/dev/null 2>&1 || true
+        \\  wait "$pid" >/dev/null 2>&1 || true
+        \\  pid=""
+        \\}
+        \\launch_and_measure_first_frame() {
+        \\  rm -f "$automation_dir/snapshot.txt" "$automation_dir/accessibility.txt" "$automation_dir/windows.txt" "$automation_dir"/command*.txt
+        \\  "$app" > .zig-cache/native-sdk-gpu-dashboard-smoke.log 2>&1 &
+        \\  pid=$!
+        \\  ready="$("$cli" automate wait 2>&1)"
+        \\  case "$ready" in *"ready=true"*) ;; *) echo "gpu-dashboard automation snapshot was not ready" >&2; exit 1 ;; esac
+        \\  ready_uptime="$(printf '%s\n' "$ready" | sed -n 's/.*runtime_uptime_ns=\([0-9][0-9]*\).*/\1/p')"
+        \\  case "$ready_uptime" in ''|*[!0-9]*) echo "gpu-dashboard automation ready uptime was missing" >&2; exit 1 ;; esac
+        \\  if [ "$ready_uptime" -le 0 ] || [ "$ready_uptime" -gt "$ready_budget_ns" ]; then echo "gpu-dashboard automation ready exceeded $ready_budget_ms ms: $ready_uptime ns" >&2; exit 1; fi
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  case "$snapshot" in *'window @w1 "Native SDK GPU Dashboard"'*) ;; *) echo "gpu-dashboard window was missing from snapshot" >&2; exit 1 ;; esac
+        \\  case "$snapshot" in *'view @w1/main kind=webview'*) echo "dashboard should not create an implicit main WebView" >&2; exit 1 ;; *) ;; esac
+        \\  case "$snapshot" in *'source kind=html bytes=0'*) echo "dashboard should not publish an empty default WebView source" >&2; exit 1 ;; *) ;; esac
+        \\  case "$snapshot" in *'view @w1/dashboard-canvas kind=gpu_surface'*'accessibility_label="Native-rendered product dashboard canvas"'*) ;; *) echo "dashboard GPU canvas was missing from snapshot" >&2; exit 1 ;; esac
+        \\  attempts=0
+        \\  while [ "$attempts" -lt 50 ]; do
+        \\    snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\    case "$snapshot" in *'view @w1/dashboard-canvas kind=gpu_surface'*'gpu_nonblank=true'*'canvas_commands=68'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) break ;; esac
+        \\    attempts=$((attempts + 1))
+        \\    sleep 0.1
+        \\  done
+        \\  case "$snapshot" in *'view @w1/dashboard-canvas kind=gpu_surface'*'gpu_nonblank=true'*'canvas_commands=68'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) ;; *) echo "dashboard GPU canvas did not present the retained display list as a packet" >&2; exit 1 ;; esac
+        \\  case "$snapshot" in *'view @w1/dashboard-canvas kind=gpu_surface'*'canvas_commands=68'*'widget_semantics=48'*) ;; *) echo "dashboard GPU canvas was missing retained commands or widget semantics" >&2; exit 1 ;; esac
+        \\  first_frame_latency="$(printf '%s\n' "$snapshot" | sed -n 's/.*view @w1\/dashboard-canvas kind=gpu_surface.* gpu_first_frame_latency_ns=\([0-9][0-9]*\).*/\1/p')"
+        \\  case "$first_frame_latency" in ''|*[!0-9]*) echo "dashboard GPU first frame latency was missing" >&2; exit 1 ;; esac
+        \\  if [ "$first_frame_latency" -le 0 ]; then echo "dashboard GPU first frame latency was not recorded" >&2; exit 1; fi
+        \\}
+        \\launch_and_measure_first_frame
+        \\if [ "$first_frame_latency" -gt "$smoke_budget_ns" ]; then
+        \\  echo "dashboard GPU first frame exceeded $smoke_budget_ms ms ($first_frame_latency ns); relaunching once to rule out machine load" >&2
+        \\  stop_app
+        \\  launch_and_measure_first_frame
+        \\fi
+        \\if [ "$first_frame_latency" -gt "$smoke_budget_ns" ]; then echo "dashboard GPU first frame exceeded $smoke_budget_ms ms on both launches: $first_frame_latency ns" >&2; exit 1; fi
+        \\# The runtime publishes its own fixed 150 ms budget verdict. Within that
+        \\# budget the verdict must agree exactly; beyond it (reachable only when
+        \\# NATIVE_SDK_SMOKE_BUDGET_MS > 150) the runtime must report the overrun honestly.
+        \\if [ "$first_frame_latency" -le 150000000 ]; then
+        \\  case "$snapshot" in *'view @w1/dashboard-canvas kind=gpu_surface'*'gpu_first_frame_latency_budget_ns=150000000'*'gpu_first_frame_latency_budget_exceeded=0'*'gpu_first_frame_latency_budget_ok=true'*) ;; *) echo "dashboard GPU first frame exceeded the latency budget" >&2; exit 1 ;; esac
+        \\else
+        \\  case "$snapshot" in *'view @w1/dashboard-canvas kind=gpu_surface'*'gpu_first_frame_latency_budget_ns=150000000'*'gpu_first_frame_latency_budget_ok=false'*) ;; *) echo "dashboard runtime did not report the first-frame budget overrun" >&2; exit 1 ;; esac
+        \\fi
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  case "$snapshot" in *'role=text name="Canvas frame:'*) break ;; esac
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\widget_line() {
+        \\  printf '%s\n' "$snapshot" | grep -F "$1" | head -1
+        \\}
+        \\line="$(widget_line 'role=tab name="Dashboard mode"')"
+        \\case "$line" in *'actions=[focus,press,select]'*) ;; *) echo "dashboard toolbar mode semantics were missing" >&2; exit 1 ;; esac
+        \\line="$(widget_line 'role=button name="Refresh dashboard"')"
+        \\case "$line" in *'actions=[focus,press]'*) ;; *) echo "dashboard toolbar refresh semantics were missing" >&2; exit 1 ;; esac
+        \\# CoreText-backed layout metrics: the refresh button must be sized by the
+        \\# platform text measure provider, not the deterministic estimator
+        \\# (estimateTextWidthForFont sizes "Refresh" at 14px to 51.842 -> 75.841995 wide).
+        \\case "$line" in *'75.841995x34'*) echo "dashboard refresh button was sized by the estimator; platform text measurement is inactive" >&2; exit 1 ;; esac
+        \\refresh_width="$(printf '%s\n' "$line" | sed -n 's/.*bounds=([0-9.,-]* \([0-9.]*\)x[0-9.]*).*/\1/p')"
+        \\case "$refresh_width" in ''|*[!0-9.]*) echo "dashboard refresh button width was missing" >&2; exit 1 ;; esac
+        \\if [ "$(printf '%s\n' "$refresh_width < 50 || $refresh_width > 110" | bc)" -eq 1 ]; then echo "dashboard refresh button width was implausible: $refresh_width" >&2; exit 1; fi
+        \\line="$(widget_line 'role=button name="Live render status"')"
+        \\case "$line" in *'actions=[focus,press]'*) ;; *) echo "dashboard live render button semantics were missing" >&2; exit 1 ;; esac
+        \\line="$(widget_line 'role=textbox name="Forecast amount"')"
+        \\case "$line" in *'text="$13.4M"'*) ;; *) echo "dashboard forecast textbox semantics were missing" >&2; exit 1 ;; esac
+        \\line="$(widget_line 'role=dialog name="Revenue filter popover"')"
+        \\case "$line" in '') echo "dashboard popover semantics were missing" >&2; exit 1 ;; esac
+        \\line="$(widget_line 'role=text name="Canvas frame:')"
+        \\case "$line" in *'packet ok'*) ;; *) echo "dashboard canvas status semantics were missing" >&2; exit 1 ;; esac
+        \\gpu_frame_from_snapshot() {
+        \\  printf '%s\n' "$snapshot" | sed -n 's/.*view @w1\/dashboard-canvas kind=gpu_surface.* gpu_frame=\([0-9][0-9]*\).*/\1/p'
+        \\}
+        \\canvas_revision_from_snapshot() {
+        \\  printf '%s\n' "$snapshot" | sed -n 's/.*view @w1\/dashboard-canvas kind=gpu_surface.* canvas_revision=\([0-9][0-9]*\).*/\1/p'
+        \\}
+        \\snapshot_contains() {
+        \\  case "$snapshot" in *"$1"*) return 0 ;; *) return 1 ;; esac
+        \\}
+        \\canvas_revision_before_resize="$(canvas_revision_from_snapshot)"
+        \\case "$canvas_revision_before_resize" in ''|*[!0-9]*) echo "dashboard canvas revision was missing before resize" >&2; exit 1 ;; esac
+        \\"$cli" automate resize 1120 700 >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  case "$snapshot" in *'window @w1 "Native SDK GPU Dashboard" bounds=('*' 1120x700)'*'view @w1/dashboard-canvas kind=gpu_surface'*'bounds=(0,0 1120x700)'*'gpu_nonblank=true'*'canvas_commands=68'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) break ;; esac
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\case "$snapshot" in *'window @w1 "Native SDK GPU Dashboard" bounds=('*' 1120x700)'*) ;; *) echo "dashboard window resize was not reflected in snapshot" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'view @w1/dashboard-canvas kind=gpu_surface'*'bounds=(0,0 1120x700)'*) ;; *) echo "dashboard GPU canvas did not relayout after resize" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'view @w1/dashboard-canvas kind=gpu_surface'*'gpu_nonblank=true'*'canvas_commands=68'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) ;; *) echo "dashboard GPU canvas did not remain packet-renderable after resize" >&2; exit 1 ;; esac
+        \\canvas_revision_after_resize="$(canvas_revision_from_snapshot)"
+        \\case "$canvas_revision_after_resize" in ''|*[!0-9]*) echo "dashboard canvas revision was missing after resize" >&2; exit 1 ;; esac
+        \\if [ "$canvas_revision_after_resize" -lt "$canvas_revision_before_resize" ]; then echo "dashboard canvas revision went backwards after resize: $canvas_revision_before_resize -> $canvas_revision_after_resize" >&2; exit 1; fi
+        \\gpu_frame_before="$(gpu_frame_from_snapshot)"
+        \\case "$gpu_frame_before" in ''|*[!0-9]*) gpu_frame_before=0 ;; esac
+        \\gpu_frame_after="$gpu_frame_before"
+        \\switch_id="$(printf '%s\n' "$snapshot" | sed -n 's/.*widget @w1\/dashboard-canvas#\([0-9][0-9]*\) role=switch name="Auto refresh".*/\1/p' | head -1)"
+        \\case "$switch_id" in ''|*[!0-9]*) echo "dashboard auto refresh switch id was missing from snapshot" >&2; exit 1 ;; esac
+        \\"$cli" automate widget-click dashboard-canvas "$switch_id" >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  gpu_frame_after="$(gpu_frame_from_snapshot)"
+        \\  case "$gpu_frame_after" in ''|*[!0-9]*) gpu_frame_after=0 ;; esac
+        \\  if [ "$gpu_frame_after" -gt "$gpu_frame_before" ]; then
+        \\    if snapshot_contains 'Auto refresh off.' && snapshot_contains 'view @w1/dashboard-canvas kind=gpu_surface' && snapshot_contains 'canvas_frame_full_repaint=false' && snapshot_contains 'canvas_frame_pipeline_uploads=0' && snapshot_contains 'canvas_frame_glyph_uploads=0' && snapshot_contains 'canvas_frame_text_uploads=0' && snapshot_contains 'canvas_frame_gpu_packet_unsupported=0' && snapshot_contains 'canvas_frame_gpu_packet_representable=true'; then
+        \\      switch_line="$(printf '%s\n' "$snapshot" | grep -F 'role=switch name="Auto refresh"' | head -1)"
+        \\      case "$switch_line" in *'value=0'*) break ;; esac
+        \\    fi
+        \\  fi
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\if [ "$gpu_frame_after" -le "$gpu_frame_before" ]; then echo "dashboard switch click did not request a GPU frame" >&2; exit 1; fi
+        \\case "$snapshot" in *'Auto refresh off.'*) ;; *) echo "dashboard switch click did not update status" >&2; exit 1 ;; esac
+        \\switch_line="$(printf '%s\n' "$snapshot" | grep -F 'role=switch name="Auto refresh"' | head -1)"
+        \\case "$switch_line" in *'value=0'*) ;; *) echo "dashboard switch click did not route through pointer input" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'view @w1/dashboard-canvas kind=gpu_surface'*'canvas_frame_full_repaint=false'*'canvas_frame_pipeline_uploads=0'*'canvas_frame_glyph_uploads=0'*'canvas_frame_text_uploads=0'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) ;; *) echo "dashboard switch click did not present an incremental GPU packet without interaction-time uploads" >&2; exit 1 ;; esac
+        \\input_timestamp="$(printf '%s\n' "$snapshot" | sed -n 's/.*view @w1\/dashboard-canvas kind=gpu_surface.* gpu_input_timestamp_ns=\([0-9][0-9]*\).*/\1/p')"
+        \\case "$input_timestamp" in ''|*[!0-9]*) echo "dashboard GPU input timestamp was missing after widget interaction" >&2; exit 1 ;; esac
+        \\if [ "$input_timestamp" -le 0 ]; then echo "dashboard GPU input timestamp was not recorded" >&2; exit 1; fi
+        \\input_latency="$(printf '%s\n' "$snapshot" | sed -n 's/.*view @w1\/dashboard-canvas kind=gpu_surface.* gpu_input_latency_ns=\([0-9][0-9]*\).*/\1/p')"
+        \\case "$input_latency" in ''|*[!0-9]*) echo "dashboard GPU input latency was missing after widget interaction" >&2; exit 1 ;; esac
+        \\# --- Incremental pixel equivalence: relaunch under the host's verify
+        \\# mode, where every scissored dirty update is byte-compared against a
+        \\# from-scratch full redraw of the retained command list. Clicks, the
+        \\# live-pulse animation, and a mid-animation resize drive scissored
+        \\# patches; the verify counters must show checks with zero mismatches.
+        \\stop_app
+        \\rm -f "$automation_dir/snapshot.txt" "$automation_dir"/command*.txt
+        \\verify_log=".zig-cache/native-sdk-gpu-dashboard-verify.log"
+        \\NATIVE_SDK_GPU_VERIFY_INCREMENTAL=1 "$app" > "$verify_log" 2>&1 &
+        \\pid=$!
+        \\ready="$("$cli" automate wait 2>&1)"
+        \\case "$ready" in *"ready=true"*) ;; *) echo "gpu-dashboard verify relaunch was not ready" >&2; exit 1 ;; esac
+        \\snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\switch_id="$(printf '%s\n' "$snapshot" | sed -n 's/.*widget @w1\/dashboard-canvas#\([0-9][0-9]*\) role=switch name="Auto refresh".*/\1/p' | head -1)"
+        \\live_id="$(printf '%s\n' "$snapshot" | sed -n 's/.*widget @w1\/dashboard-canvas#\([0-9][0-9]*\) role=button name="Live render status".*/\1/p' | head -1)"
+        \\case "$switch_id" in ''|*[!0-9]*) echo "dashboard verify switch id was missing" >&2; exit 1 ;; esac
+        \\case "$live_id" in ''|*[!0-9]*) echo "dashboard verify live button id was missing" >&2; exit 1 ;; esac
+        \\"$cli" automate widget-click dashboard-canvas "$switch_id" >/dev/null 2>&1
+        \\sleep 0.4
+        \\"$cli" automate widget-click dashboard-canvas "$live_id" >/dev/null 2>&1
+        \\sleep 0.3
+        \\"$cli" automate resize 1120 700 >/dev/null 2>&1
+        \\sleep 0.5
+        \\"$cli" automate widget-click dashboard-canvas "$live_id" >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  if grep -q "gpu incremental verify view=dashboard-canvas checks=" "$verify_log" 2>/dev/null; then break; fi
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\if ! grep -q "gpu incremental verify view=dashboard-canvas checks=" "$verify_log" 2>/dev/null; then echo "dashboard verify mode recorded no incremental checks" >&2; exit 1; fi
+        \\if grep -q "verify MISMATCH" "$verify_log" 2>/dev/null; then echo "dashboard incremental present diverged from a full redraw:" >&2; grep "verify MISMATCH" "$verify_log" >&2; exit 1; fi
+        \\if grep "gpu incremental verify view=dashboard-canvas checks=" "$verify_log" | grep -qv "mismatches=0"; then echo "dashboard incremental verify reported mismatches" >&2; exit 1; fi
+        \\echo "gpu-dashboard smoke ok"
+        ,
+        "sh",
+    });
+    gpu_dashboard_smoke_run.addFileArg(cli_exe.getEmittedBin());
+    gpu_dashboard_smoke_run.step.dependOn(&gpu_dashboard_smoke_build.step);
+    gpu_dashboard_smoke_run.step.dependOn(&cli_exe.step);
+    gpu_dashboard_smoke_step.dependOn(&gpu_dashboard_smoke_run.step);
+
+    // Percentile performance check — a single-sample gate was noise-dominated,
+    // so this asserts p90 over N launches. Deliberately NOT part of
+    // `zig build test` or the fast gate tier: N launches are slow and the
+    // numbers only mean something on a controlled machine. Runs via
+    // `scripts/gate.sh full --perf` locally and a dedicated macos-14 CI job.
+    // Knobs: NATIVE_SDK_PERF_LAUNCHES, NATIVE_SDK_PERF_INTERACTIONS, NATIVE_SDK_PERF_BUDGET_MS,
+    // NATIVE_SDK_PERF_INPUT_BUDGET_MS — see scripts/perf-gpu-dashboard.sh.
+    const gpu_dashboard_perf_step = b.step("test-gpu-dashboard-perf", "Run macOS GPU dashboard percentile performance check (N launches; slow)");
+    const gpu_dashboard_perf_build = managedExampleRun(b, cli_exe, &.{ "build", "-Dplatform=macos", "-Dweb-engine=system", "-Dautomation=true", "-Doptimize=Debug" });
+    gpu_dashboard_perf_build.setCwd(b.path("examples/gpu-dashboard"));
+    const gpu_dashboard_perf_run = b.addSystemCommand(&.{ "sh", "scripts/perf-gpu-dashboard.sh" });
+    gpu_dashboard_perf_run.addFileArg(cli_exe.getEmittedBin());
+    gpu_dashboard_perf_run.step.dependOn(&gpu_dashboard_perf_build.step);
+    gpu_dashboard_perf_run.step.dependOn(&cli_exe.step);
+    gpu_dashboard_perf_step.dependOn(&gpu_dashboard_perf_run.step);
+
+    const canvas_preview_smoke_step = b.step("test-canvas-preview-smoke", "Run macOS canvas + webview (both-in-one-window) automation smoke test");
+    const canvas_preview_smoke_build = managedExampleRun(b, cli_exe, &.{ "build", "-Dplatform=macos", "-Dweb-engine=system", "-Dautomation=true", "-Doptimize=Debug" });
+    canvas_preview_smoke_build.setCwd(b.path("examples/canvas-preview"));
+    const canvas_preview_smoke_run = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\set -eu
+        \\cd examples/canvas-preview
+        \\app="zig-out/bin/canvas-preview"
+        \\cli="$1"
+        \\case "$cli" in /*) ;; *) cli="../../$cli" ;; esac
+        \\automation_dir=".zig-cache/native-sdk-automation"
+        \\mkdir -p "$automation_dir"
+        \\rm -f "$automation_dir/snapshot.txt" "$automation_dir/accessibility.txt" "$automation_dir/windows.txt" "$automation_dir"/command*.txt "$automation_dir/screenshot-preview-canvas.png"
+        \\"$app" > .zig-cache/native-sdk-canvas-preview-smoke.log 2>&1 &
+        \\pid=$!
+        \\trap 'status=$?; kill "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true; if [ "$status" -ne 0 ]; then echo "---- app log (.zig-cache/native-sdk-canvas-preview-smoke.log) ----" >&2; cat .zig-cache/native-sdk-canvas-preview-smoke.log >&2 2>/dev/null || true; fi' EXIT
+        \\ready="$("$cli" automate wait 2>&1)"
+        \\case "$ready" in *"ready=true"*) ;; *) echo "canvas-preview automation snapshot was not ready" >&2; exit 1 ;; esac
+        \\# Both architectures live in window 1: a presenting Metal canvas and
+        \\# a live WKWebView on a real https URL — with no implicit main webview.
+        \\"$cli" automate assert 'view @w1/preview-canvas kind=gpu_surface.*gpu_nonblank=true' 'view @w1/preview kind=webview.*url="https://example.com/"'
+        \\"$cli" automate assert --absent 'view @w1/main kind=webview' 'source kind=html bytes=0'
+        \\# The webview pane is snapped to the canvas anchor widget: right of
+        \\# the 224pt sidebar, below the 56pt toolbar.
+        \\preview_line="$(grep 'view @w1/preview kind=webview' "$automation_dir/snapshot.txt" | head -1)"
+        \\preview_x="$(printf '%s\n' "$preview_line" | sed -n 's/.*bounds=(\([0-9.]*\),.*/\1/p')"
+        \\case "$preview_x" in ''|*[!0-9.]*) echo "canvas-preview webview x was missing" >&2; exit 1 ;; esac
+        \\if [ "$(printf '%s\n' "$preview_x < 224" | bc)" -eq 1 ]; then echo "canvas-preview webview was not snapped right of the sidebar: x=$preview_x" >&2; exit 1; fi
+        \\# Navigation from a Msg: the app command switches the model URL and
+        \\# the runtime navigates the platform webview.
+        \\"$cli" automate native-command app.docs >/dev/null 2>&1
+        \\"$cli" automate assert 'view @w1/preview kind=webview.*url="https://zero-native.dev/"' 'name="URL: https://zero-native.dev/"'
+        \\# Resize keeps the pane snapped to the anchor widget's new frame:
+        \\# the panel right of the 224pt sidebar and below the 56pt toolbar.
+        \\"$cli" automate resize 1200 800 >/dev/null 2>&1
+        \\"$cli" automate assert 'window @w1 "Native SDK Canvas Preview" bounds=.*1200x800' 'view @w1/preview kind=webview.*bounds=.224,56 976x744'
+        \\# Canvas screenshot evidence (reference-rendered PNG of the chrome).
+        \\"$cli" automate screenshot preview-canvas >/dev/null 2>&1
+        \\test -s "$automation_dir/screenshot-preview-canvas.png" || { echo "canvas-preview screenshot was empty" >&2; exit 1; }
+        \\echo "canvas-preview smoke ok"
+        ,
+        "sh",
+    });
+    canvas_preview_smoke_run.addFileArg(cli_exe.getEmittedBin());
+    canvas_preview_smoke_run.step.dependOn(&canvas_preview_smoke_build.step);
+    canvas_preview_smoke_run.step.dependOn(&cli_exe.step);
+    canvas_preview_smoke_step.dependOn(&canvas_preview_smoke_run.step);
+
+    const gpu_components_smoke_step = b.step("test-gpu-components-smoke", "Run macOS GPU components automation smoke test");
+    const gpu_components_smoke_build = managedExampleRun(b, cli_exe, &.{ "build", "-Dplatform=macos", "-Dweb-engine=system", "-Dautomation=true", "-Doptimize=Debug" });
+    gpu_components_smoke_build.setCwd(b.path("examples/gpu-components"));
+    const gpu_components_smoke_run = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\set -eu
+        \\cd examples/gpu-components
+        \\app="zig-out/bin/gpu-components"
+        \\cli="$1"
+        \\case "$cli" in /*) ;; *) cli="../../$cli" ;; esac
+        \\automation_dir=".zig-cache/native-sdk-automation"
+        \\mkdir -p "$automation_dir"
+        \\# Startup latencies are load-sensitive on shared CI/agent machines.
+        \\# NATIVE_SDK_SMOKE_BUDGET_MS raises the first-frame latency budget (default
+        \\# stays 150 ms) and the automation-ready ceiling (default stays
+        \\# 500 ms; the ceiling never drops below it) without weakening the
+        \\# local defaults; every correctness assertion stays strict.
+        \\smoke_budget_ms="${NATIVE_SDK_SMOKE_BUDGET_MS:-150}"
+        \\case "$smoke_budget_ms" in ''|*[!0-9]*) echo "NATIVE_SDK_SMOKE_BUDGET_MS must be a positive integer of milliseconds: $smoke_budget_ms" >&2; exit 1 ;; esac
+        \\if [ "$smoke_budget_ms" -le 0 ]; then echo "NATIVE_SDK_SMOKE_BUDGET_MS must be a positive integer of milliseconds: $smoke_budget_ms" >&2; exit 1; fi
+        \\smoke_budget_ns=$((smoke_budget_ms * 1000000))
+        \\ready_budget_ms="$smoke_budget_ms"
+        \\if [ "$ready_budget_ms" -lt 500 ]; then ready_budget_ms=500; fi
+        \\ready_budget_ns=$((ready_budget_ms * 1000000))
+        \\rm -f "$automation_dir/snapshot.txt" "$automation_dir/accessibility.txt" "$automation_dir/windows.txt" "$automation_dir"/command*.txt
+        \\"$app" > .zig-cache/native-sdk-gpu-components-smoke.log 2>&1 &
+        \\pid=$!
+        \\trap 'status=$?; kill "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true; if [ "$status" -ne 0 ]; then echo "---- app log (.zig-cache/native-sdk-gpu-components-smoke.log) ----" >&2; cat .zig-cache/native-sdk-gpu-components-smoke.log >&2 2>/dev/null || true; fi' EXIT
+        \\ready="$("$cli" automate wait 2>&1)"
+        \\case "$ready" in *"ready=true"*) ;; *) echo "gpu-components automation snapshot was not ready" >&2; exit 1 ;; esac
+        \\ready_uptime="$(printf '%s\n' "$ready" | sed -n 's/.*runtime_uptime_ns=\([0-9][0-9]*\).*/\1/p')"
+        \\case "$ready_uptime" in ''|*[!0-9]*) echo "gpu-components automation ready uptime was missing" >&2; exit 1 ;; esac
+        \\if [ "$ready_uptime" -le 0 ] || [ "$ready_uptime" -gt "$ready_budget_ns" ]; then echo "gpu-components automation ready exceeded $ready_budget_ms ms: $ready_uptime ns" >&2; exit 1; fi
+        \\snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\case "$snapshot" in *'window @w1 "Native SDK GPU Components"'*) ;; *) echo "gpu-components window was missing from snapshot" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'view @w1/main kind=webview'*) echo "components should not create an implicit main WebView" >&2; exit 1 ;; *) ;; esac
+        \\case "$snapshot" in *'source kind=html bytes=0'*) echo "components should not publish an empty default WebView source" >&2; exit 1 ;; *) ;; esac
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  case "$snapshot" in *'view @w1/components-canvas kind=gpu_surface'*'gpu_nonblank=true'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) break ;; esac
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\case "$snapshot" in *'view @w1/components-canvas kind=gpu_surface'*'gpu_nonblank=true'*) ;; *) echo "components GPU surface was not ready and nonblank" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'view @w1/components-canvas kind=gpu_surface'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) ;; *) echo "components GPU frame was not packet-representable" >&2; exit 1 ;; esac
+        \\first_frame_latency="$(printf '%s\n' "$snapshot" | sed -n 's/.*view @w1\/components-canvas kind=gpu_surface.* gpu_first_frame_latency_ns=\([0-9][0-9]*\).*/\1/p')"
+        \\case "$first_frame_latency" in ''|*[!0-9]*) echo "components GPU first frame latency was missing" >&2; exit 1 ;; esac
+        \\if [ "$first_frame_latency" -le 0 ] || [ "$first_frame_latency" -gt "$smoke_budget_ns" ]; then echo "components GPU first frame exceeded $smoke_budget_ms ms: $first_frame_latency ns" >&2; exit 1; fi
+        \\# The runtime publishes its own fixed 150 ms budget verdict. Within that
+        \\# budget the verdict must agree exactly; beyond it (reachable only when
+        \\# NATIVE_SDK_SMOKE_BUDGET_MS > 150) the runtime must report the overrun honestly.
+        \\if [ "$first_frame_latency" -le 150000000 ]; then
+        \\  case "$snapshot" in *'view @w1/components-canvas kind=gpu_surface'*'gpu_first_frame_latency_budget_ns=150000000'*'gpu_first_frame_latency_budget_exceeded=0'*'gpu_first_frame_latency_budget_ok=true'*) ;; *) echo "components GPU first frame exceeded the latency budget" >&2; exit 1 ;; esac
+        \\else
+        \\  case "$snapshot" in *'view @w1/components-canvas kind=gpu_surface'*'gpu_first_frame_latency_budget_ns=150000000'*'gpu_first_frame_latency_budget_ok=false'*) ;; *) echo "components runtime did not report the first-frame budget overrun" >&2; exit 1 ;; esac
+        \\fi
+        \\gpu_frame_from_snapshot() {
+        \\  printf '%s\n' "$snapshot" | sed -n 's/.*view @w1\/components-canvas kind=gpu_surface.* gpu_frame=\([0-9][0-9]*\).*/\1/p'
+        \\}
+        \\canvas_revision_from_snapshot() {
+        \\  printf '%s\n' "$snapshot" | sed -n 's/.*view @w1\/components-canvas kind=gpu_surface.* canvas_revision=\([0-9][0-9]*\).*/\1/p'
+        \\}
+        \\snapshot_contains() {
+        \\  case "$snapshot" in *"$1"*) return 0 ;; *) return 1 ;; esac
+        \\}
+        \\case "$snapshot" in *'widget @w1/components-canvas#113 role=checkbox'*'value=1'*'actions=[focus,toggle]'*) ;; *) echo "checkbox widget was not initially selected" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'widget @w1/components-canvas#114 role=switch'*'value=1'*'actions=[focus,toggle]'*) ;; *) echo "switch widget was not initially selected" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'widget @w1/components-canvas#116 role=progressbar'*'value=1'*) ;; *) echo "progress widget was missing from the initial snapshot" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'widget @w1/components-canvas#117 role=tab'*'value=1'*'actions=[focus,select]'*) ;; *) echo "small segmented control was not initially selected" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'widget @w1/components-canvas#119 role=tab'*'value=0'*'actions=[focus,select]'*) ;; *) echo "large segmented control was not initially available" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'widget @w1/components-canvas#142 role=menuitem'*'actions=[focus,press,select]'*) ;; *) echo "menu item widget was not initially actionable" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'widget @w1/components-canvas#86 role=tab'*'actions=[focus,press,select]'*) ;; *) echo "theme toolbar trigger was not initially actionable" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'widget @w1/components-canvas#83 role=button'*'actions=[focus,press]'*) ;; *) echo "refresh toolbar widget was not initially actionable" >&2; exit 1 ;; esac
+        \\gpu_frame_before="$(gpu_frame_from_snapshot)"
+        \\case "$gpu_frame_before" in ''|*[!0-9]*) gpu_frame_before=0 ;; esac
+        \\gpu_frame_after="$gpu_frame_before"
+        \\canvas_revision_before="$(canvas_revision_from_snapshot)"
+        \\case "$canvas_revision_before" in ''|*[!0-9]*) canvas_revision_before=0 ;; esac
+        \\canvas_revision_after="$canvas_revision_before"
+        \\"$cli" automate widget-click components-canvas 86 >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  gpu_frame_after="$(gpu_frame_from_snapshot)"
+        \\  case "$gpu_frame_after" in ''|*[!0-9]*) gpu_frame_after=0 ;; esac
+        \\  canvas_revision_after="$(canvas_revision_from_snapshot)"
+        \\  case "$canvas_revision_after" in ''|*[!0-9]*) canvas_revision_after=0 ;; esac
+        \\  if [ "$gpu_frame_after" -gt "$gpu_frame_before" ] || [ "$canvas_revision_after" -gt "$canvas_revision_before" ]; then
+        \\    if snapshot_contains 'GPU component theme: ' && snapshot_contains ' from native_view. Count 1.' && snapshot_contains 'view @w1/components-canvas kind=gpu_surface' && snapshot_contains 'canvas_frame_gpu_packet_unsupported=0' && snapshot_contains 'canvas_frame_gpu_packet_representable=true'; then break; fi
+        \\  fi
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\if [ "$gpu_frame_after" -le "$gpu_frame_before" ] && [ "$canvas_revision_after" -le "$canvas_revision_before" ]; then echo "theme automation command did not update the retained GPU canvas" >&2; exit 1; fi
+        \\case "$snapshot" in *'GPU component theme: '*' from native_view. Count 1.'*) ;; *) echo "theme automation command did not update status" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'view @w1/components-canvas kind=gpu_surface'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) ;; *) echo "theme automation command did not present a packet-renderable GPU frame" >&2; exit 1 ;; esac
+        \\"$cli" automate widget-action components-canvas 111 focus >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  case "$snapshot" in *'widget @w1/components-canvas#111 role=textbox'*'focused=true'*'text="native-sdk"'*) break ;; esac
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\case "$snapshot" in *'widget @w1/components-canvas#111 role=textbox'*'focused=true'*'text="native-sdk"'*) ;; *) echo "widget focus automation did not focus retained text" >&2; exit 1 ;; esac
+        \\"$cli" automate widget-key components-canvas z z >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  case "$snapshot" in *'widget @w1/components-canvas#111 role=textbox'*'focused=true'*'text="native-sdkz"'*) break ;; esac
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\case "$snapshot" in *'widget @w1/components-canvas#111 role=textbox'*'focused=true'*'text="native-sdkz"'*) ;; *) echo "widget keyboard automation did not update retained text" >&2; exit 1 ;; esac
+        \\"$cli" automate widget-key components-canvas tab >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  case "$snapshot" in *'widget @w1/components-canvas#112 role=textbox'*'focused=true'*) break ;; esac
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\case "$snapshot" in *'widget @w1/components-canvas#112 role=textbox'*'focused=true'*) ;; *) echo "widget keyboard automation did not move focus" >&2; exit 1 ;; esac
+        \\"$cli" automate widget-action components-canvas 105 press >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  if snapshot_contains 'Keyed icon_button #105.' && snapshot_contains 'widget @w1/components-canvas#105 role=button' && snapshot_contains 'actions=[focus,press]'; then break; fi
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\if ! snapshot_contains 'Keyed icon_button #105.' || ! snapshot_contains 'widget @w1/components-canvas#105 role=button' || ! snapshot_contains 'actions=[focus,press]'; then echo "icon button automation press did not update status" >&2; exit 1; fi
+        \\"$cli" automate widget-action components-canvas 111 set-text native-engine >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  case "$snapshot" in *'widget @w1/components-canvas#111 role=textbox'*'text="native-engine"'*) break ;; esac
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\case "$snapshot" in *'widget @w1/components-canvas#111 role=textbox'*'text="native-engine"'*) ;; *) echo "text field automation did not update retained text" >&2; exit 1 ;; esac
+        \\"$cli" automate widget-action components-canvas 115 increment >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  case "$snapshot" in *'Keyed slider #115: value '*)
+        \\    case "$snapshot" in *'widget @w1/components-canvas#115 role=slider'*'value=0.62'*) ;; *'widget @w1/components-canvas#115 role=slider'*) break ;; esac
+        \\    ;;
+        \\  esac
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\case "$snapshot" in *'Keyed slider #115: value '*) ;; *) echo "slider automation increment did not update status" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'widget @w1/components-canvas#115 role=slider'*'value=0.62'*) echo "slider automation increment did not change value" >&2; exit 1 ;; *'widget @w1/components-canvas#115 role=slider'*) ;; *) echo "slider widget was missing after increment" >&2; exit 1 ;; esac
+        \\gpu_frame_before="$(gpu_frame_from_snapshot)"
+        \\case "$gpu_frame_before" in ''|*[!0-9]*) gpu_frame_before=0 ;; esac
+        \\gpu_frame_after="$gpu_frame_before"
+        \\"$cli" automate widget-drag components-canvas 115 0.25 0.82 >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  gpu_frame_after="$(gpu_frame_from_snapshot)"
+        \\  case "$gpu_frame_after" in ''|*[!0-9]*) gpu_frame_after=0 ;; esac
+        \\  if [ "$gpu_frame_after" -gt "$gpu_frame_before" ]; then
+        \\    if snapshot_contains 'Clicked slider #115: value 0.82.' && snapshot_contains 'widget @w1/components-canvas#115 role=slider' && { snapshot_contains 'value=0.82' || snapshot_contains 'value=0.819'; }; then
+        \\      case "$snapshot" in *'view @w1/components-canvas kind=gpu_surface'*'canvas_frame_full_repaint=false'*'canvas_frame_pipeline_uploads=0'*'canvas_frame_image_uploads=0'*'canvas_frame_glyph_uploads=0'*'canvas_frame_text_uploads=0'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) break ;; esac
+        \\    fi
+        \\  fi
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\if [ "$gpu_frame_after" -le "$gpu_frame_before" ]; then echo "slider automation drag did not request a GPU frame" >&2; exit 1; fi
+        \\if ! snapshot_contains 'Clicked slider #115: value 0.82.' || ! snapshot_contains 'widget @w1/components-canvas#115 role=slider' || { ! snapshot_contains 'value=0.82' && ! snapshot_contains 'value=0.819'; }; then echo "slider automation drag did not update retained slider state" >&2; exit 1; fi
+        \\case "$snapshot" in *'view @w1/components-canvas kind=gpu_surface'*'canvas_frame_full_repaint=false'*'canvas_frame_pipeline_uploads=0'*'canvas_frame_image_uploads=0'*'canvas_frame_glyph_uploads=0'*'canvas_frame_text_uploads=0'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) ;; *) echo "slider automation drag did not present an incremental GPU packet without interaction-time uploads" >&2; exit 1 ;; esac
+        \\"$cli" automate widget-action components-canvas 156 press >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  if snapshot_contains 'Keyed data_cell #156: selected.' && snapshot_contains 'widget @w1/components-canvas#156 role=gridcell' && snapshot_contains 'focused=true' && snapshot_contains 'value=1'; then break; fi
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\if ! snapshot_contains 'Keyed data_cell #156: selected.' || ! snapshot_contains 'widget @w1/components-canvas#156 role=gridcell' || ! snapshot_contains 'focused=true' || ! snapshot_contains 'value=1'; then echo "grid cell automation press did not focus and report status" >&2; exit 1; fi
+        \\gpu_frame_before="$(gpu_frame_from_snapshot)"
+        \\case "$gpu_frame_before" in ''|*[!0-9]*) gpu_frame_before=0 ;; esac
+        \\gpu_frame_after="$gpu_frame_before"
+        \\"$cli" automate widget-click components-canvas 119 >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  gpu_frame_after="$(gpu_frame_from_snapshot)"
+        \\  case "$gpu_frame_after" in ''|*[!0-9]*) gpu_frame_after=0 ;; esac
+        \\  if [ "$gpu_frame_after" -gt "$gpu_frame_before" ]; then
+        \\    if snapshot_contains 'Clicked segmented_control #119: selected.' && snapshot_contains 'widget @w1/components-canvas#117 role=tab' && snapshot_contains 'value=0' && snapshot_contains 'widget @w1/components-canvas#119 role=tab' && snapshot_contains 'focused=true' && snapshot_contains 'value=1'; then
+        \\      case "$snapshot" in *'view @w1/components-canvas kind=gpu_surface'*'canvas_frame_full_repaint=false'*'canvas_frame_pipeline_uploads=0'*'canvas_frame_image_uploads=0'*'canvas_frame_glyph_uploads=0'*'canvas_frame_text_uploads=0'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) break ;; esac
+        \\    fi
+        \\  fi
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\if [ "$gpu_frame_after" -le "$gpu_frame_before" ]; then echo "segmented control automation click did not request a GPU frame" >&2; exit 1; fi
+        \\if ! snapshot_contains 'Clicked segmented_control #119: selected.' || ! snapshot_contains 'widget @w1/components-canvas#117 role=tab' || ! snapshot_contains 'value=0' || ! snapshot_contains 'widget @w1/components-canvas#119 role=tab' || ! snapshot_contains 'focused=true' || ! snapshot_contains 'value=1'; then echo "segmented control automation click did not update retained selection state" >&2; exit 1; fi
+        \\case "$snapshot" in *'view @w1/components-canvas kind=gpu_surface'*'canvas_frame_full_repaint=false'*'canvas_frame_pipeline_uploads=0'*'canvas_frame_image_uploads=0'*'canvas_frame_glyph_uploads=0'*'canvas_frame_text_uploads=0'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) ;; *) echo "segmented control automation click did not present an incremental GPU packet without interaction-time uploads" >&2; exit 1 ;; esac
+        \\# The catalog's project menu is an ACTIONS menu (no sibling declares a
+        \\# committed row), so automation select mints NO selection: value
+        \\# stays 0. Automation focus follows the pointer contract (rows take
+        \\# focus QUIETLY, no visible affordance), so nothing repaints and no
+        \\# frame is requested — the republished snapshot alone carries the
+        \\# focus move. A picker menu would mint value=1 and repaint; the
+        \\# select specimen's committed-row tests cover that register.
+        \\"$cli" automate widget-action components-canvas 142 select >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  case "$(printf '%s\\n' "$snapshot" | grep -F 'components-canvas#142 role=menuitem' | head -1)" in *'focused=true'*'value=0'*) break ;; esac
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\menu_item_line="$(printf '%s\\n' "$snapshot" | grep -F 'components-canvas#142 role=menuitem' | head -1)"
+        \\case "$menu_item_line" in *'focused=true'*'value=0'*) ;; *) echo "menu item automation select did not move quiet focus without minting a selection" >&2; exit 1 ;; esac
+        \\"$cli" automate widget-action components-canvas 113 toggle >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  if snapshot_contains 'Keyed checkbox #113: off.' && snapshot_contains 'widget @w1/components-canvas#113 role=checkbox' && snapshot_contains 'value=0'; then break; fi
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\if ! snapshot_contains 'Keyed checkbox #113: off.' || ! snapshot_contains 'widget @w1/components-canvas#113 role=checkbox' || ! snapshot_contains 'value=0'; then echo "checkbox automation toggle did not update the retained widget snapshot" >&2; exit 1; fi
+        \\gpu_frame_before="$(gpu_frame_from_snapshot)"
+        \\case "$gpu_frame_before" in ''|*[!0-9]*) gpu_frame_before=0 ;; esac
+        \\gpu_frame_after="$gpu_frame_before"
+        \\"$cli" automate widget-click components-canvas 113 >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  gpu_frame_after="$(gpu_frame_from_snapshot)"
+        \\  case "$gpu_frame_after" in ''|*[!0-9]*) gpu_frame_after=0 ;; esac
+        \\  if [ "$gpu_frame_after" -gt "$gpu_frame_before" ]; then
+        \\    if snapshot_contains 'Clicked checkbox #113: on.' && snapshot_contains 'widget @w1/components-canvas#113 role=checkbox' && snapshot_contains 'value=1'; then
+        \\      case "$snapshot" in *'view @w1/components-canvas kind=gpu_surface'*'canvas_frame_full_repaint=false'*'canvas_frame_pipeline_uploads=0'*'canvas_frame_image_uploads=0'*'canvas_frame_glyph_uploads=0'*'canvas_frame_text_uploads=0'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) break ;; esac
+        \\    fi
+        \\  fi
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\if [ "$gpu_frame_after" -le "$gpu_frame_before" ]; then echo "checkbox automation click did not request a GPU frame" >&2; exit 1; fi
+        \\if ! snapshot_contains 'Clicked checkbox #113: on.' || ! snapshot_contains 'widget @w1/components-canvas#113 role=checkbox' || ! snapshot_contains 'value=1'; then echo "checkbox automation click did not route through pointer input" >&2; exit 1; fi
+        \\case "$snapshot" in *'view @w1/components-canvas kind=gpu_surface'*'canvas_frame_full_repaint=false'*'canvas_frame_pipeline_uploads=0'*'canvas_frame_image_uploads=0'*'canvas_frame_glyph_uploads=0'*'canvas_frame_text_uploads=0'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) ;; *) echo "checkbox automation click did not present an incremental GPU packet without interaction-time uploads" >&2; exit 1 ;; esac
+        \\"$cli" automate widget-action components-canvas 114 toggle >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  if snapshot_contains 'Keyed switch_control #114: off.' && snapshot_contains 'widget @w1/components-canvas#114 role=switch' && snapshot_contains 'value=0'; then break; fi
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\if ! snapshot_contains 'Keyed switch_control #114: off.' || ! snapshot_contains 'widget @w1/components-canvas#114 role=switch' || ! snapshot_contains 'value=0'; then echo "switch automation toggle did not wake the idle app" >&2; exit 1; fi
+        \\gpu_frame_before="$(gpu_frame_from_snapshot)"
+        \\case "$gpu_frame_before" in ''|*[!0-9]*) gpu_frame_before=0 ;; esac
+        \\gpu_frame_after="$gpu_frame_before"
+        \\"$cli" automate widget-click components-canvas 114 >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  gpu_frame_after="$(gpu_frame_from_snapshot)"
+        \\  case "$gpu_frame_after" in ''|*[!0-9]*) gpu_frame_after=0 ;; esac
+        \\  if [ "$gpu_frame_after" -gt "$gpu_frame_before" ]; then
+        \\    if snapshot_contains 'Clicked switch_control #114: on.' && snapshot_contains 'widget @w1/components-canvas#114 role=switch' && snapshot_contains 'value=1'; then
+        \\      case "$snapshot" in *'view @w1/components-canvas kind=gpu_surface'*'canvas_frame_full_repaint=false'*'canvas_frame_pipeline_uploads=0'*'canvas_frame_image_uploads=0'*'canvas_frame_glyph_uploads=0'*'canvas_frame_text_uploads=0'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) break ;; esac
+        \\    fi
+        \\  fi
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\if [ "$gpu_frame_after" -le "$gpu_frame_before" ]; then echo "switch automation click did not request a GPU frame" >&2; exit 1; fi
+        \\if ! snapshot_contains 'Clicked switch_control #114: on.' || ! snapshot_contains 'widget @w1/components-canvas#114 role=switch' || ! snapshot_contains 'value=1'; then echo "switch automation click did not route through pointer input" >&2; exit 1; fi
+        \\case "$snapshot" in *'view @w1/components-canvas kind=gpu_surface'*'canvas_frame_full_repaint=false'*'canvas_frame_pipeline_uploads=0'*'canvas_frame_image_uploads=0'*'canvas_frame_glyph_uploads=0'*'canvas_frame_text_uploads=0'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) ;; *) echo "switch automation click did not present an incremental GPU packet without interaction-time uploads" >&2; exit 1 ;; esac
+        \\gpu_frame_before="$(gpu_frame_from_snapshot)"
+        \\case "$gpu_frame_before" in ''|*[!0-9]*) gpu_frame_before=0 ;; esac
+        \\gpu_frame_after="$gpu_frame_before"
+        \\canvas_revision_before="$(canvas_revision_from_snapshot)"
+        \\case "$canvas_revision_before" in ''|*[!0-9]*) canvas_revision_before=0 ;; esac
+        \\canvas_revision_after="$canvas_revision_before"
+        \\"$cli" automate widget-action components-canvas 120 increment >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  gpu_frame_after="$(gpu_frame_from_snapshot)"
+        \\  case "$gpu_frame_after" in ''|*[!0-9]*) gpu_frame_after=0 ;; esac
+        \\  canvas_revision_after="$(canvas_revision_from_snapshot)"
+        \\  case "$canvas_revision_after" in ''|*[!0-9]*) canvas_revision_after=0 ;; esac
+        \\  if [ "$gpu_frame_after" -gt "$gpu_frame_before" ] || [ "$canvas_revision_after" -gt "$canvas_revision_before" ]; then
+        \\    if snapshot_contains 'Keyed list #120: offset 56.' && snapshot_contains 'widget @w1/components-canvas#120 role=list' && snapshot_contains 'scroll=[offset=56,viewport=56,content=168]'; then
+        \\      case "$snapshot" in *'view @w1/components-canvas kind=gpu_surface'*'canvas_frame_full_repaint=false'*'canvas_frame_pipeline_uploads=0'*'canvas_frame_image_uploads=0'*'canvas_frame_glyph_uploads=0'*'canvas_frame_text_uploads=0'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) break ;; esac
+        \\    fi
+        \\  fi
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\if [ "$gpu_frame_after" -le "$gpu_frame_before" ] && [ "$canvas_revision_after" -le "$canvas_revision_before" ]; then echo "list automation increment did not update the retained GPU canvas" >&2; exit 1; fi
+        \\if ! snapshot_contains 'Keyed list #120: offset 56.' || ! snapshot_contains 'widget @w1/components-canvas#120 role=list' || ! snapshot_contains 'scroll=[offset=56,viewport=56,content=168]'; then echo "list automation increment did not update retained scroll semantics" >&2; exit 1; fi
+        \\case "$snapshot" in *'view @w1/components-canvas kind=gpu_surface'*'canvas_frame_full_repaint=false'*'canvas_frame_pipeline_uploads=0'*'canvas_frame_image_uploads=0'*'canvas_frame_glyph_uploads=0'*'canvas_frame_text_uploads=0'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) ;; *) echo "list automation increment did not present an incremental GPU packet without interaction-time uploads" >&2; exit 1 ;; esac
+        \\gpu_frame_before="$(gpu_frame_from_snapshot)"
+        \\case "$gpu_frame_before" in ''|*[!0-9]*) gpu_frame_before=0 ;; esac
+        \\gpu_frame_after="$gpu_frame_before"
+        \\canvas_revision_before="$(canvas_revision_from_snapshot)"
+        \\case "$canvas_revision_before" in ''|*[!0-9]*) canvas_revision_before=0 ;; esac
+        \\canvas_revision_after="$canvas_revision_before"
+        \\"$cli" automate widget-action components-canvas 150 increment >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  gpu_frame_after="$(gpu_frame_from_snapshot)"
+        \\  case "$gpu_frame_after" in ''|*[!0-9]*) gpu_frame_after=0 ;; esac
+        \\  canvas_revision_after="$(canvas_revision_from_snapshot)"
+        \\  case "$canvas_revision_after" in ''|*[!0-9]*) canvas_revision_after=0 ;; esac
+        \\  if [ "$gpu_frame_after" -gt "$gpu_frame_before" ] || [ "$canvas_revision_after" -gt "$canvas_revision_before" ]; then
+        \\    if snapshot_contains 'Keyed table #150: offset 56.' && snapshot_contains 'widget @w1/components-canvas#150 role=grid' && snapshot_contains 'scroll=[offset=56,viewport=28,content=140]'; then
+        \\      case "$snapshot" in *'view @w1/components-canvas kind=gpu_surface'*'canvas_frame_full_repaint=false'*'canvas_frame_pipeline_uploads=0'*'canvas_frame_image_uploads=0'*'canvas_frame_glyph_uploads=0'*'canvas_frame_text_uploads=0'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) break ;; esac
+        \\    fi
+        \\  fi
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\if [ "$gpu_frame_after" -le "$gpu_frame_before" ] && [ "$canvas_revision_after" -le "$canvas_revision_before" ]; then echo "data grid automation increment did not update the retained GPU canvas" >&2; exit 1; fi
+        \\if ! snapshot_contains 'Keyed table #150: offset 56.' || ! snapshot_contains 'widget @w1/components-canvas#150 role=grid' || ! snapshot_contains 'scroll=[offset=56,viewport=28,content=140]'; then echo "data grid automation increment did not update retained scroll semantics" >&2; exit 1; fi
+        \\case "$snapshot" in *'view @w1/components-canvas kind=gpu_surface'*'canvas_frame_full_repaint=false'*'canvas_frame_pipeline_uploads=0'*'canvas_frame_image_uploads=0'*'canvas_frame_glyph_uploads=0'*'canvas_frame_text_uploads=0'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) ;; *) echo "data grid automation increment did not present an incremental GPU packet without interaction-time uploads" >&2; exit 1 ;; esac
+        \\gpu_frame_before="$(gpu_frame_from_snapshot)"
+        \\case "$gpu_frame_before" in ''|*[!0-9]*) gpu_frame_before=0 ;; esac
+        \\gpu_frame_after="$gpu_frame_before"
+        \\canvas_revision_before="$(canvas_revision_from_snapshot)"
+        \\case "$canvas_revision_before" in ''|*[!0-9]*) canvas_revision_before=0 ;; esac
+        \\canvas_revision_after="$canvas_revision_before"
+        \\"$cli" automate widget-wheel components-canvas 130 20 >/dev/null 2>&1
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ]; do
+        \\  snapshot="$(cat "$automation_dir/snapshot.txt" 2>/dev/null || true)"
+        \\  gpu_frame_after="$(gpu_frame_from_snapshot)"
+        \\  case "$gpu_frame_after" in ''|*[!0-9]*) gpu_frame_after=0 ;; esac
+        \\  canvas_revision_after="$(canvas_revision_from_snapshot)"
+        \\  case "$canvas_revision_after" in ''|*[!0-9]*) canvas_revision_after=0 ;; esac
+        \\  if [ "$gpu_frame_after" -gt "$gpu_frame_before" ] || [ "$canvas_revision_after" -gt "$canvas_revision_before" ]; then
+        \\    case "$snapshot" in *'widget @w1/components-canvas#130 role=group'*'scroll=[offset=84,viewport=56,content=140]'*)
+        \\      case "$snapshot" in *'view @w1/components-canvas kind=gpu_surface'*'canvas_frame_full_repaint=false'*'canvas_frame_pipeline_uploads=0'*'canvas_frame_image_uploads=0'*'canvas_frame_glyph_uploads=0'*'canvas_frame_text_uploads=0'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) break ;; esac
+        \\      ;;
+        \\    esac
+        \\  fi
+        \\  attempts=$((attempts + 1))
+        \\  sleep 0.1
+        \\done
+        \\if [ "$gpu_frame_after" -le "$gpu_frame_before" ] && [ "$canvas_revision_after" -le "$canvas_revision_before" ]; then echo "scroll automation wheel did not update the retained GPU canvas" >&2; exit 1; fi
+        \\case "$snapshot" in *'widget @w1/components-canvas#130 role=group'*'scroll=[offset=84,viewport=56,content=140]'*) ;; *) echo "scroll automation wheel did not update retained scroll semantics" >&2; exit 1 ;; esac
+        \\case "$snapshot" in *'view @w1/components-canvas kind=gpu_surface'*'canvas_frame_full_repaint=false'*'canvas_frame_pipeline_uploads=0'*'canvas_frame_image_uploads=0'*'canvas_frame_glyph_uploads=0'*'canvas_frame_text_uploads=0'*'canvas_frame_gpu_packet_unsupported=0'*'canvas_frame_gpu_packet_representable=true'*) ;; *) echo "scroll automation wheel did not present an incremental GPU packet without interaction-time uploads" >&2; exit 1 ;; esac
+        \\input_timestamp="$(printf '%s\n' "$snapshot" | sed -n 's/.*view @w1\/components-canvas kind=gpu_surface.* gpu_input_timestamp_ns=\([0-9][0-9]*\).*/\1/p')"
+        \\case "$input_timestamp" in ''|*[!0-9]*) echo "components GPU input timestamp was missing after widget interaction" >&2; exit 1 ;; esac
+        \\if [ "$input_timestamp" -le 0 ]; then echo "components GPU input timestamp was not recorded" >&2; exit 1; fi
+        \\input_latency="$(printf '%s\n' "$snapshot" | sed -n 's/.*view @w1\/components-canvas kind=gpu_surface.* gpu_input_latency_ns=\([0-9][0-9]*\).*/\1/p')"
+        \\case "$input_latency" in ''|*[!0-9]*) echo "components GPU input latency was missing after widget interaction" >&2; exit 1 ;; esac
+        \\# gpu_input_latency now stamps at the RESPONDING present's completion
+        \\# (input to glass), which legitimately spans the paced render wait —
+        \\# up to a couple of display intervals while animations hold the paced
+        \\# loop. Assert an explicit input-to-glass bound (the perf harness
+        \\# budgets the same channel at 100 ms) instead of the one-interval
+        \\# budget flag the old completion-channel stamp happened to satisfy.
+        \\if [ "$input_latency" -le 0 ] || [ "$input_latency" -gt 100000000 ]; then echo "components GPU input-to-glass latency was implausible: $input_latency ns" >&2; exit 1; fi
+        \\echo "gpu-components smoke ok"
+        ,
+        "sh",
+    });
+    gpu_components_smoke_run.addFileArg(cli_exe.getEmittedBin());
+    gpu_components_smoke_run.step.dependOn(&gpu_components_smoke_build.step);
+    gpu_components_smoke_run.step.dependOn(&cli_exe.step);
+    gpu_components_smoke_step.dependOn(&gpu_components_smoke_run.step);
+
     const webview_cef_smoke_step = b.step("test-webview-cef-smoke", "Run macOS Chromium WebView automation smoke test");
-    const webview_cef_smoke_build = b.addSystemCommand(&.{ "zig", "build", "-Dplatform=macos", "-Dweb-engine=chromium", b.fmt("-Dcef-dir={s}", .{cef_dir}), "-Dautomation=true", "-Djs-bridge=true" });
+    const webview_cef_smoke_build = b.addSystemCommand(&.{ "zig", "build", "-Dplatform=macos", "-Dweb-engine=chromium", b.fmt("-Dcef-dir={s}", .{exampleCefDir(b, cef_dir)}), "-Dautomation=true", "-Djs-bridge=true" });
     webview_cef_smoke_build.setCwd(b.path("examples/webview"));
     const webview_cef_smoke_run = b.addSystemCommand(&.{
         "sh", "-c",
@@ -607,39 +1986,43 @@ pub fn build(b: *std.Build) void {
         \\cli="$1"
         \\case "$cli" in /*) ;; *) cli="../../$cli" ;; esac
         \\request='{"id":"ping","command":"native.ping","payload":{"source":"cef-smoke"}}'
-        \\response_file=".zig-cache/zero-native-automation/bridge-response.txt"
-        \\mkdir -p .zig-cache/zero-native-automation
-        \\rm -f .zig-cache/zero-native-automation/snapshot.txt .zig-cache/zero-native-automation/windows.txt .zig-cache/zero-native-automation/command.txt "$response_file"
-        \\printf 'bridge %s\n' "$request" > .zig-cache/zero-native-automation/command.txt
-        \\"$app" > .zig-cache/zero-native-webview-cef-smoke.log 2>&1 &
+        \\response_file=".zig-cache/native-sdk-automation/bridge-response.txt"
+        \\mkdir -p .zig-cache/native-sdk-automation
+        \\rm -f .zig-cache/native-sdk-automation/snapshot.txt .zig-cache/native-sdk-automation/windows.txt .zig-cache/native-sdk-automation/command*.txt "$response_file"
+        \\printf 'bridge %s\n' "$request" > .zig-cache/native-sdk-automation/command-1.txt
+        \\"$app" > .zig-cache/native-sdk-webview-cef-smoke.log 2>&1 &
         \\pid=$!
-        \\trap 'kill "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true' EXIT
+        \\trap 'status=$?; kill "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true; if [ "$status" -ne 0 ]; then echo "---- app log (.zig-cache/native-sdk-webview-cef-smoke.log) ----" >&2; cat .zig-cache/native-sdk-webview-cef-smoke.log >&2 2>/dev/null || true; fi' EXIT
         \\snapshot="$("$cli" automate wait 2>&1)"
         \\case "$snapshot" in *"ready=true"*) ;; *) echo "automation snapshot was not ready" >&2; exit 1 ;; esac
+        \\attempts=0
+        \\while [ "$attempts" -lt 50 ] && ! grep -q 'name="webview.load"' .zig-cache/native-sdk-webview-cef-smoke.log; do attempts=$((attempts + 1)); sleep 0.1; done
+        \\grep -q 'name="webview.load"' .zig-cache/native-sdk-webview-cef-smoke.log || { echo "main window never loaded its webview source (blank window)" >&2; exit 1; }
+        \\if grep -q 'name="dispatch.error"' .zig-cache/native-sdk-webview-cef-smoke.log; then echo "runtime recorded a dispatch error during startup" >&2; exit 1; fi
         \\attempts=0
         \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
         \\response="$(cat "$response_file" 2>/dev/null || true)"
         \\case "$response" in *'"ok":true'*'pong from Zig'*) ;; *) echo "native.ping response was unexpected: $response" >&2; exit 1 ;; esac
         \\rm -f "$response_file"
-        \\printf 'bridge %s\n' '{"id":"webview-create","command":"zero-native.webview.create","payload":{"label":"smoke","url":"https://example.com","frame":{"x":24,"y":24,"width":320,"height":220}}}' > .zig-cache/zero-native-automation/command.txt
+        \\printf 'bridge %s\n' '{"id":"webview-create","command":"native-sdk.webview.create","payload":{"label":"smoke","url":"https://example.com","frame":{"x":24,"y":24,"width":320,"height":220}}}' > .zig-cache/native-sdk-automation/command-1.txt
         \\attempts=0
         \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
         \\response="$(cat "$response_file" 2>/dev/null || true)"
         \\case "$response" in *'"ok":true'*) ;; *) echo "cef webview create did not succeed: $response" >&2; exit 1 ;; esac
         \\rm -f "$response_file"
-        \\printf 'bridge %s\n' '{"id":"webview-resize","command":"zero-native.webview.setFrame","payload":{"label":"smoke","frame":{"x":36,"y":36,"width":420,"height":260}}}' > .zig-cache/zero-native-automation/command.txt
+        \\printf 'bridge %s\n' '{"id":"webview-resize","command":"native-sdk.webview.setFrame","payload":{"label":"smoke","frame":{"x":36,"y":36,"width":420,"height":260}}}' > .zig-cache/native-sdk-automation/command-1.txt
         \\attempts=0
         \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
         \\response="$(cat "$response_file" 2>/dev/null || true)"
         \\case "$response" in *'"ok":true'*) ;; *) echo "cef webview resize did not succeed: $response" >&2; exit 1 ;; esac
         \\rm -f "$response_file"
-        \\printf 'bridge %s\n' '{"id":"webview-navigate","command":"zero-native.webview.navigate","payload":{"label":"smoke","url":"https://example.com/?smoke=1"}}' > .zig-cache/zero-native-automation/command.txt
+        \\printf 'bridge %s\n' '{"id":"webview-navigate","command":"native-sdk.webview.navigate","payload":{"label":"smoke","url":"https://example.com/?smoke=1"}}' > .zig-cache/native-sdk-automation/command-1.txt
         \\attempts=0
         \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
         \\response="$(cat "$response_file" 2>/dev/null || true)"
         \\case "$response" in *'"ok":true'*) ;; *) echo "cef webview navigate did not succeed: $response" >&2; exit 1 ;; esac
         \\rm -f "$response_file"
-        \\printf 'bridge %s\n' '{"id":"webview-close","command":"zero-native.webview.close","payload":{"label":"smoke"}}' > .zig-cache/zero-native-automation/command.txt
+        \\printf 'bridge %s\n' '{"id":"webview-close","command":"native-sdk.webview.close","payload":{"label":"smoke"}}' > .zig-cache/native-sdk-automation/command-1.txt
         \\attempts=0
         \\while [ "$attempts" -lt 50 ] && [ ! -s "$response_file" ]; do attempts=$((attempts + 1)); sleep 0.1; done
         \\response="$(cat "$response_file" 2>/dev/null || true)"
@@ -658,12 +2041,12 @@ pub fn build(b: *std.Build) void {
     const dev_step = b.step("dev", "Run managed frontend dev server and native shell");
     dev_step.dependOn(&dev_run.step);
 
-    const lib_step = b.step("lib", "Build zero-native embeddable static library");
+    const lib_step = b.step("lib", "Build native-sdk embeddable static library");
     lib_step.dependOn(&b.addInstallArtifact(embed_lib, .{}).step);
 
     const doctor_run = b.addRunArtifact(host_cli_exe);
     doctor_run.addArg("doctor");
-    const doctor_step = b.step("doctor", "Print zero-native platform diagnostics");
+    const doctor_step = b.step("doctor", "Print native-sdk platform diagnostics");
     doctor_step.dependOn(&doctor_run.step);
 
     const validate_run = b.addRunArtifact(host_cli_exe);
@@ -682,7 +2065,7 @@ pub fn build(b: *std.Build) void {
         "--target",
         @tagName(package_target),
         "--output",
-        b.fmt("zig-out/package/zero-native-{s}-{s}-{s}{s}", .{ package_version, @tagName(package_target), optimize_name, packageSuffix(package_target) }),
+        b.fmt("zig-out/package/native-sdk-{s}-{s}-{s}{s}", .{ package_version, @tagName(package_target), optimize_name, packageSuffix(package_target) }),
         "--binary",
     });
     package_run.addFileArg(embed_lib.getEmittedBin());
@@ -699,7 +2082,7 @@ pub fn build(b: *std.Build) void {
         "--target",
         "macos",
         "--output",
-        b.fmt("zig-out/package/zero-native-cef-smoke-{s}.app", .{optimize_name}),
+        b.fmt("zig-out/package/native-sdk-cef-smoke-{s}.app", .{optimize_name}),
         "--binary",
     });
     package_cef_run.addFileArg(embed_lib.getEmittedBin());
@@ -712,7 +2095,7 @@ pub fn build(b: *std.Build) void {
         "sh", "-c",
         b.fmt(
             \\set -e
-            \\app="zig-out/package/zero-native-cef-smoke-{s}.app"
+            \\app="zig-out/package/native-sdk-cef-smoke-{s}.app"
             \\test -d "$app/Contents/Frameworks/Chromium Embedded Framework.framework"
             \\test -f "$app/Contents/Frameworks/Chromium Embedded Framework.framework/Resources/icudtl.dat"
             \\test -f "$app/Contents/Frameworks/Chromium Embedded Framework.framework/Libraries/libGLESv2.dylib"
@@ -724,44 +2107,86 @@ pub fn build(b: *std.Build) void {
     const package_cef_smoke_step = b.step("test-package-cef-layout", "Verify macOS Chromium package layout");
     package_cef_smoke_step.dependOn(&package_cef_check.step);
 
+    // Signed-package seal pin: package an ad-hoc signed bundle and prove
+    // the signature survives packaging intact with codesign's own strict
+    // verifier. This is the regression gate for the ordering bug where a
+    // file written into Contents/Resources AFTER signing invalidated the
+    // resource seal ("file added"), turning every quarantined install
+    // into Gatekeeper's "damaged — move to Trash" dialog. The bundle
+    // carries the CLI as its executable (packaging only needs a real
+    // Mach-O to sign); the check skips loudly on hosts without codesign
+    // (any non-macOS machine) instead of pretending to have verified.
+    const package_signing_run = b.addRunArtifact(host_cli_exe);
+    package_signing_run.addArgs(&.{ "package", "--target", "macos", "--output", "zig-out/package/native-sdk-signing-verify.app", "--binary" });
+    package_signing_run.addFileArg(host_cli_exe.getEmittedBin());
+    package_signing_run.addArgs(&.{ "--manifest", "app.zon", "--assets", "assets", "--optimize", optimize_name, "--signing", "adhoc" });
+    package_signing_run.has_side_effects = true;
+    const package_signing_check = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\set -e
+        \\app="zig-out/package/native-sdk-signing-verify.app"
+        \\if ! command -v codesign >/dev/null 2>&1; then
+        \\  echo "codesign unavailable on this host; skipping signed-package verification"
+        \\  exit 0
+        \\fi
+        \\codesign --verify --strict --deep "$app"
+        \\grep -q "ad-hoc signed" "$app/Contents/Resources/signing-plan.txt"
+        \\echo "signed package verify ok"
+        ,
+    });
+    package_signing_check.step.dependOn(&package_signing_run.step);
+    const package_signing_step = b.step("test-package-signing", "Verify an ad-hoc signed macOS package passes codesign --verify --strict");
+    package_signing_step.dependOn(&package_signing_check.step);
+
     const package_windows_run = b.addRunArtifact(host_cli_exe);
-    package_windows_run.addArgs(&.{ "package-windows", "--output", b.fmt("zig-out/package/zero-native-{s}-windows-Debug", .{package_version}), "--manifest", "app.zon", "--assets", "assets" });
+    package_windows_run.addArgs(&.{ "package-windows", "--output", b.fmt("zig-out/package/native-sdk-{s}-windows-Debug", .{package_version}), "--manifest", "app.zon", "--assets", "assets" });
     const package_windows_step = b.step("package-windows", "Create local Windows artifact directory");
     package_windows_step.dependOn(&package_windows_run.step);
 
     const package_linux_run = b.addRunArtifact(host_cli_exe);
-    package_linux_run.addArgs(&.{ "package-linux", "--output", b.fmt("zig-out/package/zero-native-{s}-linux-Debug", .{package_version}), "--manifest", "app.zon", "--assets", "assets" });
+    package_linux_run.addArgs(&.{ "package-linux", "--output", b.fmt("zig-out/package/native-sdk-{s}-linux-Debug", .{package_version}), "--manifest", "app.zon", "--assets", "assets" });
     const package_linux_step = b.step("package-linux", "Create local Linux artifact directory");
     package_linux_step.dependOn(&package_linux_run.step);
 
     const package_ios_run = b.addRunArtifact(host_cli_exe);
-    package_ios_run.addArgs(&.{ "package-ios", "--output", b.fmt("zig-out/mobile/zero-native-{s}-ios-Debug", .{package_version}), "--manifest", "app.zon", "--assets", "assets" });
+    package_ios_run.addArgs(&.{ "package-ios", "--output", b.fmt("zig-out/mobile/native-sdk-{s}-ios-Debug", .{package_version}), "--manifest", "app.zon", "--assets", "assets" });
     const package_ios_step = b.step("package-ios", "Create local iOS host skeleton");
     package_ios_step.dependOn(&package_ios_run.step);
 
     const package_android_run = b.addRunArtifact(host_cli_exe);
-    package_android_run.addArgs(&.{ "package-android", "--output", b.fmt("zig-out/mobile/zero-native-{s}-android-Debug", .{package_version}), "--manifest", "app.zon", "--assets", "assets" });
-    const package_android_step = b.step("package-android", "Create local Android host skeleton");
+    package_android_run.addArgs(&.{ "package-android", "--output", b.fmt("zig-out/mobile/native-sdk-{s}-android-Debug", .{package_version}), "--manifest", "app.zon", "--assets", "assets" });
+    const package_android_step = b.step("package-android", "Create local Android host project");
     package_android_step.dependOn(&package_android_run.step);
 
-    const generate_icon_step = b.step("generate-icon", "Generate .icns and .ico from assets/icon.png");
-    const iconset_script = b.addSystemCommand(&.{
-        "sh", "-c",
-        \\set -e
-        \\command -v python3 >/dev/null || { echo "python3 required for icon generation" >&2; exit 1; }
-        \\python3 -c "
-        \\from PIL import Image; import os
-        \\img = Image.open('assets/icon.png')
-        \\iconset = 'zig-out/icon.iconset'
-        \\os.makedirs(iconset, exist_ok=True)
-        \\for name, sz in {'icon_16x16.png':16,'icon_16x16@2x.png':32,'icon_32x32.png':32,'icon_32x32@2x.png':64,'icon_128x128.png':128,'icon_128x128@2x.png':256,'icon_256x256.png':256,'icon_256x256@2x.png':512,'icon_512x512.png':512,'icon_512x512@2x.png':1024}.items():
-        \\    img.resize((sz,sz),Image.LANCZOS).save(os.path.join(iconset,name),'PNG')
-        \\img.save('assets/icon.ico',format='ICO',sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])
-        \\"
-        \\iconutil -c icns zig-out/icon.iconset -o assets/icon.icns
-        \\echo "generated assets/icon.icns and assets/icon.ico"
+    // Default app icon: rendered from vector geometry (tools/
+    // generate_app_icon.zig) through the SDK's own path rasterizer, so
+    // the checked-in .icns/.ico/.png/.svg all regenerate from source.
+    // The built-in app-icon pipeline assembles and round-trip-validates
+    // the containers itself (no external tools, any host OS), and the
+    // CLI's embedded scaffold copies are kept in sync.
+    const generate_icon_step = b.step("generate-icon", "Regenerate the default app icon (.icns/.ico/.png/.svg) from vector source");
+    const generate_icon_mod = module(b, target, optimize, "tools/generate_app_icon.zig");
+    generate_icon_mod.addImport("native_sdk", desktop_mod);
+    const generate_icon_exe = b.addExecutable(.{
+        .name = "generate-app-icon",
+        .root_module = generate_icon_mod,
     });
-    generate_icon_step.dependOn(&iconset_script.step);
+    const generate_icon_run = b.addRunArtifact(generate_icon_exe);
+    generate_icon_run.addArgs(&.{
+        "assets/icon.icns",
+        "assets/icon.png",
+        "assets/icon.ico",
+        "assets/icon.svg",
+        "src/tooling/default_icon.icns",
+        "src/tooling/default_icon.png",
+        "zig-out/icon-full-bleed.png",
+        // The one committed full-bleed copy: the notes example's raw
+        // one-image icon source (it demos the packaging mask + inset),
+        // regenerated here so it can never drift from the default.
+        "examples/notes/assets/icon.png",
+    });
+    generate_icon_run.has_side_effects = true;
+    generate_icon_step.dependOn(&generate_icon_run.step);
 
     const notarize_run = b.addRunArtifact(host_cli_exe);
     notarize_run.addArgs(&.{
@@ -769,7 +2194,7 @@ pub fn build(b: *std.Build) void {
         "--target",
         "macos",
         "--output",
-        b.fmt("zig-out/package/zero-native-{s}-macos-{s}.app", .{ package_version, optimize_name }),
+        b.fmt("zig-out/package/native-sdk-{s}-macos-{s}.app", .{ package_version, optimize_name }),
         "--binary",
     });
     notarize_run.addFileArg(embed_lib.getEmittedBin());
@@ -783,10 +2208,10 @@ pub fn build(b: *std.Build) void {
     const dmg_script = b.addSystemCommand(&.{
         "sh", "-c",
         b.fmt(
-            \\APP="zig-out/package/zero-native-{s}-macos-{s}.app"
-            \\DMG="zig-out/package/zero-native-{s}-macos-{s}.dmg"
+            \\APP="zig-out/package/native-sdk-{s}-macos-{s}.app"
+            \\DMG="zig-out/package/native-sdk-{s}-macos-{s}.dmg"
             \\test -d "$APP" || {{ echo "run 'zig build package' first" >&2; exit 1; }}
-            \\hdiutil create -volname "zero-native" -srcfolder "$APP" -ov -format UDZO "$DMG"
+            \\hdiutil create -volname "native-sdk" -srcfolder "$APP" -ov -format UDZO "$DMG"
             \\echo "created $DMG"
         , .{ package_version, optimize_name, package_version, optimize_name }),
     });
@@ -827,8 +2252,206 @@ fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     });
 }
 
+/// The short commit hash of the framework checkout the CLI is built
+/// from, for `native version` staleness checks. "unknown" when
+/// git is unavailable (e.g. building from a package tarball).
+fn cliBuildCommit(b: *std.Build) []const u8 {
+    var code: u8 = undefined;
+    const output = b.runAllowFail(&.{ "git", "rev-parse", "--short", "HEAD" }, &code, .ignore) catch return "unknown";
+    const trimmed = std.mem.trim(u8, output, " \n\r\t");
+    if (trimmed.len == 0) return "unknown";
+    return trimmed;
+}
+
 fn testArtifact(b: *std.Build, mod: *std.Build.Module) *std.Build.Step.Compile {
-    return b.addTest(.{ .root_module = mod });
+    return filteredTestArtifact(b, mod, "test", &.{});
+}
+
+fn filteredTestArtifact(b: *std.Build, mod: *std.Build.Module, name: []const u8, filters: []const []const u8) *std.Build.Step.Compile {
+    // use_llvm: Zig 0.16.0's self-hosted x86_64 backend miscompiles the
+    // SysV C ABI for f32-heavy signatures (native_sdk_app_viewport); see
+    // useLlvmWorkaround in build/app.zig for the full story and repro.
+    const use_llvm = if (mod.resolved_target) |target| @import("build/app.zig").useLlvmWorkaround(target) else null;
+    return b.addTest(.{ .name = name, .root_module = mod, .filters = filters, .use_llvm = use_llvm });
+}
+
+/// One slice of the framework test suite, selected by test-name filters.
+/// The framework module compiles into a single test binary whose ~580
+/// tests run serially in one process, which made that binary the longest
+/// step in `zig build test` by a wide margin — the rest of the suite is
+/// dozens of binaries that each finish in well under a second. The
+/// aggregate `test` step therefore runs the framework module as one
+/// filtered binary per family below, so the build runner executes the
+/// families concurrently and the suite finishes with the slowest family
+/// instead of the sum of all of them. `zig build test-desktop` still runs
+/// the unfiltered binary when a single process is easier to debug, and
+/// each family has its own `test-desktop-<name>` step.
+const DesktopTestShard = struct {
+    /// Suffix for the artifact name and the `test-desktop-<name>` step.
+    name: []const u8,
+    description: []const u8,
+    /// A test file's namespace is routed to the first shard in
+    /// `desktop_test_shard_specs` with a matching prefix, so earlier
+    /// entries carve their family out of the later, broader ones and
+    /// the final empty prefix collects every namespace left over.
+    prefixes: []const []const u8,
+};
+
+const desktop_test_shard_specs = [_]DesktopTestShard{
+    .{
+        .name = "canvas-widget",
+        .description = "Run framework canvas widget tests",
+        .prefixes = &.{"runtime.canvas_widget"},
+    },
+    .{
+        .name = "canvas-frame",
+        .description = "Run framework canvas frame, budget, image, and font tests",
+        .prefixes = &.{"runtime.canvas"},
+    },
+    .{
+        .name = "ui-shell",
+        .description = "Run framework UI app and shell layout tests",
+        .prefixes = &.{ "runtime.ui_app", "runtime.shell" },
+    },
+    .{
+        .name = "runtime-core",
+        .description = "Run framework runtime core, effects, session, and bridge tests",
+        .prefixes = &.{"runtime."},
+    },
+    .{
+        .name = "platform",
+        .description = "Run framework platform, automation, embed, and remaining tests",
+        .prefixes = &.{""},
+    },
+};
+
+/// A framework source file that declares top-level tests, described by
+/// the dotted namespace the test runner uses in fully-qualified test
+/// names: tests in src/runtime/effects_tests.zig are named
+/// "runtime.effects_tests.test.<name>".
+const DesktopTestFile = struct {
+    namespace: []const u8,
+    /// Names of the file's `test "<name>"` declarations, in source order.
+    /// Unnamed `test { ... }` blocks are not listed: the test runner
+    /// exempts them from filtering, so they run in every shard. That is
+    /// deliberate — those blocks are the aggregators whose references
+    /// make the compiler discover the named tests in the first place,
+    /// and their bodies are empty at run time.
+    named_tests: []const []const u8,
+};
+
+/// Test binaries for the framework module, one per shard spec. Filters
+/// are derived from the source tree at configure time: every framework
+/// file with a top-level `test` declaration contributes its namespace as
+/// a filter ("runtime.effects_tests.test") to exactly one shard, so a
+/// new test file is picked up — and routed to a shard by prefix — the
+/// moment it exists, and a file can never silently fall out of
+/// `zig build test` because a hand-kept list went stale.
+fn desktopTestShardArtifacts(b: *std.Build, mod: *std.Build.Module) [desktop_test_shard_specs.len]*std.Build.Step.Compile {
+    const files = desktopTestFiles(b);
+    var filters: [desktop_test_shard_specs.len]std.ArrayList([]const u8) = @splat(.empty);
+    for (files) |file| {
+        const shard = desktopTestShardIndex(file.namespace);
+        if (std.mem.eql(u8, file.namespace, "root")) {
+            // Filters match anywhere in a fully-qualified name, and the
+            // module root's namespace ("root") is a dotted suffix of
+            // every other root.zig namespace ("runtime.root",
+            // "platform.root", ...), so a bare "root.test" filter would
+            // pull those files' tests into this shard as well. Filter
+            // the module root by exact test name instead.
+            for (file.named_tests) |test_name| {
+                filters[shard].append(b.allocator, b.fmt("root.test.{s}", .{test_name})) catch @panic("OOM");
+            }
+            continue;
+        }
+        filters[shard].append(b.allocator, b.fmt("{s}.test", .{file.namespace})) catch @panic("OOM");
+        // The same suffix hazard across two shards would run the longer
+        // file's tests twice per `zig build test`. Refuse the layout up
+        // front so the collision is resolved when the file is added, not
+        // when a duplicated test starts flaking.
+        for (files) |other| {
+            if (desktopTestShardIndex(other.namespace) == shard) continue;
+            if (std.mem.endsWith(u8, other.namespace, b.fmt(".{s}", .{file.namespace}))) {
+                std.debug.panic(
+                    "framework test shards: namespace {s} is a dotted suffix of {s} in another shard; their name filters would overlap. Adjust desktop_test_shard_specs so both land in one shard.",
+                    .{ file.namespace, other.namespace },
+                );
+            }
+        }
+    }
+    var artifacts: [desktop_test_shard_specs.len]*std.Build.Step.Compile = undefined;
+    for (&artifacts, desktop_test_shard_specs, filters) |*artifact, spec, shard_filters| {
+        artifact.* = filteredTestArtifact(b, mod, b.fmt("desktop-{s}-tests", .{spec.name}), shard_filters.items);
+    }
+    return artifacts;
+}
+
+fn desktopTestShardIndex(namespace: []const u8) usize {
+    for (desktop_test_shard_specs, 0..) |spec, index| {
+        for (spec.prefixes) |prefix| {
+            if (std.mem.startsWith(u8, namespace, prefix)) return index;
+        }
+    }
+    unreachable; // the final shard's empty prefix matches every namespace
+}
+
+/// Scans the framework source tree for files declaring top-level tests,
+/// sorted by namespace so the generated filters — and therefore the
+/// shard binaries' cache manifests — do not churn with directory
+/// iteration order. src/primitives and src/tooling are separate modules
+/// with their own test binaries; everything else under src/ belongs to
+/// the framework module rooted at src/root.zig.
+fn desktopTestFiles(b: *std.Build) []const DesktopTestFile {
+    const gpa = b.allocator;
+    const io = b.graph.io;
+    var files: std.ArrayList(DesktopTestFile) = .empty;
+    var src_dir = b.build_root.handle.openDir(io, "src", .{ .iterate = true }) catch |err|
+        std.debug.panic("framework test shards: unable to open src/: {s}", .{@errorName(err)});
+    defer src_dir.close(io);
+    var walker = src_dir.walk(gpa) catch @panic("OOM");
+    defer walker.deinit();
+    while (walker.next(io) catch |err|
+        std.debug.panic("framework test shards: unable to walk src/: {s}", .{@errorName(err)})) |entry|
+    {
+        if (entry.kind == .directory) {
+            if (entry.depth() == 1 and
+                (std.mem.eql(u8, entry.basename, "primitives") or std.mem.eql(u8, entry.basename, "tooling")))
+            {
+                walker.leave(io);
+            }
+            continue;
+        }
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+        const source = entry.dir.readFileAlloc(io, entry.basename, gpa, .limited(16 * 1024 * 1024)) catch |err|
+            std.debug.panic("framework test shards: unable to read src/{s}: {s}", .{ entry.path, @errorName(err) });
+        var named_tests: std.ArrayList([]const u8) = .empty;
+        var has_tests = false;
+        var lines = std.mem.splitScalar(u8, source, '\n');
+        while (lines.next()) |line| {
+            // Only column-zero declarations: a test nested inside a
+            // container would carry that container's namespace, which
+            // these filters would not match.
+            if (!std.mem.startsWith(u8, line, "test ")) continue;
+            has_tests = true;
+            const rest = line["test ".len..];
+            if (rest.len > 0 and rest[0] == '"') {
+                if (std.mem.indexOfScalar(u8, rest[1..], '"')) |end| {
+                    named_tests.append(gpa, rest[1 .. 1 + end]) catch @panic("OOM");
+                }
+            }
+        }
+        if (!has_tests) continue;
+        const namespace = gpa.dupe(u8, entry.path[0 .. entry.path.len - ".zig".len]) catch @panic("OOM");
+        std.mem.replaceScalar(u8, namespace, std.fs.path.sep, '.');
+        files.append(gpa, .{ .namespace = namespace, .named_tests = named_tests.items }) catch @panic("OOM");
+    }
+    const sorted = files.items;
+    std.mem.sort(DesktopTestFile, sorted, {}, struct {
+        fn lessThan(_: void, lhs: DesktopTestFile, rhs: DesktopTestFile) bool {
+            return std.mem.lessThan(u8, lhs.namespace, rhs.namespace);
+        }
+    }.lessThan);
+    return sorted;
 }
 
 fn addTestStep(b: *std.Build, name: []const u8, description: []const u8, artifact: *std.Build.Step.Compile) void {
@@ -836,12 +2459,53 @@ fn addTestStep(b: *std.Build, name: []const u8, description: []const u8, artifac
     step.dependOn(&b.addRunArtifact(artifact).step);
 }
 
-fn addExampleTestStep(b: *std.Build, group: *std.Build.Step, name: []const u8, description: []const u8, example_path: []const u8) void {
-    const run = b.addSystemCommand(&.{ "zig", "build", "test", "-Dplatform=null" });
+/// How an example's build is driven. `managed` examples carry only
+/// app.zon + src (+ assets): the `native` CLI synthesizes their build
+/// graph, so their suites run through the CLI verbs — exactly what a user
+/// gets from `native init`. `owned` examples keep a build.zig of their own
+/// (extra steps or flags the generated graph does not provide) and are
+/// driven through plain in-dir `zig build`.
+const ExampleBuildShape = enum { managed, owned };
+
+fn addExampleTestStep(b: *std.Build, cli_exe: *std.Build.Step.Compile, group: *std.Build.Step, name: []const u8, description: []const u8, example_path: []const u8, shape: ExampleBuildShape) void {
+    const run = switch (shape) {
+        .owned => b.addSystemCommand(&.{ "zig", "build", "test", "-Dplatform=null" }),
+        .managed => managedExampleRun(b, cli_exe, &.{ "test", "-Dplatform=null" }),
+    };
     run.setCwd(b.path(example_path));
+    // Every example suite must actually run every time: the child build owns
+    // its own caching, and this outer step's argv never changes when example
+    // or framework sources do, so letting the step cache would skip real
+    // tests. But a side-effect run that also inherits stdio holds the build
+    // runner's global stderr lock for the child's entire lifetime, which
+    // executes the example suites strictly one at a time. Capturing both
+    // streams keeps the always-run semantics while releasing that lock, so
+    // independent examples run concurrently (bounded by the runner's job
+    // pool, one worker per CPU — cold child builds peak well under 1 GB
+    // each, so a machine-wide pool of them fits in memory). On failure the
+    // captured stderr is reported under this step's name, so a failing
+    // example still names itself.
+    run.has_side_effects = true;
+    _ = run.captureStdOut(.{});
+    _ = run.captureStdErr(.{});
+    // Concurrent children all spawn the same binary, so carry the step name
+    // into the run: a failure line then reads "test-example-<name> failure"
+    // instead of nineteen indistinguishable "run exe native" entries.
+    run.setName(name);
     const step = b.step(name, description);
     step.dependOn(&run.step);
     group.dependOn(&run.step);
+}
+
+/// Run a `native` CLI verb (argv tail) against a managed example. The CLI
+/// artifact runs from the build cache, where its executable location does
+/// not reveal the framework checkout, so NATIVE_SDK_PATH pins the generated
+/// graph's framework dependency to this repository.
+fn managedExampleRun(b: *std.Build, cli_exe: *std.Build.Step.Compile, argv_tail: []const []const u8) *std.Build.Step.Run {
+    const run = b.addRunArtifact(cli_exe);
+    run.addArgs(argv_tail);
+    run.setEnvironmentVariable("NATIVE_SDK_PATH", b.pathFromRoot("."));
+    return run;
 }
 
 fn addLayoutCheckStep(b: *std.Build, group: *std.Build.Step, name: []const u8, description: []const u8, paths: []const []const u8) void {
@@ -862,6 +2526,12 @@ fn addFileContainsCheckStep(b: *std.Build, checker: *std.Build.Step.Compile, gro
     const step = b.step(name, description);
     for (checks) |check_value| {
         const check = b.addRunArtifact(checker);
+        // The checked paths are relative to this build script. Run steps
+        // otherwise inherit the invoking process's cwd, and `zig build test`
+        // is also invoked from zero-config app directories that resolve up
+        // to this build.zig (scaffolded workspaces, examples) — from there
+        // the relative paths would point into the app, not the repo.
+        check.setCwd(b.path("."));
         check.addArg(check_value.path);
         check.addArg(check_value.pattern);
         step.dependOn(&check.step);
@@ -896,6 +2566,16 @@ fn defaultCefDir(platform: PlatformOption, configured: []const u8) []const u8 {
         .windows => "third_party/cef/windows",
         else => configured,
     };
+}
+
+/// CEF dir for a sub-build whose cwd is an example directory (two levels
+/// below the repo root). Relative paths are resolved by the example's
+/// build against its own root, so the repo-root-relative default must be
+/// rebased; absolute overrides pass through, but the example build.zigs
+/// reject them (b.path panics), so callers should prefer relative paths.
+fn exampleCefDir(b: *std.Build, cef_dir: []const u8) []const u8 {
+    if (std.fs.path.isAbsolute(cef_dir)) return cef_dir;
+    return b.fmt("../../{s}", .{cef_dir});
 }
 
 fn webEngineFromBuildOption(option: WebEngineOption) web_engine_tool.Engine {

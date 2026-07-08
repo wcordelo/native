@@ -204,7 +204,7 @@ pub fn parsePrepareOptions(args: []const []const u8) Error!PrepareOptions {
 }
 
 pub fn preparedArchiveName(buffer: []u8, version: []const u8, platform: Platform) ![]const u8 {
-    return std.fmt.bufPrint(buffer, "zero-native-cef-{s}-{s}.tar.gz", .{ version, platform.name() });
+    return std.fmt.bufPrint(buffer, "native-sdk-cef-{s}-{s}.tar.gz", .{ version, platform.name() });
 }
 
 pub fn archiveName(buffer: []u8, version: []const u8, platform: Platform) ![]const u8 {
@@ -230,16 +230,16 @@ pub fn archiveUrl(allocator: std.mem.Allocator, base_url: []const u8, version: [
 }
 
 pub fn cacheDir(allocator: std.mem.Allocator, env_map: *std.process.Environ.Map) ![]const u8 {
-    if (env_map.get("XDG_CACHE_HOME")) |root| return std.fs.path.join(allocator, &.{ root, "zero-native", "cef" });
+    if (env_map.get("XDG_CACHE_HOME")) |root| return std.fs.path.join(allocator, &.{ root, "native", "cef" });
     if (builtin.target.os.tag == .windows) {
-        if (env_map.get("LOCALAPPDATA")) |root| return std.fs.path.join(allocator, &.{ root, "zero-native", "cef" });
-        if (env_map.get("USERPROFILE")) |home| return std.fs.path.join(allocator, &.{ home, "AppData", "Local", "zero-native", "cef" });
+        if (env_map.get("LOCALAPPDATA")) |root| return std.fs.path.join(allocator, &.{ root, "native", "cef" });
+        if (env_map.get("USERPROFILE")) |home| return std.fs.path.join(allocator, &.{ home, "AppData", "Local", "native", "cef" });
     }
     if (env_map.get("HOME")) |home| {
-        if (builtin.target.os.tag == .macos) return std.fs.path.join(allocator, &.{ home, "Library", "Caches", "zero-native", "cef" });
-        return std.fs.path.join(allocator, &.{ home, ".cache", "zero-native", "cef" });
+        if (builtin.target.os.tag == .macos) return std.fs.path.join(allocator, &.{ home, "Library", "Caches", "native", "cef" });
+        return std.fs.path.join(allocator, &.{ home, ".cache", "native", "cef" });
     }
-    return allocator.dupe(u8, ".zig-cache/zero-native-cef");
+    return allocator.dupe(u8, ".zig-cache/native-sdk-cef");
 }
 
 pub fn verifyLayout(io: std.Io, dir: []const u8) LayoutReport {
@@ -347,8 +347,8 @@ fn installPrepared(allocator: std.mem.Allocator, io: std.Io, env_map: *std.proce
 
     if (options.force or !pathExists(io, archive_path)) {
         downloadFile(io, archive_path, url) catch |err| {
-            std.debug.print("Prepared zero-native CEF runtime is not available at {s}\n", .{url});
-            std.debug.print("Maintainers can publish it with the CEF runtime release workflow. Advanced users may run `zero-native cef install --source official --allow-build-tools`.\n", .{});
+            std.debug.print("Prepared native-sdk CEF runtime is not available at {s}\n", .{url});
+            std.debug.print("Maintainers can publish it with the CEF runtime release workflow. Advanced users may run `native cef install --source official --allow-build-tools`.\n", .{});
             return err;
         };
     }
@@ -384,7 +384,7 @@ fn installPrepared(allocator: std.mem.Allocator, io: std.Io, env_map: *std.proce
 
 fn installOfficial(allocator: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.Map, options: InstallOptions, platform: Platform, existing: LayoutReport) !InstallResult {
     if (!options.allow_build_tools) {
-        std.debug.print("Official CEF archives require building libcef_dll_wrapper.a locally. Use the prepared runtime with `zero-native cef install`, or opt in with `--source official --allow-build-tools`.\n", .{});
+        std.debug.print("Official CEF archives require building libcef_dll_wrapper.a locally. Use the prepared runtime with `native cef install`, or opt in with `--source official --allow-build-tools`.\n", .{});
         return error.WrapperBuildFailed;
     }
 
@@ -492,7 +492,7 @@ fn ensureWrapperArchive(allocator: std.mem.Allocator, io: std.Io, platform: Plat
     if (pathExists(io, wrapper_path)) return;
 
     if (!commandAvailable(io, "cmake")) {
-        std.debug.print("Official CEF source needs CMake to build libcef_dll_wrapper.a. Install it with `brew install cmake` or use the default prepared runtime with `zero-native cef install`.\n", .{});
+        std.debug.print("Official CEF source needs CMake to build libcef_dll_wrapper.a. Install it with `brew install cmake` or use the default prepared runtime with `native cef install`.\n", .{});
         return error.WrapperBuildFailed;
     }
 
@@ -575,7 +575,7 @@ fn shellQuote(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
 
 fn usage() Error!void {
     std.debug.print(
-        \\usage: zero-native cef <command>
+        \\usage: native cef <command>
         \\
         \\commands:
         \\  install [--dir path] [--version version] [--source prepared|official] [--download-url url] [--allow-build-tools] [--force]
@@ -589,7 +589,7 @@ fn usage() Error!void {
 
 test "archive names follow the CEF build convention" {
     var buffer: [256]u8 = undefined;
-    try std.testing.expectEqualStrings("zero-native-cef-1.2.3+gabc+chromium-4.5.6-macosarm64.tar.gz", try preparedArchiveName(&buffer, "1.2.3+gabc+chromium-4.5.6", .macosarm64));
+    try std.testing.expectEqualStrings("native-sdk-cef-1.2.3+gabc+chromium-4.5.6-macosarm64.tar.gz", try preparedArchiveName(&buffer, "1.2.3+gabc+chromium-4.5.6", .macosarm64));
     try std.testing.expectEqualStrings("cef_binary_1.2.3+gabc+chromium-4.5.6_macosarm64.tar.bz2", try archiveName(&buffer, "1.2.3+gabc+chromium-4.5.6", .macosarm64));
     try std.testing.expectEqualStrings("cef_binary_1.2.3+gabc+chromium-4.5.6_macosx64.tar.bz2", try archiveName(&buffer, "1.2.3+gabc+chromium-4.5.6", .macosx64));
     try std.testing.expectEqualStrings("cef_binary_1.2.3+gabc+chromium-4.5.6_linux64.tar.bz2", try archiveName(&buffer, "1.2.3+gabc+chromium-4.5.6", .linux64));
@@ -599,7 +599,7 @@ test "archive names follow the CEF build convention" {
 test "archive urls trim trailing slash" {
     const prepared_url = try preparedArchiveUrl(std.testing.allocator, "https://example.com/releases/", "1.2.3", .macosarm64);
     defer std.testing.allocator.free(prepared_url);
-    try std.testing.expectEqualStrings("https://example.com/releases/cef-1.2.3/zero-native-cef-1.2.3-macosarm64.tar.gz", prepared_url);
+    try std.testing.expectEqualStrings("https://example.com/releases/cef-1.2.3/native-sdk-cef-1.2.3-macosarm64.tar.gz", prepared_url);
 
     const url = try archiveUrl(std.testing.allocator, "https://example.com/", "1.2.3", .macosx64);
     defer std.testing.allocator.free(url);

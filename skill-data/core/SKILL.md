@@ -1,13 +1,13 @@
 ---
 name: core
-description: Core zero-native guide for AI agents. Read this before explaining zero-native or changing a zero-native app. Covers the mental model, project structure, app.zon, App and Runtime patterns, frontend integration, web engines, JavaScript bridge commands, permissions, windows, WebViews, dialogs, packaging, debugging, testing, and when to load deeper references. Use when the user asks what zero-native is, how to build or modify an app, how to package or debug it, or how to add native capabilities.
+description: Core Native SDK guide for AI agents. Read this before explaining the Native SDK or changing a Native SDK app. Covers the mental model (native-rendered apps by default, WebView shells as a coexisting architecture), project structure, app.zon, App and Runtime patterns, frontend integration, web engines, JavaScript bridge commands, permissions, windows, WebViews, dialogs, packaging, debugging, testing, and when to load deeper references. For authoring native-rendered UI (Native markup .native views, Model/Msg/update, UiApp), load the native-ui skill. Use when the user asks what the Native SDK is, how to build or modify an app, how to package or debug it, or how to add native capabilities.
 ---
 
-# Build zero-native apps
+# Build Native SDK apps
 
-zero-native is a Zig desktop app shell for modern web frontends. A zero-native app is native Zig code that owns windows, policies, lifecycle, and platform services while rendering web UI in a WebView. The default engine is the platform WebView: WKWebView on macOS and WebKitGTK on Linux. Apps can also bundle Chromium through CEF where supported.
+The Native SDK is a cross-platform native app toolkit inspired by the web. The default app (`native init`) is native-rendered: a declarative Native markup view (`.native`) plus Zig logic on the `UiApp` loop, drawn by Native SDK's own engine — **load the `native-ui` skill for everything about authoring those** (markup grammar, bindings, messages, testing, hot reload). This skill covers the shared foundation and the WebView-shell architecture: apps that render web frontends in a WebView (`native init --frontend next|vite|react|svelte|vue`). Both architectures share windows, policies, lifecycle, commands, and platform services, and one app can mix native-rendered surfaces and WebViews. WebView engines: platform WebView (WKWebView on macOS, WebKitGTK on Linux) or Chromium through CEF where supported.
 
-Agents should assume they do not know zero-native from general model knowledge. Read this skill first. For implementation work, run `zero-native skills get core --full` so the referenced files are included in the CLI output.
+Agents should assume they do not know the Native SDK from general model knowledge. Read this skill first. For implementation work, run `native skills get core --full` so the referenced files are included in the CLI output.
 
 ## Mental model
 
@@ -21,22 +21,22 @@ Agents should assume they do not know zero-native from general model knowledge. 
 
 ## Task router
 
-These references are included by `zero-native skills get core --full`. Use them when the task touches the topic:
+These references are included by `native skills get core --full`. Use them when the task touches the topic:
 
 - Project creation, generated files, build steps: `references/project-anatomy.md`
 - `App`, `Runtime`, callbacks, embedding, tests: `references/app-model-runtime.md`
 - React/Vue/Svelte/Next/Vite, dev server, bundled assets: `references/frontend-assets.md`
 - App-defined bridge commands, builtin commands, permissions, windows, WebViews, dialogs: `references/bridge-security-native-capabilities.md`
 - Web engine choice, CEF, packaging, signing, doctor, logs, debugging: `references/web-engines-packaging-debugging.md`
-- Running-app inspection and smoke tests: `zero-native skills get automation`
+- Running-app inspection and smoke tests: `native skills get automation`
 
 ## Quick start
 
 Use the CLI for new apps:
 
 ```bash
-npm install -g zero-native
-zero-native init my_app --frontend next
+npm install -g @native-sdk/cli
+native init my_app --frontend next
 cd my_app
 zig build run
 ```
@@ -45,7 +45,7 @@ Frontend choices are `next`, `vite`, `react`, `svelte`, and `vue`. The first `zi
 
 ## Workflow for existing apps
 
-Before editing an existing zero-native app:
+Before editing an existing Native SDK app:
 
 1. Read `app.zon`, `src/main.zig`, `src/runner.zig`, and `build.zig`.
 2. Identify whether the change is app metadata/policy, runtime wiring, app-native behavior, frontend behavior, packaging, or automation.
@@ -63,15 +63,15 @@ Common file ownership:
 
 ## Core app model
 
-The minimal Zig app returns `zero_native.App` with `context`, `name`, and a WebView source:
+The minimal Zig app returns `native_sdk.App` with `context`, `name`, and a WebView source:
 
 ```zig
 const App = struct {
-    fn app(self: *@This()) zero_native.App {
+    fn app(self: *@This()) native_sdk.App {
         return .{
             .context = self,
             .name = "my-app",
-            .source = zero_native.WebViewSource.html("<h1>Hello from zero-native</h1>"),
+            .source = native_sdk.WebViewSource.html("<h1>Hello from Native SDK</h1>"),
         };
     }
 };
@@ -79,23 +79,23 @@ const App = struct {
 
 Use these source constructors:
 
-- `zero_native.WebViewSource.html(content)` for small inline demos.
-- `zero_native.WebViewSource.url(address)` for an explicit URL.
-- `zero_native.WebViewSource.assets(.{ .root_path = "frontend/dist", .entry = "index.html" })` for packaged frontend assets.
+- `native_sdk.WebViewSource.html(content)` for small inline demos.
+- `native_sdk.WebViewSource.url(address)` for an explicit URL.
+- `native_sdk.WebViewSource.assets(.{ .root_path = "frontend/dist", .entry = "index.html" })` for packaged frontend assets.
 
 For framework apps, prefer a dynamic source so development loads the local dev server and production loads bundled assets:
 
 ```zig
-fn source(context: *anyopaque) anyerror!zero_native.WebViewSource {
+fn source(context: *anyopaque) anyerror!native_sdk.WebViewSource {
     const self: *App = @ptrCast(@alignCast(context));
-    return zero_native.frontend.sourceFromEnv(self.env_map, .{
+    return native_sdk.frontend.sourceFromEnv(self.env_map, .{
         .dist = "frontend/dist",
         .entry = "index.html",
     });
 }
 ```
 
-`sourceFromEnv` reads `ZERO_NATIVE_FRONTEND_URL`; otherwise it serves the configured asset directory. Use it for most framework apps.
+`sourceFromEnv` reads `NATIVE_SDK_FRONTEND_URL`; otherwise it serves the configured asset directory. Use it for most framework apps.
 
 ## app.zon essentials
 
@@ -106,8 +106,9 @@ Keep `app.zon` as the source of truth for app-level behavior:
     .id = "com.example.my-app",
     .name = "my-app",
     .display_name = "My App",
+    .description = "One line about the app, shown in the About panel.",
     .version = "0.1.0",
-    .icons = .{ "assets/icon.icns" },
+    .icons = .{"assets/icon.png"},
     .platforms = .{ "macos", "linux" },
     .permissions = .{},
     .capabilities = .{ "webview" },
@@ -141,7 +142,7 @@ Use exact local origins for dev servers. Add `zero://inline` only for inline HTM
 
 ### Add a new framework app
 
-Use `zero-native init <path> --frontend <next|vite|react|svelte|vue>`. Then inspect the generated `app.zon`, `src/main.zig`, and `build.zig` before customizing. For framework behavior, keep frontend work in `frontend/` and use `sourceFromEnv` so development and packaged builds share one app shell.
+Use `native init <path> --frontend <next|vite|react|svelte|vue>`. Then inspect the generated `app.zon`, `src/main.zig`, and `build.zig` before customizing. For framework behavior, keep frontend work in `frontend/` and use `sourceFromEnv` so development and packaged builds share one app shell.
 
 ### Add a native bridge command
 
@@ -149,7 +150,7 @@ Use `zero-native init <path> --frontend <next|vite|react|svelte|vue>`. Then insp
 2. Register the handler in `bridge()`.
 3. Allow the command in `app.zon` and in the runtime bridge policy if the runner reads manifest policy into runtime.
 4. Call it from JavaScript with `window.zero.invoke("namespace.command", payload)`.
-5. Return valid JSON from Zig. Use `zero_native.bridge.writeJsonStringValue()` for user-controlled strings.
+5. Return valid JSON from Zig. Use `native_sdk.bridge.writeJsonStringValue()` for user-controlled strings.
 
 Bridge calls are size-limited, origin-checked, permission-checked, and routed only to registered handlers.
 
@@ -163,11 +164,18 @@ Default to `.web_engine = "system"` for small apps and native footprint. Use `.w
 
 ### Package an app
 
-Keep package metadata in `app.zon`, build the frontend assets, build the native binary, then package:
+Zero-config apps package WITHOUT ejecting — `native package` works directly on the zero-config build (`native eject` is only for owning the build files, never a packaging prerequisite):
+
+```bash
+native build
+native package --target macos
+```
+
+Apps that own their build (ejected or scaffolded `--full`) wire the same step into the build graph: keep package metadata in `app.zon`, build the frontend assets, build the native binary, then package:
 
 ```bash
 zig build package
-zero-native doctor --manifest app.zon --strict
+native doctor --manifest app.zon --strict
 ```
 
 Use signing and CEF options only when the product requires them.
@@ -183,7 +191,7 @@ zig build dev
 Or run the CLI directly after building the binary:
 
 ```bash
-zero-native dev --manifest app.zon --binary zig-out/bin/MyApp
+native dev --manifest app.zon --binary zig-out/bin/MyApp
 ```
 
 Vite usually uses `http://127.0.0.1:5173/`; Next.js usually uses `http://127.0.0.1:3000/`. The app WebView loads the dev URL directly, so framework HMR remains owned by Vite, Next.js, or the selected dev server.
@@ -211,16 +219,18 @@ zig build run
 zig build dev
 zig build test
 zig build test-tooling
-zero-native validate app.zon
-zero-native doctor --manifest app.zon --strict
+native validate app.zon
+native doctor --manifest app.zon --strict
 zig build package
 ```
+
+Run BOTH `zig build` and `zig build test` before calling a change done: Zig's lazy analysis means code only tests reference (or only `main()` reference) can sit broken for weeks under the other command alone — tests never analyze `main`, so an API removed from std can keep "passing" until the app build finally touches it.
 
 For GUI smoke tests, build with automation enabled and use the `automation` skill:
 
 ```bash
 zig build run -Dplatform=macos -Dautomation=true
-zig-out/bin/zero-native automate snapshot
+zig-out/bin/native automate snapshot
 ```
 
 When changing app behavior, add focused Zig tests when the code can run headlessly. Use automation-based tests only for WebView/runtime integration that requires a GUI-capable session.
@@ -236,4 +246,4 @@ When changing app behavior, add focused Zig tests when the code can run headless
 
 ## When answering users
 
-Explain zero-native in concrete terms: Zig owns native app lifecycle and security; web UI renders in a WebView; the bridge is opt-in and policy controlled; `app.zon` is the manifest; framework frontend development uses a dev server in development and bundled assets in production. If asked to implement, read the app files first and make the smallest change in the correct layer.
+Explain the Native SDK in concrete terms: Zig owns native app lifecycle and security; web UI renders in a WebView; the bridge is opt-in and policy controlled; `app.zon` is the manifest; framework frontend development uses a dev server in development and bundled assets in production. If asked to implement, read the app files first and make the smallest change in the correct layer.

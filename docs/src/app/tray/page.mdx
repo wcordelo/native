@@ -1,8 +1,10 @@
 # System Tray
 
-zero-native supports system tray icons with menus. Tray menu items can dispatch explicit command names with `source = .tray`; items without a command dispatch the compatibility command name `"tray.action"`.
+The Native SDK supports system tray icons with menus. Tray menu items can dispatch explicit command names with `source = .tray`; items without a command dispatch the compatibility command name `"tray.action"`.
 
 Tray support is currently implemented on macOS and Windows system WebView hosts. Linux returns `UnsupportedService` until a portable status notifier implementation is selected.
+
+On macOS, `title` renders the tray as a menu-bar extra: a titled `NSStatusItem` with variable width. When both `icon_path` and `title` are empty, the button falls back to the app name's first letter.
 
 ## TrayOptions
 
@@ -17,6 +19,11 @@ Tray support is currently implemented on macOS and Windows system WebView hosts.
   <tbody>
     <tr>
       <td><code>icon_path</code></td>
+      <td><code>[]const u8</code></td>
+      <td><code>""</code></td>
+    </tr>
+    <tr>
+      <td><code>title</code></td>
       <td><code>[]const u8</code></td>
       <td><code>""</code></td>
     </tr>
@@ -88,7 +95,7 @@ When a user clicks a tray menu item, the runtime dispatches a `CommandEvent` wit
 
 ```zig
 try runtime.createTray(.{
-    .tooltip = "zero-native",
+    .tooltip = "native-sdk",
     .items = &.{
         .{ .id = 1, .label = "Refresh", .command = "app.refresh" },
         .{ .separator = true },
@@ -111,3 +118,42 @@ fn event(context: *anyopaque, runtime: *Runtime, ev: Event) anyerror!void {
     }
 }
 ```
+
+## Menu-bar extras in `UiApp`
+
+Canvas-first apps declare the status item once, with `UiApp.Options.status_item` (installed on the installing frame). Selecting a menu item dispatches its `command` through the ordinary `on_command` mapping with source `.tray`:
+
+```zig
+app.* = PreviewApp.init(allocator, .{}, .{
+    // ...
+    .on_command = command,
+    .status_item = .{
+        .title = "ZN",
+        .tooltip = "Native SDK Canvas Preview",
+        .items = &.{
+            .{ .id = 1, .label = "Show Docs", .command = "app.docs" },
+            .{ .separator = true },
+            .{ .id = 2, .label = "Reload Preview", .command = "app.reload" },
+        },
+    },
+});
+```
+
+macOS (`NSStatusItem`) is the proven host; platforms without a status-bar service log a warning and continue. See `examples/canvas-preview` for the live composition.
+
+## Model-driven title and menu
+
+For a live menu-bar extra — an open-count badge in the title, the latest items in the dropdown — add `UiApp.Options.status_item_fn`. It is consulted on install and after every rebuild, and the runtime re-applies only what actually changed: a title-only change retitles the live status button (no flicker, no menu rebuild), a menu change updates the dropdown. The static `status_item` still provides the icon and tooltip.
+
+```zig
+fn statusItem(model: *const Model, scratch: *App.StatusItemScratch) App.StatusItemState {
+    const title = std.fmt.bufPrint(&scratch.title_buffer, "ZN {d}", .{model.open_count}) catch "ZN";
+    scratch.items[0] = .{ .id = 1, .label = "Refresh", .command = "app.refresh" };
+    scratch.items[1] = .{ .separator = true };
+    scratch.items[2] = .{ .id = 10, .label = model.latest_title, .command = "issue.select.latest" };
+    return .{ .title = title, .items = scratch.items[0..3] };
+}
+// options: .status_item_fn = statusItem,
+```
+
+Selections dispatch each item's `command` through `on_command` with source `.tray`, the same shape as window menus. Platforms without a tray-title seam keep the menu updates and log the missing title support once.

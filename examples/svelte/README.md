@@ -1,6 +1,6 @@
 # Svelte Example
 
-A super basic zero-native example using Svelte for the frontend and Zig for the native shell.
+A super basic Native SDK example using Svelte for the frontend and Zig for the native shell.
 
 ## Run
 
@@ -16,7 +16,7 @@ The build installs frontend dependencies, builds the frontend, and opens the nat
 zig build dev
 ```
 
-This starts the Svelte dev server from `app.zon`, waits for `http://127.0.0.1:5173/`, and launches the native shell with `ZERO_NATIVE_FRONTEND_URL`.
+This starts the Svelte dev server from `app.zon`, waits for `http://127.0.0.1:5173/`, and launches the native shell with `NATIVE_SDK_FRONTEND_URL`.
 
 ## Frontend
 
@@ -26,8 +26,8 @@ This starts the Svelte dev server from `app.zon`, waits for `http://127.0.0.1:51
 
 ## Using Outside The Repo
 
-This example references zero-native via relative path (`../../`). To use it standalone, override the path:
+This example references the Native SDK via relative path (`../../`). To use it standalone, override the path:
 
 ```bash
-zig build run -Dzero-native-path=/path/to/zero-native
+zig build run -Dnative-sdk-path=/path/to/native-sdk
 ```

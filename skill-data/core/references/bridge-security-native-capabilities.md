@@ -23,7 +23,7 @@ Bridge commands are default-deny. A command must be registered in Zig and allowe
 ## Handler pattern
 
 ```zig
-fn ping(context: *anyopaque, invocation: zero_native.bridge.Invocation, output: []u8) anyerror![]const u8 {
+fn ping(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
     _ = invocation;
     const self: *App = @ptrCast(@alignCast(context));
     self.ping_count += 1;
@@ -34,7 +34,7 @@ fn ping(context: *anyopaque, invocation: zero_native.bridge.Invocation, output: 
 Dispatcher pattern:
 
 ```zig
-fn bridge(self: *App) zero_native.BridgeDispatcher {
+fn bridge(self: *App) native_sdk.BridgeDispatcher {
     self.handlers = .{.{ .name = "native.ping", .context = self, .invoke_fn = ping }};
     return .{
         .policy = .{ .enabled = true, .commands = &policies },
@@ -46,7 +46,7 @@ fn bridge(self: *App) zero_native.BridgeDispatcher {
 When returning user-controlled strings, escape them:
 
 ```zig
-return zero_native.bridge.writeJsonStringValue(output, user_name);
+return native_sdk.bridge.writeJsonStringValue(output, user_name);
 ```
 
 ## Size limits
@@ -91,35 +91,35 @@ Prefer exact origins over `"*"`. Use `"*"` only for commands that expose no nati
 
 ## Builtin commands
 
-zero-native includes builtin bridge commands for windows, layered WebViews, and dialogs. These are controlled separately from app-defined commands via `builtin_bridge`.
+The Native SDK includes builtin bridge commands for windows, layered WebViews, and dialogs. These are controlled separately from app-defined commands via `builtin_bridge`.
 
 Window commands:
 
-- `zero-native.window.list`
-- `zero-native.window.create`
-- `zero-native.window.focus`
-- `zero-native.window.close`
+- `native-sdk.window.list`
+- `native-sdk.window.create`
+- `native-sdk.window.focus`
+- `native-sdk.window.close`
 
 Layered WebView commands:
 
-- `zero-native.webview.create`
-- `zero-native.webview.list`
-- `zero-native.webview.setFrame`
-- `zero-native.webview.navigate`
-- `zero-native.webview.setZoom`
-- `zero-native.webview.setLayer`
-- `zero-native.webview.close`
+- `native-sdk.webview.create`
+- `native-sdk.webview.list`
+- `native-sdk.webview.setFrame`
+- `native-sdk.webview.navigate`
+- `native-sdk.webview.setZoom`
+- `native-sdk.webview.setLayer`
+- `native-sdk.webview.close`
 
 Dialog commands:
 
-- `zero-native.dialog.openFile`
-- `zero-native.dialog.saveFile`
-- `zero-native.dialog.showMessage`
+- `native-sdk.dialog.openFile`
+- `native-sdk.dialog.saveFile`
+- `native-sdk.dialog.showMessage`
 
 Enable explicitly:
 
 ```zig
-const app_permissions = [_][]const u8{zero_native.security.permission_window};
+const app_permissions = [_][]const u8{native_sdk.security.permission_window};
 
 .security = .{
     .permissions = &app_permissions,
@@ -128,9 +128,9 @@ const app_permissions = [_][]const u8{zero_native.security.permission_window};
 .builtin_bridge = .{
     .enabled = true,
     .commands = &.{
-        .{ .name = "zero-native.window.create", .permissions = .{ "window" }, .origins = .{ "zero://app" } },
-        .{ .name = "zero-native.webview.create", .permissions = .{ "window" }, .origins = .{ "zero://app" } },
-        .{ .name = "zero-native.dialog.openFile", .origins = .{ "zero://app" } },
+        .{ .name = "native-sdk.window.create", .permissions = .{ "window" }, .origins = .{ "zero://app" } },
+        .{ .name = "native-sdk.webview.create", .permissions = .{ "window" }, .origins = .{ "zero://app" } },
+        .{ .name = "native-sdk.dialog.openFile", .origins = .{ "zero://app" } },
     },
 },
 ```
@@ -185,19 +185,19 @@ Rules:
 Dialogs require explicit `builtin_bridge` policy.
 
 ```javascript
-const files = await window.zero.invoke("zero-native.dialog.openFile", {
+const files = await window.zero.invoke("native-sdk.dialog.openFile", {
   title: "Select a file",
   defaultPath: "/home",
   allowMultiple: true,
   allowDirectories: false,
 });
 
-const path = await window.zero.invoke("zero-native.dialog.saveFile", {
+const path = await window.zero.invoke("native-sdk.dialog.saveFile", {
   title: "Save as",
   defaultName: "untitled.txt",
 });
 
-const result = await window.zero.invoke("zero-native.dialog.showMessage", {
+const result = await window.zero.invoke("native-sdk.dialog.showMessage", {
   style: "warning",
   title: "Confirm",
   message: "Delete this item?",

@@ -9,7 +9,7 @@
 </script>
 
 <main>
-  <p class="eyebrow">zero-native + Svelte</p>
+  <p class="eyebrow">Native SDK + Svelte</p>
   <h1>App</h1>
   <p class="lede">A Svelte frontend running inside the system WebView.</p>
   <div class="card">

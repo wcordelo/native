@@ -1,5 +1,5 @@
 {
-  "name": "@zero-native/docs",
+  "name": "@native-sdk/docs",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -22,6 +22,7 @@
     "radix-ui": "^1.4.3",
     "react": "^19",
     "react-dom": "^19",
+    "remark-gfm": "^4.0.1",
     "shiki": "^4.0.2",
     "tailwind-merge": "^3.5.0",
     "tailwindcss-animate": "^1.0.7"

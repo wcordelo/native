@@ -9,7 +9,7 @@ export default function App() {
 
   return (
     <main>
-      <p className="eyebrow">zero-native + React</p>
+      <p className="eyebrow">Native SDK + React</p>
       <h1>React</h1>
       <p className="lede">A React frontend running inside the system WebView.</p>
       <div className="card">

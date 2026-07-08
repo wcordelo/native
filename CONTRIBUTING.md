@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve zero-native. This guide is for maintainers and contributors working on the framework repository itself.
+Thanks for helping improve the Native SDK. This guide is for maintainers and contributors working on the toolkit repository itself.
 
 For app author documentation, start at [zero-native.dev](https://zero-native.dev).
 
@@ -14,7 +14,7 @@ For app author documentation, start at [zero-native.dev](https://zero-native.dev
 
 ## Local Checks
 
-Run the framework tests:
+Run the toolkit tests:
 
 ```bash
 zig build test
@@ -41,8 +41,8 @@ zig build run-webview
 Check the npm CLI package:
 
 ```bash
-npm --prefix packages/zero-native run version:check
-npm --prefix packages/zero-native run scripts:check
+npm --prefix packages/native-sdk run version:check
+npm --prefix packages/native-sdk run scripts:check
 ```
 
 Check the documentation site:
@@ -63,7 +63,7 @@ zig build run-webview -Dweb-engine=system
 For Chromium on macOS, install CEF and run with the Chromium engine:
 
 ```bash
-zero-native cef install
+native cef install
 zig build run-webview -Dweb-engine=chromium
 ```
 
@@ -85,10 +85,16 @@ zig build package
 Package explicitly through the CLI:
 
 ```bash
-zero-native package --target macos --manifest app.zon --assets assets --binary zig-out/lib/libzero-native.a
+native package --target macos --manifest app.zon --assets assets --binary zig-out/lib/libnative-sdk.a
 ```
 
 For Chromium packages, configure `.web_engine = "chromium"` and `.cef` in `app.zon`, or use temporary `--web-engine` and `--cef-dir` overrides while testing.
+
+Verify an ad-hoc signed package's code signature survives packaging intact (macOS; skips loudly on hosts without `codesign`):
+
+```bash
+zig build test-package-signing
+```
 
 ## Automation Development
 
@@ -101,19 +107,22 @@ zig build run-webview -Dautomation=true
 Interact with the running app:
 
 ```bash
-zero-native automate wait
-zero-native automate list
-zero-native automate bridge '{"id":"ping","command":"native.ping","payload":null}'
+native automate wait
+native automate list
+native automate bridge '{"id":"ping","command":"native.ping","payload":null}'
 ```
 
-Automation writes artifacts under `.zig-cache/zero-native-automation`.
+Automation writes artifacts under `.zig-cache/native-sdk-automation`.
 
 
 ## Making a Pull Request
-Thank you for your contribution! Please follow these steps to ensure a smooth review process:
-1. Fork the repository and create a new branch for your feature or bug fix.
-2. Make your changes and commit them with clear, descriptive messages.
-3. Push your branch to your forked repository.
-4. Open a pull request against the main repository's `main` branch.
 
-Please cryptographically sign your commits so they show as **Verified** on GitHub. This requires a GPG or SSH signing key added to your GitHub account — see [GitHub's guide](https://docs.github.com/en/authentication/managing-commit-signature-verification/about-commit-signature-verification). Note: the `Signed-off-by` trailer (`git commit -s`) is a DCO attestation and does **not** produce the Verified badge; you need `git commit -S` (uppercase) or `commit.gpgsign = true` in your git config.
+Branch from `main` (fork first if you don't have push access), keep the change focused, and run the tiered local gate before opening the PR:
+
+```bash
+scripts/gate.sh fast    # root suites + the example suites your diff touches
+```
+
+If the change is user-visible, add a changelog fragment in `changelog.d/` (see [changelog.d/README.md](./changelog.d/README.md)) instead of editing `CHANGELOG.md`. Open the PR against `main` describing what changed and why; for larger changes, open an issue first so the design can be discussed.
+
+Commits must be cryptographically signed (`git commit -S`, or set `commit.gpgsign = true`) so they show as **Verified** — the `Signed-off-by` trailer from `git commit -s` is a DCO attestation, not a signature.

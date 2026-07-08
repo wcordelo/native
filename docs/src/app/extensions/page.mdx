@@ -10,13 +10,13 @@ Each module has an info block, a context pointer, and optional lifecycle hooks:
 const MyModule = struct {
     data: u32 = 0,
 
-    fn start(context: *anyopaque, runtime: zero_native.extensions.RuntimeContext) anyerror!void {
+    fn start(context: *anyopaque, runtime: native_sdk.extensions.RuntimeContext) anyerror!void {
         _ = runtime;
         const self: *@This() = @ptrCast(@alignCast(context));
         self.data = 42;
     }
 
-    fn command(context: *anyopaque, runtime: zero_native.extensions.RuntimeContext, cmd: zero_native.extensions.Command) anyerror!void {
+    fn command(context: *anyopaque, runtime: native_sdk.extensions.RuntimeContext, cmd: native_sdk.extensions.Command) anyerror!void {
         _ = runtime;
         const self: *@This() = @ptrCast(@alignCast(context));
         if (std.mem.eql(u8, cmd.name, "reset")) self.data = 0;
@@ -28,15 +28,15 @@ const MyModule = struct {
 
 ```zig
 var my_module = MyModule{};
-const caps = [_]zero_native.extensions.Capability{.{ .kind = .native_module }};
-const modules = [_]zero_native.extensions.Module{.{
+const caps = [_]native_sdk.extensions.Capability{.{ .kind = .native_module }};
+const modules = [_]native_sdk.extensions.Module{.{
     .info = .{ .id = 1, .name = "my-module", .capabilities = &caps },
     .context = &my_module,
     .hooks = .{ .start_fn = MyModule.start, .command_fn = MyModule.command },
 }};
-const registry = zero_native.extensions.ModuleRegistry{ .modules = &modules };
+const registry = native_sdk.extensions.ModuleRegistry{ .modules = &modules };
 
-var runtime = zero_native.Runtime.init(.{
+var runtime = native_sdk.Runtime.init(.{
     .platform = my_platform,
     .extensions = registry,
 });

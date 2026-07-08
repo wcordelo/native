@@ -1,6 +1,6 @@
 const std = @import("std");
 const build_options = @import("build_options");
-const zero_native = @import("zero-native");
+const native_sdk = @import("native_sdk");
 const app_manifest = @import("app_manifest_zon");
 const manifest_shortcuts = if (@hasField(@TypeOf(app_manifest), "shortcuts")) app_manifest.shortcuts else .{};
 const manifest_windows = if (@hasField(@TypeOf(app_manifest), "windows")) app_manifest.windows else .{};
@@ -9,15 +9,23 @@ pub const RunOptions = struct {
     app_name: []const u8,
     window_title: []const u8 = "",
     bundle_id: []const u8,
-    icon_path: []const u8 = "assets/icon.icns",
-    bridge: ?zero_native.BridgeDispatcher = null,
-    builtin_bridge: zero_native.BridgePolicy = .{},
-    security: zero_native.SecurityPolicy = .{},
-    shortcuts: ?[]const zero_native.Shortcut = null,
+    icon_path: []const u8 = "assets/icon.png",
+    bridge: ?native_sdk.BridgeDispatcher = null,
+    builtin_bridge: native_sdk.BridgePolicy = .{},
+    security: native_sdk.SecurityPolicy = .{},
+    shortcuts: ?[]const native_sdk.Shortcut = null,
 
-    fn appInfo(self: RunOptions, buffers: *StateBuffers) zero_native.AppInfo {
-        var info: zero_native.AppInfo = .{
+    fn appInfo(self: RunOptions, buffers: *StateBuffers) native_sdk.AppInfo {
+        var info: native_sdk.AppInfo = .{
             .app_name = self.app_name,
+            // The identity the OS shows (application menu, Dock, About
+            // panel) reads straight from app.zon at comptime, so dev
+            // runs carry the same display name and version a packaged
+            // bundle gets from its Info.plist.
+            .display_name = manifestStringField("display_name"),
+            .version = manifestStringField("version"),
+            .description = manifestStringField("description"),
+            .has_web_content = manifestHasWebContent(),
             .window_title = self.window_title,
             .bundle_id = self.bundle_id,
             .icon_path = self.icon_path,
@@ -30,17 +38,17 @@ pub const RunOptions = struct {
         return info;
     }
 
-    fn resolvedShortcuts(self: RunOptions, storage: *ShortcutStorage) []const zero_native.Shortcut {
+    fn resolvedShortcuts(self: RunOptions, storage: *ShortcutStorage) []const native_sdk.Shortcut {
         return self.shortcuts orelse storage.fromManifest();
     }
 };
 
 const ShortcutStorage = struct {
-    shortcuts: [zero_native.platform.max_shortcuts]zero_native.Shortcut = undefined,
+    shortcuts: [native_sdk.platform.max_shortcuts]native_sdk.Shortcut = undefined,
 
-    fn fromManifest(self: *ShortcutStorage) []const zero_native.Shortcut {
+    fn fromManifest(self: *ShortcutStorage) []const native_sdk.Shortcut {
         comptime {
-            if (manifest_shortcuts.len > zero_native.platform.max_shortcuts) {
+            if (manifest_shortcuts.len > native_sdk.platform.max_shortcuts) {
                 @compileError("app.zon defines too many shortcuts");
             }
         }
@@ -57,12 +65,35 @@ const ShortcutStorage = struct {
 };
 
 const StateBuffers = struct {
-    restored_windows: [zero_native.platform.max_windows]zero_native.WindowOptions = undefined,
+    restored_windows: [native_sdk.platform.max_windows]native_sdk.WindowOptions = undefined,
 };
 
-fn manifestWindowOptions(buffers: *StateBuffers) []const zero_native.WindowOptions {
+/// A top-level app.zon string field (`display_name`, `version`,
+/// `description`), or "" when the manifest omits it — optional identity
+/// stays optional all the way into `AppInfo`.
+fn manifestStringField(comptime field: []const u8) []const u8 {
+    if (comptime !@hasField(@TypeOf(app_manifest), field)) return "";
+    const value = @field(app_manifest, field);
+    if (comptime @TypeOf(value) == @TypeOf(null)) return "";
+    return value;
+}
+
+/// Whether app.zon declares web content: the `webview` capability or a
+/// `frontend` block. Hosts build honest default menus from this — web
+/// items like Reload only exist when a webview can answer them, so
+/// canvas-only apps never ship dead menu items.
+fn manifestHasWebContent() bool {
+    if (comptime @hasField(@TypeOf(app_manifest), "frontend")) return true;
+    if (comptime !@hasField(@TypeOf(app_manifest), "capabilities")) return false;
+    inline for (app_manifest.capabilities) |capability| {
+        if (comptime std.mem.eql(u8, capability, "webview")) return true;
+    }
+    return false;
+}
+
+fn manifestWindowOptions(buffers: *StateBuffers) []const native_sdk.WindowOptions {
     comptime {
-        if (manifest_windows.len > zero_native.platform.max_windows) {
+        if (manifest_windows.len > native_sdk.platform.max_windows) {
             @compileError("app.zon defines too many windows");
         }
     }
@@ -73,12 +104,12 @@ fn manifestWindowOptions(buffers: *StateBuffers) []const zero_native.WindowOptio
     return buffers.restored_windows[0..manifest_windows.len];
 }
 
-fn manifestWindow(comptime window: anytype, comptime index: usize) zero_native.WindowOptions {
+fn manifestWindow(comptime window: anytype, comptime index: usize) native_sdk.WindowOptions {
     return .{
         .id = index + 1,
         .label = windowLabel(window, index),
         .title = windowTitle(window),
-        .default_frame = zero_native.geometry.RectF.init(
+        .default_frame = native_sdk.geometry.RectF.init(
             windowFloat(window, "x", 0),
             windowFloat(window, "y", 0),
             windowFloat(window, "width", 720),
@@ -112,7 +143,7 @@ fn windowBool(comptime window: anytype, comptime field: []const u8, comptime def
     return default_value;
 }
 
-fn windowRestorePolicy(comptime window: anytype) zero_native.WindowRestorePolicy {
+fn windowRestorePolicy(comptime window: anytype) native_sdk.WindowRestorePolicy {
     if (comptime !@hasField(@TypeOf(window), "restore_policy")) return .clamp_to_visible_screen;
     const value = window.restore_policy;
     if (comptime std.mem.eql(u8, value, "clamp_to_visible_screen")) return .clamp_to_visible_screen;
@@ -120,9 +151,9 @@ fn windowRestorePolicy(comptime window: anytype) zero_native.WindowRestorePolicy
     @compileError("unknown app.zon window restore_policy");
 }
 
-fn shortcutModifiers(comptime shortcut: anytype) zero_native.ShortcutModifiers {
+fn shortcutModifiers(comptime shortcut: anytype) native_sdk.ShortcutModifiers {
     const values = if (@hasField(@TypeOf(shortcut), "modifiers")) shortcut.modifiers else .{};
-    var modifiers: zero_native.ShortcutModifiers = .{};
+    var modifiers: native_sdk.ShortcutModifiers = .{};
     inline for (values) |value| {
         const modifier: []const u8 = value;
         if (comptime std.mem.eql(u8, modifier, "primary")) {
@@ -142,7 +173,7 @@ fn shortcutModifiers(comptime shortcut: anytype) zero_native.ShortcutModifiers {
     return modifiers;
 }
 
-pub fn runWithOptions(app: zero_native.App, options: RunOptions, init: std.process.Init) !void {
+pub fn runWithOptions(app: native_sdk.App, options: RunOptions, init: std.process.Init) !void {
     if (comptime std.mem.eql(u8, build_options.platform, "macos")) {
         try runMacos(app, options, init);
     } else if (comptime std.mem.eql(u8, build_options.platform, "linux")) {
@@ -154,52 +185,56 @@ pub fn runWithOptions(app: zero_native.App, options: RunOptions, init: std.proce
     }
 }
 
-fn runNull(app: zero_native.App, options: RunOptions, init: std.process.Init) !void {
+fn runNull(app: native_sdk.App, options: RunOptions, init: std.process.Init) !void {
     var buffers: StateBuffers = undefined;
     const app_info = options.appInfo(&buffers);
-    var null_platform = zero_native.NullPlatform.initWithOptions(.{}, webEngine(), app_info);
+    var null_platform = native_sdk.NullPlatform.initWithOptions(.{}, webEngine(), app_info);
     try runRuntime(app, options, init, null_platform.platform());
 }
 
-fn runMacos(app: zero_native.App, options: RunOptions, init: std.process.Init) !void {
+fn runMacos(app: native_sdk.App, options: RunOptions, init: std.process.Init) !void {
     var buffers: StateBuffers = undefined;
     const app_info = options.appInfo(&buffers);
-    var mac_platform = try zero_native.platform.macos.MacPlatform.initWithOptions(zero_native.geometry.SizeF.init(1120, 780), webEngine(), app_info);
+    var mac_platform = try native_sdk.platform.macos.MacPlatform.initWithOptions(native_sdk.geometry.SizeF.init(1120, 780), webEngine(), app_info);
     defer mac_platform.deinit();
     try runRuntime(app, options, init, mac_platform.platform());
 }
 
-fn runLinux(app: zero_native.App, options: RunOptions, init: std.process.Init) !void {
+fn runLinux(app: native_sdk.App, options: RunOptions, init: std.process.Init) !void {
     var buffers: StateBuffers = undefined;
     const app_info = options.appInfo(&buffers);
-    var linux_platform = try zero_native.platform.linux.LinuxPlatform.initWithOptions(zero_native.geometry.SizeF.init(960, 720), webEngine(), app_info);
+    var linux_platform = try native_sdk.platform.linux.LinuxPlatform.initWithOptions(native_sdk.geometry.SizeF.init(960, 720), webEngine(), app_info);
     defer linux_platform.deinit();
     try runRuntime(app, options, init, linux_platform.platform());
 }
 
-fn runWindows(app: zero_native.App, options: RunOptions, init: std.process.Init) !void {
+fn runWindows(app: native_sdk.App, options: RunOptions, init: std.process.Init) !void {
     var buffers: StateBuffers = undefined;
     const app_info = options.appInfo(&buffers);
-    var windows_platform = try zero_native.platform.windows.WindowsPlatform.initWithOptions(zero_native.geometry.SizeF.init(960, 720), webEngine(), app_info);
+    var windows_platform = try native_sdk.platform.windows.WindowsPlatform.initWithOptions(native_sdk.geometry.SizeF.init(960, 720), webEngine(), app_info);
     defer windows_platform.deinit();
     try runRuntime(app, options, init, windows_platform.platform());
 }
 
-fn runRuntime(app: zero_native.App, options: RunOptions, init: std.process.Init, platform: zero_native.Platform) !void {
+fn runRuntime(app: native_sdk.App, options: RunOptions, init: std.process.Init, platform: native_sdk.Platform) !void {
     var shortcut_storage: ShortcutStorage = .{};
     const shortcuts = options.resolvedShortcuts(&shortcut_storage);
-    var runtime = zero_native.Runtime.init(.{
+    // The Runtime is tens of megabytes; construct on the heap (default
+    // main-thread stacks overflow on a stack instance).
+    const runtime = try std.heap.page_allocator.create(native_sdk.Runtime);
+    defer std.heap.page_allocator.destroy(runtime);
+    native_sdk.Runtime.initAt(runtime, .{
         .platform = platform,
         .bridge = options.bridge,
         .builtin_bridge = options.builtin_bridge,
         .security = options.security,
         .shortcuts = shortcuts,
-        .automation = if (build_options.automation) zero_native.automation.Server.init(init.io, ".zig-cache/zero-native-automation", options.window_title) else null,
+        .automation = if (build_options.automation) native_sdk.automation.Server.init(init.io, ".zig-cache/native-sdk-automation", options.window_title) else null,
     });
     try runtime.run(app);
 }
 
-fn webEngine() zero_native.WebEngine {
+fn webEngine() native_sdk.WebEngine {
     if (comptime std.mem.eql(u8, build_options.web_engine, "chromium")) return .chromium;
     return .system;
 }

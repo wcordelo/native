@@ -1,22 +1,26 @@
-# Frontend Projects
+# Web Content
 
-For apps with a build step (React, Vue, Svelte, etc.), zero-native provides helpers to switch between a dev server and bundled assets.
+Native apps can embed WebViews as first-class components: build a web browser, a website builder with live preview, or a doc viewer that renders real web content inside a native-rendered app. The [browser example](https://github.com/vercel-labs/zero-native/tree/main/examples/browser) is a complete working browser; the [web engines](/web-engines) page covers choosing between the platform WebView and bundled Chromium.
+
+The same machinery also carries an entire existing web frontend — a React, Vue, Svelte, or Next.js codebase running in a WebView inside the native shell. That is a migration path next to the default [native-rendered UI](/native-ui): reach for it when you are bringing web UI along, not when starting fresh. Scaffold one with `native init my_app --frontend <next|vite|react|svelte|vue>`.
+
+For frontends with a build step, the Native SDK provides helpers to switch between a dev server during development and bundled assets in production.
 
 ## Dynamic source function
 
 Use `source_fn` on your `App` so development uses a localhost server and production uses bundled assets:
 
 ```zig
-fn source(context: *anyopaque) anyerror!zero_native.WebViewSource {
+fn source(context: *anyopaque) anyerror!native_sdk.WebViewSource {
     const self: *App = @ptrCast(@alignCast(context));
-    return zero_native.frontend.sourceFromEnv(self.env_map, .{
+    return native_sdk.frontend.sourceFromEnv(self.env_map, .{
         .dist = "dist",
         .entry = "index.html",
     });
 }
 ```
 
-`sourceFromEnv` checks `ZERO_NATIVE_FRONTEND_URL`. If set, it returns a URL source; otherwise it returns an assets source from `config.dist`.
+`sourceFromEnv` checks `NATIVE_SDK_FRONTEND_URL`. If set, it returns a URL source; otherwise it returns an assets source from `config.dist`.
 
 ## frontend.Config
 
@@ -51,7 +55,7 @@ fn source(context: *anyopaque) anyerror!zero_native.WebViewSource {
     </tr>
     <tr>
       <td><code>dev_url_env</code></td>
-      <td><code>"ZERO_NATIVE_FRONTEND_URL"</code></td>
+      <td><code>"NATIVE_SDK_FRONTEND_URL"</code></td>
       <td>Environment variable checked by <code>sourceFromEnv</code></td>
     </tr>
   </tbody>
@@ -75,14 +79,14 @@ fn source(context: *anyopaque) anyerror!zero_native.WebViewSource {
 
 ## Dev server
 
-Use `zero-native dev` to let zero-native manage the frontend server lifecycle:
+Use `native dev` to let the Native SDK manage the frontend server lifecycle:
 
 ```bash
-zero-native dev --binary zig-out/bin/MyApp
-zero-native dev --binary zig-out/bin/MyApp --url http://127.0.0.1:3000/ --command "npm run dev"
+native dev --binary zig-out/bin/MyApp
+native dev --binary zig-out/bin/MyApp --url http://127.0.0.1:3000/ --command "npm run dev"
 ```
 
-The command starts the frontend process, waits for the port to accept connections, launches the native shell with `ZERO_NATIVE_FRONTEND_URL`, and terminates the frontend when the shell exits. See [Dev Server](/cli/dev) for all flags.
+The command starts the frontend process, waits for the port to accept connections, launches the native shell with `NATIVE_SDK_FRONTEND_URL`, and terminates the frontend when the shell exits. See [Dev Server](/cli/dev) for all flags.
 
 ## Framework recipes
 
@@ -108,9 +112,9 @@ Each example can be run from its directory with `zig build run`, or with `zig bu
 For packaged builds that always use local assets:
 
 ```zig
-return zero_native.frontend.productionSource(.{ .dist = "dist", .entry = "index.html" });
+return native_sdk.frontend.productionSource(.{ .dist = "dist", .entry = "index.html" });
 ```
 
-## ZERO_NATIVE_FRONTEND_ASSETS
+## NATIVE_SDK_FRONTEND_ASSETS
 
-`ZERO_NATIVE_FRONTEND_ASSETS` is an app-defined convention (not read by the `frontend` module). Examples use it to signal that pre-built assets should be loaded via `productionSource` instead of the default dev/prod branching.
+`NATIVE_SDK_FRONTEND_ASSETS` is an app-defined convention (not read by the `frontend` module). Examples use it to signal that pre-built assets should be loaded via `productionSource` instead of the default dev/prod branching.

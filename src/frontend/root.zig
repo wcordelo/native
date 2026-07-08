@@ -6,7 +6,7 @@ pub const Config = struct {
     entry: []const u8 = "index.html",
     origin: []const u8 = "zero://app",
     spa_fallback: bool = true,
-    dev_url_env: []const u8 = "ZERO_NATIVE_FRONTEND_URL",
+    dev_url_env: []const u8 = "NATIVE_SDK_FRONTEND_URL",
 };
 
 pub fn sourceFromEnv(env_map: *std.process.Environ.Map, config: Config) platform.WebViewSource {
@@ -28,7 +28,7 @@ pub fn productionSource(config: Config) platform.WebViewSource {
 test "frontend source prefers managed dev server url" {
     var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();
-    try env.put("ZERO_NATIVE_FRONTEND_URL", "http://127.0.0.1:5173/");
+    try env.put("NATIVE_SDK_FRONTEND_URL", "http://127.0.0.1:5173/");
 
     const source = sourceFromEnv(&env, .{ .dist = "dist" });
 

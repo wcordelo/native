@@ -1,15 +1,21 @@
 import type { MDXComponents } from "mdx/types";
 import { Code } from "@/components/code";
+import { CopyPage } from "@/components/copy-page";
 import { HeadingLink } from "@/components/heading-link";
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {
   return {
+    // The page h1 is the heading row: title on the left, the layout-level
+    // "Copy Page" button (copies the page as markdown) on the right.
     h1: (props) => (
-      <HeadingLink
-        as="h1"
-        className="mb-6 text-2xl font-semibold tracking-tight text-neutral-900 dark:text-neutral-100"
-        {...props}
-      />
+      <div className="mb-6 flex items-start justify-between gap-4">
+        <HeadingLink
+          as="h1"
+          className="text-2xl font-semibold tracking-tight text-neutral-900 dark:text-neutral-100"
+          {...props}
+        />
+        <CopyPage />
+      </div>
     ),
     h2: (props) => (
       <HeadingLink
@@ -67,22 +73,13 @@ export function useMDXComponents(components: MDXComponents): MDXComponents {
         {...props}
       />
     ),
+    // Markdown pipe tables render as bare table elements inside a scroll
+    // wrapper: the `article table` rules in globals.css style them, the
+    // same register the literal HTML tables on the component pages use.
     table: (props) => (
-      <div className="mb-4 overflow-x-auto">
-        <table className="w-full text-sm" {...props} />
+      <div className="overflow-x-auto">
+        <table {...props} />
       </div>
-    ),
-    th: (props) => (
-      <th
-        className="border-b border-neutral-200 px-3 py-2 text-left text-xs font-medium uppercase tracking-wider text-neutral-500 dark:border-neutral-800 dark:text-neutral-400"
-        {...props}
-      />
-    ),
-    td: (props) => (
-      <td
-        className="border-b border-neutral-100 px-3 py-2 text-neutral-600 dark:border-neutral-800/50 dark:text-neutral-400"
-        {...props}
-      />
     ),
     hr: () => <hr className="my-8 border-neutral-200 dark:border-neutral-800" />,
     strong: (props) => (

@@ -1,6 +1,6 @@
 # Native Surfaces
 
-Native surfaces are the app-owned regions that zero-native composes inside a platform window. A surface can be a WebView, native chrome, a native utility panel, or a future specialized drawing region. The key model is that WebView content is one surface in the window, not the whole app.
+Native surfaces are the app-owned regions that the Native SDK composes inside a platform window. A surface can be a GPU-rendered canvas, native chrome, a native utility panel, or an embedded WebView. The key model is that a window is a declared tree of surfaces — the default app is one `gpu_surface` canvas filling the window, and everything else composes around it.
 
 ## Surface Types
 
@@ -14,9 +14,9 @@ Native surfaces are the app-owned regions that zero-native composes inside a pla
   </thead>
   <tbody>
     <tr>
-      <td>WebView</td>
-      <td>Rich product UI, frontend frameworks, documents, dashboards</td>
-      <td><code>ViewKind.webview</code>, <code>WebViewSource</code>, and the selected web engine</td>
+      <td>GPU surface</td>
+      <td>The canvas your <a href="/native-ui">native UI</a> renders into — plus custom drawing regions for editors, timelines, dashboards, and games</td>
+      <td>Metal-backed on macOS; software (CPU reference renderer) presentation on Linux and Windows system hosts</td>
     </tr>
     <tr>
       <td>Native chrome</td>
@@ -34,19 +34,38 @@ Native surfaces are the app-owned regions that zero-native composes inside a pla
       <td>Guarded <code>PlatformServices</code>, runtime methods, and built-in bridge commands</td>
     </tr>
     <tr>
-      <td>GPU surface</td>
-      <td>Future custom drawing regions for editors, timelines, games, or canvas-like workflows</td>
-      <td>Reserved as <code>ViewKind.gpu_surface</code>; current hosts report it unsupported</td>
+      <td>WebView</td>
+      <td><a href="/frontend">Embedded web content</a>: web frontends, documents, previews</td>
+      <td><code>ViewKind.webview</code>, <code>WebViewSource</code>, and the selected <a href="/web-engines">web engine</a></td>
     </tr>
   </tbody>
 </table>
 
-## Window Shape
+## The default shape: one canvas
 
-Use `App.scene_fn` when a window should start with native structure around WebView content:
+The generated app declares one window with one GPU surface, and the [`UiApp`](/app-model) loop renders the whole UI into it:
 
 ```zig
-const shell_views = [_]zero_native.ShellView{
+const shell_views = [_]native_sdk.ShellView{
+    .{ .label = "main-canvas", .kind = .gpu_surface, .fill = true, .gpu_backend = .metal },
+};
+const shell_windows = [_]native_sdk.ShellWindow{.{
+    .label = "main",
+    .title = "My App",
+    .width = 480,
+    .height = 320,
+    .views = &shell_views,
+}};
+```
+
+Everything below this section is composition around that canvas: platform chrome, split panes, and (when needed) web content.
+
+## Window Shape
+
+Use `App.scene_fn` (or `UiApp`'s `scene` option) when a window should start with native structure, such as chrome around a WebView workspace:
+
+```zig
+const shell_views = [_]native_sdk.ShellView{
     .{ .label = "toolbar", .kind = .toolbar, .edge = .top, .height = 52 },
     .{ .label = "refresh", .kind = .button, .parent = "toolbar", .accessibility_label = "Refresh workspace", .text = "Refresh", .command = "app.refresh" },
     .{ .label = "body", .kind = .split, .fill = true, .axis = .row },
@@ -55,7 +74,7 @@ const shell_views = [_]zero_native.ShellView{
     .{ .label = "status", .kind = .statusbar, .edge = .bottom, .height = 32, .text = "Ready" },
 };
 
-const shell_windows = [_]zero_native.ShellWindow{.{
+const shell_windows = [_]native_sdk.ShellWindow{.{
     .label = "main",
     .title = "Acme",
     .width = 1100,
@@ -65,6 +84,38 @@ const shell_windows = [_]zero_native.ShellWindow{.{
 ```
 
 This creates native chrome and controls in the platform host while the `main` WebView owns the workspace content.
+
+## Canvas + WebView In One Window
+
+A canvas-first `UiApp` can host a live webview next to its native-rendered widgets — the "native, web, or both per window" composition. The scene declares the webview shell view (parent it to the canvas view so frames share the canvas coordinate space), and `UiApp.Options.web_panes` keeps it snapped to a canvas widget's layout frame and drives navigation from the model:
+
+```zig
+const shell_views = [_]native_sdk.ShellView{
+    .{ .label = "preview-canvas", .kind = .gpu_surface, .fill = true, .gpu_backend = .metal },
+    .{ .label = "preview", .kind = .webview, .parent = "preview-canvas", .url = "https://example.com/", .x = 240, .y = 76, .width = 704, .height = 548 },
+};
+
+fn view(ui: *Ui, model: *const Model) Ui.Node {
+    return ui.row(.{ .grow = 1 }, .{
+        sidebar(ui, model),
+        // An empty panel reserves the webview region; its semantics label
+        // is the pane anchor.
+        ui.panel(.{ .grow = 1, .semantics = .{ .label = "preview-pane" } }, .{}),
+    });
+}
+
+fn panes(model: *const Model, out: []PreviewApp.WebViewPane) usize {
+    out[0] = .{
+        .label = "preview",
+        .anchor = "preview-pane",
+        .url = model.url(),          // changing it navigates
+        .reload_token = model.reload_token, // bumping it reloads
+    };
+    return 1;
+}
+```
+
+Panes re-apply after every rebuild and presented frame, reconciling against the runtime's actual webview state, so shell relayouts (window restores, resizes) cannot leave the webview detached from its anchor. Pane URLs are subject to `security.navigation.allowed_origins`. A scene whose only webviews are children like this never grows an implicit `main` webview — the window stays canvas-first. The seam is engine-agnostic (it rides the same `PlatformServices` webview surface both the system and Chromium hosts implement), though `gpu_surface` canvases currently require the system engine on macOS. `examples/canvas-preview` is the live proof, with a smoke test at `zig build test-canvas-preview-smoke`.
 
 ## Imperative View API
 
@@ -110,7 +161,7 @@ Existing `App.source`, `runtime.createWebView(...)`, and `window.zero.webviews.*
 
 ## Platform Support
 
-macOS, Linux, and Windows system-WebView hosts support native views and controls today. Chromium hosts and mobile hosts expose the same public vocabulary where useful, but unsupported operations reject explicitly instead of silently falling back to WebView-only behavior.
+macOS, Linux, and Windows system hosts support native views and controls today. The macOS host presents `gpu_surface` through a Metal-backed child view; Linux and Windows present it through the software reference renderer. See `examples/gpu-surface` for a minimal native controls plus WebView plus GPU surface composition. Chromium hosts and mobile hosts expose the same public vocabulary where useful, but unsupported operations reject explicitly instead of silently falling back.
 
 Use support checks before showing optional native affordances:
 
@@ -118,11 +169,28 @@ Use support checks before showing optional native affordances:
 if (runtime.supports(.native_views)) {
     try runtime.createView(.{ .label = "toolbar", .kind = .toolbar });
 }
+if (runtime.supports(.gpu_surfaces)) {
+    try runtime.createView(.{
+        .label = "canvas",
+        .kind = .gpu_surface,
+        .frame = native_sdk.geometry.RectF.init(0, 0, 480, 320),
+        .gpu_surface = .{
+            .backend = .metal,
+            .pixel_format = .bgra8_unorm,
+            .present_mode = .timer,
+            .alpha_mode = .@"opaque",
+            .color_space = .srgb,
+            .vsync = true,
+        },
+    });
+}
 ```
 
 ```js
 const hasNativeViews = await window.zero.platform.supports("native_views");
 ```
+
+`gpu_surface` views report GPU presentation state through `ViewInfo` and `GpuSurfaceFrameEvent`, including the selected backend, pixel format, present mode, alpha mode, color space, vsync flag, status, frame size, frame index, timestamp, nonblank sample status, input latency budget, first-frame latency budget, retained canvas frame counters, widget revision, widget node count, and current cursor intent.
 
 See [Platform Support](/platform-support) for the current host matrix.
 
@@ -133,4 +201,4 @@ See [Platform Support](/platform-support) for the current host matrix.
 - [Commands](/commands)
 - [Capabilities](/capabilities)
 - [Multiple WebViews](/webviews)
-- [app.zon Reference](/app-zon)
+- [Config](/app-zon)

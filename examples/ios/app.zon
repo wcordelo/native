@@ -1,5 +1,5 @@
 .{
-    .id = "dev.zero_native.ios-example",
+    .id = "dev.native_sdk.ios-example",
     .name = "ios-example",
     .display_name = "iOS Example",
     .version = "0.1.0",

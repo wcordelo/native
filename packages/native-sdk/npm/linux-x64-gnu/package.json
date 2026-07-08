@@ -1,0 +1,24 @@
+{
+  "name": "@native-sdk/cli-linux-x64-gnu",
+  "version": "0.4.0",
+  "description": "The native CLI binary for Linux x64 (glibc)",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "files": [
+    "bin"
+  ],
+  "preferUnplugged": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vercel-labs/zero-native.git"
+  },
+  "homepage": "https://zero-native.dev",
+  "license": "Apache-2.0"
+}
