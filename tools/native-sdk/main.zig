@@ -61,7 +61,7 @@ pub fn main(init: std.process.Init) !void {
             }
             std.process.exit(1);
         }
-        try tooling.templates.writeDefaultApp(allocator, init.io, destination, .{ .app_name = app_name, .framework_path = framework_path, .frontend = frontend, .shape = shape });
+        tooling.templates.writeDefaultApp(allocator, init.io, destination, .{ .app_name = app_name, .framework_path = framework_path, .frontend = frontend, .shape = shape }) catch |err| return failVerb(err);
         std.debug.print("created Native SDK app at {s} ({s})\n", .{ destination, frontend_str });
         printInitNextSteps(destination, frontend, shape);
     } else if (std.mem.eql(u8, command, "build") or std.mem.eql(u8, command, "test")) {
@@ -421,6 +421,7 @@ fn failVerb(err: anyerror) anyerror!void {
     switch (err) {
         error.MissingManifest,
         error.MissingFramework,
+        error.CrossVolumeFramework,
         error.ZigUnavailable,
         error.DownloadDeclined,
         error.UnsupportedPlatform,
@@ -645,6 +646,11 @@ fn iosPackageLibrary(allocator: std.mem.Allocator, io: std.Io, env_map: *std.pro
                 "  build it first (`zig build lib -Dtarget={s}`) or pass --binary <path>; the app must expose a mobile UiApp (`mobileOptions`)\n", .{tooling.ios.LibSlice.device.zigTriple()});
             return null;
         },
+        // Cross-volume SDK: the junction bridge failed, so the generated
+        // host project could not build against the SDK either — a
+        // libraryless project would ship broken. The teaching message is
+        // already on screen; fail the whole package verb without a trace.
+        error.CrossVolumeFramework => std.process.exit(1),
         else => return err,
     };
 }
@@ -665,6 +671,11 @@ fn androidPackageLibrary(allocator: std.mem.Allocator, io: std.Io, env_map: *std
                 "  build it first (`zig build lib -Dtarget={s}`) or pass --binary <path>; the app must expose a mobile UiApp (`mobileOptions`)\n", .{tooling.android.zig_triple});
             return null;
         },
+        // Cross-volume SDK: the junction bridge failed, so the generated
+        // host project could not build against the SDK either — a
+        // libraryless project would ship broken. The teaching message is
+        // already on screen; fail the whole package verb without a trace.
+        error.CrossVolumeFramework => std.process.exit(1),
         else => return err,
     };
 }
