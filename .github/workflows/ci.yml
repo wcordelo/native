@@ -90,6 +90,12 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+      # Builds the WebView example with the system engine, compiling the
+      # full embedded-WebView host against the vendored WebView2 SDK
+      # header (third_party/webview2). The host refuses to fall back to
+      # the stubbed layer, so a regression — a missing header, a broken
+      # include path, or a conformance error in the embedded layer — is a
+      # compile failure here, not a silent WebViewNotFound at runtime.
       - run: zig build test-webview-system-link -Dplatform=windows
 
   cef-platform-tooling:

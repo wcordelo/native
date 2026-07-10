@@ -25,7 +25,7 @@ Apps that [embed web content](/frontend) choose a web engine backend for their W
     </tr>
     <tr>
       <td>Windows</td>
-      <td>In progress</td>
+      <td>WebView2</td>
       <td>Not wired yet; builds fail early instead of silently using WebView2</td>
     </tr>
   </tbody>
@@ -40,6 +40,8 @@ The intended parity contract is the same Zig app model, same runtime services, s
 ```
 
 System mode has no bundled browser dependency. It uses the OS web engine, so rendering and web platform support follow the user's installed OS.
+
+On Windows the system engine is WebView2, whose Evergreen runtime is preinstalled on Windows 11 and current Windows 10; older machines need the runtime installer from the WebView2 download page (`native doctor` checks for it). The build stages the small vendored `WebView2Loader.dll` next to the app executable automatically, and `native package` includes it in the Windows artifact.
 
 ## Chromium (CEF)
 

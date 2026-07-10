@@ -7,9 +7,12 @@
 // build script that `addApp` lives in), app.zon (the SDK's own manifest,
 // which its build script reads at configure time), assets/ (files the
 // build graph resolves from the dependency, e.g. the Windows application
-// manifest build/app.zig wires via dep.path), and the agent skills.
-// With the payload in the package, `native init && native dev` work
-// offline right after install.
+// manifest build/app.zig wires via dep.path), third_party/webview2/ (the
+// vendored WebView2 SDK header and loader the Windows build resolves the
+// same way; the CEF runtimes stay out — they are large downloaded
+// artifacts, not repo files), and the agent skills. With the payload in
+// the package, `native init && native dev` work offline right after
+// install.
 
 import { cpSync, copyFileSync, rmSync } from 'fs';
 import { dirname, join } from 'path';
@@ -25,6 +28,14 @@ for (const dir of ['src', 'build', 'assets', 'skills', 'skill-data']) {
   rmSync(target, { recursive: true, force: true });
   cpSync(source, target, { recursive: true });
   console.log(`✓ Copied ${dir}/ to ${target}`);
+}
+
+{
+  const source = join(repoRoot, 'third_party', 'webview2');
+  const target = join(projectRoot, 'third_party', 'webview2');
+  rmSync(join(projectRoot, 'third_party'), { recursive: true, force: true });
+  cpSync(source, target, { recursive: true });
+  console.log(`✓ Copied third_party/webview2/ to ${target}`);
 }
 
 for (const file of ['build.zig', 'build.zig.zon', 'app.zon', 'LICENSE']) {

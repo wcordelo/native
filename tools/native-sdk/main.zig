@@ -277,10 +277,10 @@ pub fn main(init: std.process.Init) !void {
         }
     } else if (std.mem.eql(u8, command, "package-windows")) {
         checkPackageShortcutFlags(command, args[2..]);
-        try packageShortcut(allocator, init.io, args, .windows, "zig-out/package/windows");
+        try packageShortcut(allocator, init.io, init.environ_map, args, .windows, "zig-out/package/windows");
     } else if (std.mem.eql(u8, command, "package-linux")) {
         checkPackageShortcutFlags(command, args[2..]);
-        try packageShortcut(allocator, init.io, args, .linux, "zig-out/package/linux");
+        try packageShortcut(allocator, init.io, init.environ_map, args, .linux, "zig-out/package/linux");
     } else if (std.mem.eql(u8, command, "package-ios")) {
         checkPackageShortcutFlags(command, args[2..]);
         const metadata = try tooling.manifest.readMetadata(allocator, init.io, try flagValue(args, "--manifest") orelse "app.zon");
@@ -296,6 +296,7 @@ pub fn main(init: std.process.Init) !void {
             .frontend = metadata.frontend,
             .web_engine = web_engine.engine,
             .cef_dir = web_engine.cef_dir,
+            .env_map = init.environ_map,
         });
         tooling.package.printDiagnostic(stats);
     } else if (std.mem.eql(u8, command, "package-android")) {
@@ -759,7 +760,7 @@ fn splitCommand(allocator: std.mem.Allocator, value: []const u8) ![]const []cons
     return parts.toOwnedSlice(allocator);
 }
 
-fn packageShortcut(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8, target: tooling.package.PackageTarget, default_output: []const u8) !void {
+fn packageShortcut(allocator: std.mem.Allocator, io: std.Io, env_map: *std.process.Environ.Map, args: []const []const u8, target: tooling.package.PackageTarget, default_output: []const u8) !void {
     const metadata = try tooling.manifest.readMetadata(allocator, io, try flagValue(args, "--manifest") orelse "app.zon");
     const web_engine = try tooling.web_engine.resolve(.{ .web_engine = metadata.web_engine, .cef = metadata.cef }, .{});
     const stats = try tooling.package.createPackage(allocator, io, .{
@@ -771,6 +772,7 @@ fn packageShortcut(allocator: std.mem.Allocator, io: std.Io, args: []const []con
         .frontend = metadata.frontend,
         .web_engine = web_engine.engine,
         .cef_dir = web_engine.cef_dir,
+        .env_map = env_map,
     });
     tooling.package.printDiagnostic(stats);
 }

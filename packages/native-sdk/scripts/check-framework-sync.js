@@ -18,6 +18,7 @@ const mirrors = [
   { source: 'LICENSE', target: 'LICENSE' },
   { source: 'skills', target: 'skills' },
   { source: 'skill-data', target: 'skill-data' },
+  { source: 'third_party/webview2', target: 'third_party/webview2' },
 ];
 
 const errors = [];

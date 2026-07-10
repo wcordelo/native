@@ -27,19 +27,22 @@
 #include <thread>
 #include <vector>
 
+/* The WebView2 SDK header is vendored (third_party/webview2/include) and
+ * every first-party build graph puts it on the include path, so a build
+ * that cannot see it is misconfigured — fail it loudly instead of
+ * shipping a host whose WebView loads report WebViewNotFound at runtime.
+ * NATIVE_SDK_ALLOW_WEBVIEW2_STUB opts a hand-rolled build into the old
+ * stubbed layer (canvas apps are unaffected by the stub). */
 #if __has_include(<WebView2.h>) && __has_include(<wrl.h>)
 #include <WebView2.h>
 #include <wrl.h>
 #define NATIVE_SDK_HAS_WEBVIEW2 1
-using Microsoft::WRL::Callback;
 using Microsoft::WRL::ComPtr;
-#else
+#elif defined(NATIVE_SDK_ALLOW_WEBVIEW2_STUB)
 #define NATIVE_SDK_HAS_WEBVIEW2 0
-/* Loud on purpose: without the WebView2 SDK header on the include path
- * the host builds with the embedded WebView layer stubbed out — canvas
- * apps are unaffected, but apps that load a WebView report
- * WebViewNotFound at start. */
 #pragma message("WebView2.h not found: building the Windows host without the embedded WebView layer (canvas apps unaffected; WebView loads will report WebViewNotFound)")
+#else
+#error "WebView2.h not found: add third_party/webview2/include to the include path, or define NATIVE_SDK_ALLOW_WEBVIEW2_STUB to build without the embedded WebView layer"
 #endif
 
 /* Media Foundation (the audio backend below) + WinHTTP (the audio cache
@@ -557,6 +560,9 @@ struct Host {
     int appearance_color_scheme = -1;
     int appearance_reduce_motion = -1;
     int appearance_high_contrast = -1;
+    /* Whether the CoInitializeEx in native_sdk_windows_create succeeded
+     * and native_sdk_windows_destroy owes the balancing CoUninitialize. */
+    bool com_initialized = false;
     AudioState audio;
     AudioSpectrumState spectrum;
     std::shared_ptr<HostLifetime> lifetime = std::make_shared<HostLifetime>();
@@ -3952,6 +3958,92 @@ static void destroyAllWindows(Host *host) {
 #if NATIVE_SDK_HAS_WEBVIEW2
 using CreateEnvironmentFn = HRESULT (STDAPICALLTYPE *)(PCWSTR, PCWSTR, ICoreWebView2EnvironmentOptions *, ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *);
 
+/* The event-handler factory. The full WRL provides this as
+ * Microsoft::WRL::Callback, but the mingw WRL subset only carries ComPtr,
+ * so the handful of WebView2 completion and event handlers are built on
+ * this minimal equivalent: one refcounted COM object per handler that
+ * forwards Invoke to the wrapped callable. QueryInterface needs each
+ * handler's IID at runtime; the constants mirror the interface
+ * declarations in WebView2.h (mingw's __uuidof only covers interfaces
+ * its own headers declare, the same reason the WIC GUIDs further down
+ * are defined locally). */
+static const GUID kNativeSdkIID_EnvironmentCompletedHandler = {0x4e8a3389, 0xc9d8, 0x4bd2, {0xb6, 0xb5, 0x12, 0x4f, 0xee, 0x6c, 0xc1, 0x4d}};
+static const GUID kNativeSdkIID_ControllerCompletedHandler = {0x6c4819f3, 0xc9b7, 0x4260, {0x81, 0x27, 0xc9, 0xf5, 0xbd, 0xe7, 0xf6, 0x8c}};
+static const GUID kNativeSdkIID_WebMessageReceivedHandler = {0x57213f19, 0x00e6, 0x49fa, {0x8e, 0x07, 0x89, 0x8e, 0xa0, 0x1e, 0xcb, 0xd2}};
+static const GUID kNativeSdkIID_AcceleratorKeyPressedHandler = {0xb29c7e28, 0xfa79, 0x41a8, {0x8e, 0x44, 0x65, 0x81, 0x1c, 0x76, 0xdc, 0xb2}};
+static const GUID kNativeSdkIID_WebResourceRequestedHandler = {0xab00b74c, 0x15f1, 0x4646, {0x80, 0xe8, 0xe7, 0x63, 0x41, 0xd2, 0x5d, 0x71}};
+static const GUID kNativeSdkIID_NavigationStartingHandler = {0x9adbe429, 0xf36d, 0x432b, {0x9d, 0xdc, 0xf8, 0x88, 0x1f, 0xbd, 0x76, 0xe3}};
+
+template <typename Interface> struct WebView2HandlerIid;
+template <> struct WebView2HandlerIid<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler> {
+    static const GUID &value() { return kNativeSdkIID_EnvironmentCompletedHandler; }
+};
+template <> struct WebView2HandlerIid<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler> {
+    static const GUID &value() { return kNativeSdkIID_ControllerCompletedHandler; }
+};
+template <> struct WebView2HandlerIid<ICoreWebView2WebMessageReceivedEventHandler> {
+    static const GUID &value() { return kNativeSdkIID_WebMessageReceivedHandler; }
+};
+template <> struct WebView2HandlerIid<ICoreWebView2AcceleratorKeyPressedEventHandler> {
+    static const GUID &value() { return kNativeSdkIID_AcceleratorKeyPressedHandler; }
+};
+template <> struct WebView2HandlerIid<ICoreWebView2WebResourceRequestedEventHandler> {
+    static const GUID &value() { return kNativeSdkIID_WebResourceRequestedHandler; }
+};
+template <> struct WebView2HandlerIid<ICoreWebView2NavigationStartingEventHandler> {
+    static const GUID &value() { return kNativeSdkIID_NavigationStartingHandler; }
+};
+
+/* Every handler interface above declares a two-argument Invoke; this
+ * trait reads the argument types off the interface so the override below
+ * matches exactly. */
+template <typename Method> struct WebView2InvokeSignature;
+template <typename Interface, typename FirstArg, typename SecondArg>
+struct WebView2InvokeSignature<HRESULT (STDMETHODCALLTYPE Interface::*)(FirstArg, SecondArg)> {
+    using First = FirstArg;
+    using Second = SecondArg;
+};
+
+template <typename Interface, typename Callable>
+class WebView2Handler final : public Interface {
+public:
+    explicit WebView2Handler(Callable callable) : callable_(std::move(callable)) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **object) override {
+        if (!object) return E_POINTER;
+        if (IsEqualIID(riid, WebView2HandlerIid<Interface>::value()) || IsEqualIID(riid, IID_IUnknown)) {
+            *object = static_cast<Interface *>(this);
+            AddRef();
+            return S_OK;
+        }
+        *object = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return refs_.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG remaining = refs_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (remaining == 0) delete this;
+        return remaining;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(
+        typename WebView2InvokeSignature<decltype(&Interface::Invoke)>::First first,
+        typename WebView2InvokeSignature<decltype(&Interface::Invoke)>::Second second) override {
+        return callable_(first, second);
+    }
+
+private:
+    std::atomic<ULONG> refs_{1};
+    Callable callable_;
+};
+
+template <typename Interface, typename Callable>
+static ComPtr<Interface> Callback(Callable callable) {
+    ComPtr<Interface> handler;
+    handler.Attach(new WebView2Handler<Interface, Callable>(std::move(callable)));
+    return handler;
+}
+
 static const wchar_t *nativeSdkBridgeScript() {
     return LR"ZN((function(){
 	if(window.zero&&window.zero.invoke&&window.zero.on&&window.zero._emit){return;}
@@ -4240,7 +4332,7 @@ static bool createChildWebView(Host *host, const std::string &key) {
                             uint64_t bridge_window_id = found->second.window_id;
                             std::string bridge_label = found->second.label;
                             found->second.webview->add_WebMessageReceived(Callback<ICoreWebView2WebMessageReceivedEventHandler>(
-                                [host, bridge_window_id, bridge_label, lifetime](ICoreWebView2 *, ICoreWebView2WebMessageReceivedEventArgs *args) -> HRESULT {
+                                [host, key, bridge_window_id, bridge_label, lifetime](ICoreWebView2 *, ICoreWebView2WebMessageReceivedEventArgs *args) -> HRESULT {
                                     auto token = lifetime.lock();
                                     if (!token) return S_OK;
                                     std::lock_guard<std::recursive_mutex> guard(token->mutex);
@@ -4902,6 +4994,15 @@ Host *native_sdk_windows_create(const char *app_name, size_t app_name_len, const
     InitCommonControlsEx(&controls);
 
     Host *host = new Host();
+    /* The WebView2 environment factory requires a single-threaded
+     * apartment on the calling thread; without one it fails with
+     * CO_E_NOTINITIALIZED. Create, run, and destroy all execute on the
+     * app's main thread, so one init here pairs with the CoUninitialize
+     * at the end of native_sdk_windows_destroy — after the controllers
+     * are closed. S_FALSE (already initialized) still pairs;
+     * RPC_E_CHANGED_MODE (an MTA got there first) leaves nothing to
+     * balance. */
+    host->com_initialized = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
     host->app_name = slice(app_name, app_name_len);
     host->window_title = slice(window_title, window_title_len);
     host->bundle_id = slice(bundle_id, bundle_id_len);
@@ -4945,7 +5046,9 @@ void native_sdk_windows_destroy(Host *host) {
     audioReleaseSession(host, true);
     removeNotificationIcon(host);
     destroyAllWindows(host);
+    const bool com_initialized = host->com_initialized;
     delete host;
+    if (com_initialized) CoUninitialize();
 }
 
 void native_sdk_windows_run(Host *host, EventCallback callback, void *context) {

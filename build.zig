@@ -482,6 +482,26 @@ pub fn build(b: *std.Build) void {
         .{ .path = "src/platform/linux/gtk_host.c", .pattern = "change != NATIVE_SDK_GST_STATE_CHANGE_ASYNC" },
         .{ .path = "src/platform/linux/gtk_host.c", .pattern = "#define NATIVE_SDK_GST_STATE_CHANGE_ASYNC 2" },
     });
+    // The embedded-WebView layer must stay real: the vendored WebView2
+    // SDK header turns the guard on, every first-party build graph puts
+    // it on the include path, and a build that cannot see it fails at
+    // compile time instead of quietly shipping the stubbed host (whose
+    // WebView loads report WebViewNotFound at runtime).
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-windows-webview2-vendor", "Verify the vendored WebView2 SDK stays wired into every Windows build graph", &.{
+        .{ .path = "third_party/webview2/include/WebView2.h", .pattern = "CreateCoreWebView2EnvironmentWithOptions" },
+        .{ .path = "third_party/webview2/include/EventToken.h", .pattern = "EventRegistrationToken" },
+        .{ .path = "third_party/webview2/LICENSE.txt", .pattern = "Redistribution and use in source and binary forms" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "#error \"WebView2.h not found" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "LoadLibraryW(L\"WebView2Loader.dll\")" },
+        .{ .path = "build/app.zig", .pattern = "app_mod.addIncludePath(dep.path(\"third_party/webview2/include\"));" },
+        .{ .path = "build/app.zig", .pattern = "third_party/webview2/x64/WebView2Loader.dll" },
+        .{ .path = "src/tooling/templates.zig", .pattern = "third_party/webview2/include" },
+        .{ .path = "src/tooling/templates.zig", .pattern = "third_party/webview2/x64/WebView2Loader.dll" },
+    });
+    addLayoutCheckStep(b, test_step, "test-windows-webview2-loader-layout", "Verify the vendored WebView2 loader binaries are present", &.{
+        "third_party/webview2/x64/WebView2Loader.dll",
+        "third_party/webview2/arm64/WebView2Loader.dll",
+    });
     addFileContainsCheckStep(b, file_contains_checker, test_step, "test-windows-packaged-assets-webview2", "Verify Windows packaged assets are served through WebView2 request interception", &.{
         .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "constexpr const char *kAssetVirtualOrigin = \"https://native-sdk-app.localhost\";" },
         .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "return virtualAssetEntryUrl(webview.asset_entry);" },

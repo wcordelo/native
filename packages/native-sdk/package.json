@@ -17,6 +17,7 @@
     "build.zig",
     "build.zig.zon",
     "app.zon",
+    "third_party/webview2",
     "native-sdk.d.ts",
     "README.md",
     "LICENSE"

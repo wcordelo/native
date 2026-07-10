@@ -2,6 +2,7 @@ const std = @import("std");
 const android_tool = @import("android.zig");
 const app_icon_tool = @import("app_icon");
 const assets_tool = @import("assets.zig");
+const buildgraph = @import("buildgraph.zig");
 const cef = @import("cef.zig");
 const codesign = @import("codesign.zig");
 const diagnostics = @import("diagnostics");
@@ -212,6 +213,11 @@ fn createDesktopArtifact(allocator: std.mem.Allocator, io: std.Io, options: Pack
         const binary_subpath = try std.fmt.allocPrint(allocator, "bin/{s}", .{executable_name});
         defer allocator.free(binary_subpath);
         try copyFileToDir(allocator, io, dir, binary_path, binary_subpath);
+        if (options.target == .windows and options.web_engine == .system) {
+            try copyWindowsWebView2Loader(allocator, io, dir, options, binary_path);
+        }
+    } else if (options.target == .windows and options.web_engine == .system) {
+        try writeFile(dir, io, "bin/README.txt", "Build the app binary separately and place it here for this target, together with the WebView2Loader.dll for its architecture (vendored in the SDK under third_party/webview2/).\n");
     } else {
         try writeFile(dir, io, "bin/README.txt", "Build the app binary separately and place it here for this target.\n");
     }
@@ -932,6 +938,45 @@ fn zonStringAlloc(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
     }
     try out.append(allocator, '"');
     return out.toOwnedSlice(allocator);
+}
+
+/// The Windows system engine discovers the machine's WebView2 runtime
+/// through WebView2Loader.dll, which the host loads from the executable's
+/// directory — the vendored copy ships inside every packaged app. The
+/// architecture comes from the packaged binary's PE header so an arm64
+/// build gets the arm64 loader.
+fn copyWindowsWebView2Loader(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, options: PackageOptions, binary_path: []const u8) !void {
+    const framework_root = blk: {
+        if (options.env_map) |env_map| {
+            if (try buildgraph.resolveFrameworkRoot(allocator, io, env_map)) |root| break :blk root;
+        } else if (try buildgraph.frameworkRootFromExecutable(allocator, io)) |root| {
+            break :blk root;
+        }
+        return error.MissingFramework;
+    };
+    defer allocator.free(framework_root);
+    const arch_dir: []const u8 = if (try peExecutableIsArm64(io, binary_path)) "arm64" else "x64";
+    const loader_path = try std.fs.path.join(allocator, &.{ framework_root, "third_party", "webview2", arch_dir, "WebView2Loader.dll" });
+    defer allocator.free(loader_path);
+    try copyFileToDir(allocator, io, dir, loader_path, "bin/WebView2Loader.dll");
+}
+
+/// Whether a PE executable targets arm64, read from the COFF machine
+/// field. Anything unrecognized falls back to x64, the default Windows
+/// build target.
+fn peExecutableIsArm64(io: std.Io, path: []const u8) !bool {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var read_buffer: [4096]u8 = undefined;
+    var reader = file.reader(io, &read_buffer);
+    var header: [4096]u8 = undefined;
+    const len = try reader.interface.readSliceShort(&header);
+    if (len < 0x40 or header[0] != 'M' or header[1] != 'Z') return false;
+    const pe_offset: usize = std.mem.readInt(u32, header[0x3c..0x40], .little);
+    if (pe_offset + 6 > len) return false;
+    if (!std.mem.eql(u8, header[pe_offset..][0..4], "PE\x00\x00")) return false;
+    const machine = std.mem.readInt(u16, header[pe_offset + 4 ..][0..2], .little);
+    return machine == 0xaa64;
 }
 
 fn copyFileToDir(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, source_path: []const u8, dest_subpath: []const u8) !void {
