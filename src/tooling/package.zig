@@ -66,6 +66,13 @@ pub const PackageOptions = struct {
     assets_dir: []const u8 = "assets",
     frontend: ?manifest_tool.FrontendMetadata = null,
     web_engine: WebEngine = .system,
+    /// The `--web-layer` flag, when the caller passed one: beats app.zon's
+    /// `.webview_layer` the same way `-Dweb-layer` beats it in the build
+    /// graph. The standard build graphs always pass their RESOLVED layer
+    /// decision here (include|exclude), so a graph-driven package never
+    /// re-infers what the graph already compiled into the exe. Null means
+    /// the manifest field decides.
+    web_layer_setting: ?manifest_tool.WebViewLayerSetting = null,
     cef_dir: []const u8 = web_engine_tool.default_cef_dir,
     signing: SigningConfig = .{},
     archive: bool = false,
@@ -84,8 +91,30 @@ pub const PackageStats = struct {
     signing_mode: SigningMode = .none,
     asset_count: usize = 0,
     web_engine: WebEngine = .system,
+    web_layer: ?manifest_tool.WebLayer = null,
     archive_path: ?[]const u8 = null,
 };
+
+/// The web-layer verdict for a package, from the same declare-to-use
+/// inference the build graph runs — fed the RESOLVED engine
+/// (`--web-engine` orelse app.zon, resolved by the CLI before packaging)
+/// so a Chromium flag on a system manifest still ships the layer, and
+/// the RESOLVED layer setting (`--web-layer` orelse app.zon) so a
+/// flag-overridden exe is packaged under the decision it was built with.
+/// Metadata that cannot be inferred (invalid or contradictory
+/// `.webview_layer`) keeps the layer here — `createPackage` refuses
+/// those loudly up front, and the direct artifact helpers must not
+/// silently strip a layer on bad input.
+fn webLayerFor(options: PackageOptions) manifest_tool.WebLayer {
+    return manifest_tool.webLayerResolved(options.metadata, options.web_engine, options.web_layer_setting) catch .{ .enabled = true, .reason = .declared_include };
+}
+
+/// The verdict line's engine half: what web layer this artifact ships.
+fn webLayerEngineName(layer: manifest_tool.WebLayer, target: PackageTarget, web_engine: WebEngine) []const u8 {
+    if (!layer.enabled) return "none";
+    if (web_engine == .chromium) return "chromium";
+    return if (target == .windows) "webview2" else "system";
+}
 
 pub fn artifactName(buffer: []u8, metadata: manifest_tool.Metadata, target: PackageTarget, optimize: []const u8) ![]const u8 {
     return std.fmt.bufPrint(buffer, "{s}-{s}-{s}-{s}{s}", .{
@@ -98,6 +127,16 @@ pub fn artifactName(buffer: []u8, metadata: manifest_tool.Metadata, target: Pack
 }
 
 pub fn createPackage(allocator: std.mem.Allocator, io: std.Io, options: PackageOptions) !PackageStats {
+    // The package boundary of the reject-conflicts contract: an exclude
+    // (from `--web-layer` or app.zon) against declared web content — or
+    // against a resolved Chromium engine — never becomes an artifact.
+    _ = manifest_tool.webLayerResolved(options.metadata, options.web_engine, options.web_layer_setting) catch |err| {
+        switch (err) {
+            error.WebViewLayerConflict => std.debug.print("error: {s}\n", .{if (options.web_layer_setting == .exclude) manifest_tool.web_layer_flag_conflict_message else manifest_tool.web_layer_conflict_message}),
+            error.InvalidWebViewLayer => std.debug.print("error: app.zon webview_layer is invalid - expected \"auto\", \"include\", or \"exclude\"\n", .{}),
+        }
+        return err;
+    };
     try validateWebEngineTarget(options.target, options.web_engine);
     var stats = switch (options.target) {
         .macos => try createMacosApp(allocator, io, options),
@@ -132,6 +171,9 @@ pub fn printDiagnostic(stats: PackageStats) void {
         .message = std.fmt.bufPrint(&message_buffer, "created {s} artifact at {s}", .{ @tagName(stats.target), stats.path }) catch "created package",
     }, &writer) catch return;
     std.debug.print("{s}\n", .{writer.buffered()});
+    if (stats.web_layer) |layer| {
+        std.debug.print("  web layer: {s} ({s})\n", .{ webLayerEngineName(layer, stats.target, stats.web_engine), layer.sourceText() });
+    }
     if (stats.archive_path) |archive| {
         std.debug.print("  archive: {s}\n", .{archive});
     }
@@ -192,6 +234,7 @@ pub fn createMacosApp(allocator: std.mem.Allocator, io: std.Io, options: Package
         .signing_mode = options.signing.mode,
         .asset_count = bundle_stats.asset_count,
         .web_engine = options.web_engine,
+        .web_layer = webLayerFor(options),
     };
 }
 
@@ -209,14 +252,34 @@ fn createDesktopArtifact(allocator: std.mem.Allocator, io: std.Io, options: Pack
         try allocator.dupe(u8, options.metadata.name);
     defer allocator.free(executable_name);
 
+    // Native-only apps ship no WebView2 loader: their host was compiled
+    // without the embedded web layer, so the loader would be dead bytes
+    // pretending the app can spawn a webview.
+    const wants_webview2_loader = options.target == .windows and options.web_engine == .system and webLayerFor(options).enabled;
+    // The package-time half of the web-layer audit (the build-time half
+    // is tools/audit_web_layer.zig): a Windows exe that references
+    // WebView2Loader.dll was compiled WITH the embedded web layer, so
+    // packaging it loaderless ships an app whose every webview call
+    // fails at runtime. Refuse the mismatch and teach the fix — this
+    // catches exes built under an override the packaging decision never
+    // saw (a stale zig-out binary, a hand-supplied --binary).
+    if (options.target == .windows and !wants_webview2_loader) {
+        if (options.binary_path) |binary_path| {
+            if (try peReferencesWebView2Loader(allocator, io, binary_path)) {
+                std.debug.print("error: {s} references WebView2Loader.dll but this package ships no web layer, so its webviews would fail to spawn - the exe was built with the embedded web layer (for example `zig build -Dweb-layer=include`)\n" ++
+                    "  package with `--web-layer include`, or rebuild the binary to match the packaging decision\n", .{binary_path});
+                return error.WebViewLayerMismatch;
+            }
+        }
+    }
     if (options.binary_path) |binary_path| {
         const binary_subpath = try std.fmt.allocPrint(allocator, "bin/{s}", .{executable_name});
         defer allocator.free(binary_subpath);
         try copyFileToDir(allocator, io, dir, binary_path, binary_subpath);
-        if (options.target == .windows and options.web_engine == .system) {
+        if (wants_webview2_loader) {
             try copyWindowsWebView2Loader(allocator, io, dir, options, binary_path);
         }
-    } else if (options.target == .windows and options.web_engine == .system) {
+    } else if (wants_webview2_loader) {
         try writeFile(dir, io, "bin/README.txt", "Build the app binary separately and place it here for this target, together with the WebView2Loader.dll for its architecture (vendored in the SDK under third_party/webview2/).\n");
     } else {
         try writeFile(dir, io, "bin/README.txt", "Build the app binary separately and place it here for this target.\n");
@@ -258,7 +321,7 @@ fn createDesktopArtifact(allocator: std.mem.Allocator, io: std.Io, options: Pack
         try copyDesktopCefRuntime(allocator, io, dir, options.target, options.cef_dir);
     }
     try writeReport(allocator, dir, io, "package-manifest.zon", options, executable_name, bundle_stats.asset_count);
-    return .{ .path = options.output_path, .artifact_name = std.fs.path.basename(options.output_path), .target = options.target, .asset_count = bundle_stats.asset_count, .web_engine = options.web_engine };
+    return .{ .path = options.output_path, .artifact_name = std.fs.path.basename(options.output_path), .target = options.target, .asset_count = bundle_stats.asset_count, .web_engine = options.web_engine, .web_layer = webLayerFor(options) };
 }
 
 /// The iOS host tier: a COMPLETE Xcode project the user never edits —
@@ -330,7 +393,7 @@ fn createIosArtifact(allocator: std.mem.Allocator, io: std.Io, options: PackageO
     defer allocator.free(readme);
     try writeFile(dir, io, "README.md", readme);
     try writeReport(allocator, dir, io, "package-manifest.zon", options, "libnative-sdk.a", bundle_stats.asset_count);
-    return .{ .path = options.output_path, .artifact_name = std.fs.path.basename(options.output_path), .target = .ios, .asset_count = bundle_stats.asset_count, .web_engine = options.web_engine };
+    return .{ .path = options.output_path, .artifact_name = std.fs.path.basename(options.output_path), .target = .ios, .asset_count = bundle_stats.asset_count, .web_engine = options.web_engine, .web_layer = webLayerFor(options) };
 }
 
 fn iosProjectReadme(allocator: std.mem.Allocator, metadata: manifest_tool.Metadata) ![]const u8 {
@@ -397,7 +460,7 @@ fn createAndroidArtifact(allocator: std.mem.Allocator, io: std.Io, options: Pack
     if (try assembleAndroidApk(allocator, io, options)) |apk_name| {
         artifact_name = apk_name;
     }
-    return .{ .path = options.output_path, .artifact_name = artifact_name, .target = .android, .asset_count = bundle_stats.asset_count, .web_engine = options.web_engine };
+    return .{ .path = options.output_path, .artifact_name = artifact_name, .target = .android, .asset_count = bundle_stats.asset_count, .web_engine = options.web_engine, .web_layer = webLayerFor(options) };
 }
 
 /// Assemble the debug APK inside the generated project when the caller
@@ -961,6 +1024,30 @@ fn copyWindowsWebView2Loader(allocator: std.mem.Allocator, io: std.Io, dir: std.
     try copyFileToDir(allocator, io, dir, loader_path, "bin/WebView2Loader.dll");
 }
 
+/// Whether a Windows executable carries the embedded web layer: the host
+/// loads WebView2Loader.dll through LoadLibraryW, so the honest evidence
+/// is the loader's name in the binary — stored as UTF-16 in a web build
+/// and compiled out entirely (with the whole layer) in a native-only
+/// build. The same probe as the build-time auditor
+/// (tools/audit_web_layer.zig); a non-PE file proves nothing about the
+/// layer, so it scans as false rather than refusing the package.
+fn peReferencesWebView2Loader(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
+    const bytes = try readPath(allocator, io, path);
+    defer allocator.free(bytes);
+    if (bytes.len < 0x40 or bytes[0] != 'M' or bytes[1] != 'Z') return false;
+    const pe_offset: usize = std.mem.readInt(u32, bytes[0x3c..0x40], .little);
+    if (pe_offset + 4 > bytes.len) return false;
+    if (!std.mem.eql(u8, bytes[pe_offset..][0..4], "PE\x00\x00")) return false;
+    const needle_ascii = "WebView2Loader.dll";
+    var needle_wide: [needle_ascii.len * 2]u8 = undefined;
+    for (needle_ascii, 0..) |ch, index| {
+        needle_wide[index * 2] = ch;
+        needle_wide[index * 2 + 1] = 0;
+    }
+    return std.mem.indexOf(u8, bytes, &needle_wide) != null or
+        std.mem.indexOf(u8, bytes, needle_ascii) != null;
+}
+
 /// Whether a PE executable targets arm64, read from the COFF machine
 /// field. Anything unrecognized falls back to x64, the default Windows
 /// build target.
@@ -1021,6 +1108,15 @@ fn writeReport(allocator: std.mem.Allocator, dir: std.Io.Dir, io: std.Io, subpat
     defer allocator.free(optimize);
     const web_engine = try zonStringAlloc(allocator, @tagName(options.web_engine));
     defer allocator.free(web_engine);
+    // The web-layer verdict the artifact was staged under, in the same
+    // "engine (source)" shape the package diagnostic prints — e.g.
+    // "none (inferred: nothing in app.zon declares web use)" or
+    // "webview2 (declared: capabilities)".
+    const layer = webLayerFor(options);
+    const web_layer_value = try std.fmt.allocPrint(allocator, "{s} ({s})", .{ webLayerEngineName(layer, options.target, options.web_engine), layer.sourceText() });
+    defer allocator.free(web_layer_value);
+    const web_layer = try zonStringAlloc(allocator, web_layer_value);
+    defer allocator.free(web_layer);
     const signing = try zonStringAlloc(allocator, @tagName(options.signing.mode));
     defer allocator.free(signing);
     const report = try std.fmt.allocPrint(allocator,
@@ -1032,6 +1128,7 @@ fn writeReport(allocator: std.mem.Allocator, dir: std.Io.Dir, io: std.Io, subpat
         \\  .executable = {s},
         \\  .optimize = {s},
         \\  .web_engine = {s},
+        \\  .web_layer = {s},
         \\  .signing = {s},
         \\  .asset_count = {d},
         \\{s}
@@ -1048,6 +1145,7 @@ fn writeReport(allocator: std.mem.Allocator, dir: std.Io.Dir, io: std.Io, subpat
         executable,
         optimize,
         web_engine,
+        web_layer,
         signing,
         asset_count,
         frontend,
@@ -1715,7 +1813,6 @@ test "mobile package templates ship the toolkit hosts" {
     try std.testing.expect(std.mem.indexOf(u8, android_bridge, "WINDOW_FORMAT_RGBA_8888") != null);
 }
 
-
 test "mobile package artifacts use manifest identity metadata" {
     var cwd = std.Io.Dir.cwd();
     try cwd.deleteTree(std.testing.io, ".zig-cache/test-package-mobile-identity");
@@ -2150,6 +2247,278 @@ test "package report records target signing and assets" {
     const len = try file.readPositionalAll(std.testing.io, &buffer, 0);
     try std.testing.expect(std.mem.indexOf(u8, buffer[0..len], ".target = \"linux\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer[0..len], ".asset_count = 2") != null);
+}
+
+test "native-only windows package ships no WebView2 loader and reports web layer none" {
+    var cwd = std.Io.Dir.cwd();
+    const root = ".zig-cache/test-package-native-only-windows";
+    try cwd.deleteTree(std.testing.io, root);
+    defer cwd.deleteTree(std.testing.io, root) catch {};
+    try cwd.createDirPath(std.testing.io, root ++ "/assets");
+    try cwd.writeFile(std.testing.io, .{ .sub_path = root ++ "/app-binary", .data = "not a real exe" });
+
+    // A canvas app shape: gpu capabilities, no frontend, no webview.
+    const capabilities = [_][]const u8{ "native_views", "gpu_surfaces" };
+    const metadata: manifest_tool.Metadata = .{
+        .id = "dev.example.canvas",
+        .name = "canvas-demo",
+        .version = "1.0.0",
+        .capabilities = &capabilities,
+    };
+
+    const stats = try createPackage(std.testing.allocator, std.testing.io, .{
+        .metadata = metadata,
+        .target = .windows,
+        .output_path = root ++ "/demo-windows",
+        .binary_path = root ++ "/app-binary",
+        .assets_dir = root ++ "/assets",
+    });
+    try std.testing.expect(!stats.web_layer.?.enabled);
+
+    // No loader staged next to the binary.
+    var dir = try cwd.openDir(std.testing.io, root ++ "/demo-windows", .{});
+    defer dir.close(std.testing.io);
+    try std.testing.expectError(error.FileNotFound, dir.openFile(std.testing.io, "bin/WebView2Loader.dll", .{}));
+
+    // No frontend dist directory (native-only packages bundle plain assets).
+    try std.testing.expectError(error.FileNotFound, dir.openDir(std.testing.io, "resources/dist", .{}));
+
+    // The report carries the verdict.
+    const report = try readPath(std.testing.allocator, std.testing.io, root ++ "/demo-windows/package-manifest.zon");
+    defer std.testing.allocator.free(report);
+    try std.testing.expect(std.mem.indexOf(u8, report, ".web_layer = \"none (inferred: nothing in app.zon declares web use)\"") != null);
+}
+
+test "webview-declaring package reports the web layer as declared" {
+    var cwd = std.Io.Dir.cwd();
+    const root = ".zig-cache/test-package-web-layer-declared";
+    try cwd.deleteTree(std.testing.io, root);
+    defer cwd.deleteTree(std.testing.io, root) catch {};
+    try cwd.createDirPath(std.testing.io, root ++ "/assets");
+
+    const capabilities = [_][]const u8{ "webview", "js_bridge" };
+    const metadata: manifest_tool.Metadata = .{
+        .id = "dev.example.web",
+        .name = "web-demo",
+        .version = "1.0.0",
+        .capabilities = &capabilities,
+    };
+
+    // No binary: the loader copy is not exercised (it needs a framework
+    // root), but the report and stats still carry the declared verdict.
+    const stats = try createPackage(std.testing.allocator, std.testing.io, .{
+        .metadata = metadata,
+        .target = .windows,
+        .output_path = root ++ "/demo-windows",
+        .assets_dir = root ++ "/assets",
+    });
+    try std.testing.expect(stats.web_layer.?.enabled);
+    try std.testing.expectEqual(manifest_tool.WebLayerReason.capability, stats.web_layer.?.reason);
+
+    const report = try readPath(std.testing.allocator, std.testing.io, root ++ "/demo-windows/package-manifest.zon");
+    defer std.testing.allocator.free(report);
+    try std.testing.expect(std.mem.indexOf(u8, report, ".web_layer = \"webview2 (declared: capabilities)\"") != null);
+}
+
+test "package refuses a manifest that excludes the web layer while declaring web content" {
+    const capabilities = [_][]const u8{"webview"};
+    const metadata: manifest_tool.Metadata = .{
+        .id = "dev.example.conflict",
+        .name = "conflict-demo",
+        .version = "1.0.0",
+        .capabilities = &capabilities,
+        .webview_layer = "exclude",
+    };
+    try std.testing.expectError(error.WebViewLayerConflict, createPackage(std.testing.allocator, std.testing.io, .{
+        .metadata = metadata,
+        .target = .windows,
+        .output_path = ".zig-cache/test-package-web-layer-conflict",
+    }));
+}
+
+test "package web layer follows the resolved engine, not the raw manifest" {
+    var cwd = std.Io.Dir.cwd();
+    const root = ".zig-cache/test-package-web-layer-resolved-engine";
+    try cwd.deleteTree(std.testing.io, root);
+    defer cwd.deleteTree(std.testing.io, root) catch {};
+    try cwd.createDirPath(std.testing.io, root ++ "/assets");
+    try cwd.writeFile(std.testing.io, .{ .sub_path = root ++ "/assets/index.html", .data = "<h1>Web</h1>" });
+
+    // A system manifest with no web declarations, packaged with the
+    // engine the CLI resolved from `--web-engine chromium`: the layer
+    // ships, and the verdict names the engine as the cause.
+    const metadata: manifest_tool.Metadata = .{
+        .id = "dev.example.resolved",
+        .name = "resolved-demo",
+        .version = "1.0.0",
+    };
+    const stats = try createPackage(std.testing.allocator, std.testing.io, .{
+        .metadata = metadata,
+        .target = .ios,
+        .output_path = root ++ "/ios",
+        .assets_dir = root ++ "/assets",
+        .web_engine = .chromium,
+    });
+    try std.testing.expect(stats.web_layer.?.enabled);
+    try std.testing.expectEqual(manifest_tool.WebLayerReason.chromium_engine, stats.web_layer.?.reason);
+}
+
+test "package refuses an exclude against a resolved Chromium engine" {
+    // `.webview_layer = "exclude"` with `--web-engine chromium` is the
+    // same contradiction as exclude + a manifest web declaration: the
+    // package boundary rejects it exactly like build configure does.
+    const metadata: manifest_tool.Metadata = .{
+        .id = "dev.example.exclude-chromium",
+        .name = "exclude-chromium-demo",
+        .version = "1.0.0",
+        .webview_layer = "exclude",
+    };
+    try std.testing.expectError(error.WebViewLayerConflict, createPackage(std.testing.allocator, std.testing.io, .{
+        .metadata = metadata,
+        .target = .macos,
+        .output_path = ".zig-cache/test-package-web-layer-exclude-chromium",
+        .web_engine = .chromium,
+    }));
+}
+
+/// A minimal Windows executable for web-layer packaging tests: a valid
+/// PE header (so the loader-reference scan and the arch sniff both treat
+/// it as a real exe) followed by the UTF-16 loader name a web build
+/// carries. The COFF machine field stays zero, which the arch sniff
+/// reads as x64.
+fn testWebLayerPeBytes() [0x80 + "WebView2Loader.dll".len * 2]u8 {
+    var bytes = [_]u8{0} ** (0x80 + "WebView2Loader.dll".len * 2);
+    bytes[0] = 'M';
+    bytes[1] = 'Z';
+    std.mem.writeInt(u32, bytes[0x3c..0x40], 0x40, .little);
+    bytes[0x40] = 'P';
+    bytes[0x41] = 'E';
+    for ("WebView2Loader.dll", 0..) |ch, index| {
+        bytes[0x80 + index * 2] = ch;
+    }
+    return bytes;
+}
+
+test "package --web-layer include on a canvas manifest stages the loader and names the flag" {
+    var cwd = std.Io.Dir.cwd();
+    const root = ".zig-cache/test-package-web-layer-include-flag";
+    try cwd.deleteTree(std.testing.io, root);
+    defer cwd.deleteTree(std.testing.io, root) catch {};
+    try cwd.createDirPath(std.testing.io, root ++ "/assets");
+    // The exe a `zig build package -Dweb-layer=include` graph produces on
+    // a canvas manifest: a real PE that references the loader.
+    const exe_bytes = testWebLayerPeBytes();
+    try cwd.writeFile(std.testing.io, .{ .sub_path = root ++ "/app.exe", .data = &exe_bytes });
+
+    const capabilities = [_][]const u8{ "native_views", "gpu_surfaces" };
+    const metadata: manifest_tool.Metadata = .{
+        .id = "dev.example.canvas",
+        .name = "canvas-demo",
+        .version = "1.0.0",
+        .capabilities = &capabilities,
+    };
+
+    // The loader copy resolves the framework root from the environment.
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("NATIVE_SDK_PATH", ".");
+
+    const stats = try createPackage(std.testing.allocator, std.testing.io, .{
+        .metadata = metadata,
+        .target = .windows,
+        .output_path = root ++ "/demo-windows",
+        .binary_path = root ++ "/app.exe",
+        .assets_dir = root ++ "/assets",
+        .web_layer_setting = .include,
+        .env_map = &env_map,
+    });
+    try std.testing.expect(stats.web_layer.?.enabled);
+    try std.testing.expectEqual(manifest_tool.WebLayerReason.declared_include, stats.web_layer.?.reason);
+
+    // The loader is staged next to the binary, exactly like a manifest
+    // that declares web use.
+    var dir = try cwd.openDir(std.testing.io, root ++ "/demo-windows", .{});
+    defer dir.close(std.testing.io);
+    var loader = try dir.openFile(std.testing.io, "bin/WebView2Loader.dll", .{});
+    loader.close(std.testing.io);
+
+    // The report names the flag as the cause, not app.zon.
+    const report = try readPath(std.testing.allocator, std.testing.io, root ++ "/demo-windows/package-manifest.zon");
+    defer std.testing.allocator.free(report);
+    try std.testing.expect(std.mem.indexOf(u8, report, ".web_layer = \"webview2 (declared: --web-layer include)\"") != null);
+}
+
+test "package --web-layer exclude on a web manifest is the same refused conflict" {
+    const capabilities = [_][]const u8{"webview"};
+    const metadata: manifest_tool.Metadata = .{
+        .id = "dev.example.flag-conflict",
+        .name = "flag-conflict-demo",
+        .version = "1.0.0",
+        .capabilities = &capabilities,
+    };
+    try std.testing.expectError(error.WebViewLayerConflict, createPackage(std.testing.allocator, std.testing.io, .{
+        .metadata = metadata,
+        .target = .windows,
+        .output_path = ".zig-cache/test-package-web-layer-flag-conflict",
+        .web_layer_setting = .exclude,
+    }));
+}
+
+test "package forwarded include on a web manifest keeps the manifest's reason" {
+    var cwd = std.Io.Dir.cwd();
+    const root = ".zig-cache/test-package-web-layer-forwarded-include";
+    try cwd.deleteTree(std.testing.io, root);
+    defer cwd.deleteTree(std.testing.io, root) catch {};
+    try cwd.createDirPath(std.testing.io, root ++ "/assets");
+
+    // The build graphs forward `--web-layer include` for every web app;
+    // the verdict must keep reporting the manifest's own declaration, so
+    // graph-driven and hand-run packages read identically.
+    const capabilities = [_][]const u8{"webview"};
+    const metadata: manifest_tool.Metadata = .{
+        .id = "dev.example.forwarded",
+        .name = "forwarded-demo",
+        .version = "1.0.0",
+        .capabilities = &capabilities,
+    };
+    const stats = try createPackage(std.testing.allocator, std.testing.io, .{
+        .metadata = metadata,
+        .target = .windows,
+        .output_path = root ++ "/demo-windows",
+        .assets_dir = root ++ "/assets",
+        .web_layer_setting = .include,
+    });
+    try std.testing.expect(stats.web_layer.?.enabled);
+    try std.testing.expectEqual(manifest_tool.WebLayerReason.capability, stats.web_layer.?.reason);
+}
+
+test "package refuses to strip the loader from an exe that references it" {
+    var cwd = std.Io.Dir.cwd();
+    const root = ".zig-cache/test-package-web-layer-mismatch";
+    try cwd.deleteTree(std.testing.io, root);
+    defer cwd.deleteTree(std.testing.io, root) catch {};
+    try cwd.createDirPath(std.testing.io, root ++ "/assets");
+    const exe_bytes = testWebLayerPeBytes();
+    try cwd.writeFile(std.testing.io, .{ .sub_path = root ++ "/app.exe", .data = &exe_bytes });
+
+    // A loader-referencing exe (built with the web layer) packaged under
+    // a native-only decision would ship broken webviews: refused, with
+    // `--web-layer include` as the way out. Non-PE payloads (the other
+    // tests' fake binaries) prove nothing and stay packageable.
+    const capabilities = [_][]const u8{ "native_views", "gpu_surfaces" };
+    const metadata: manifest_tool.Metadata = .{
+        .id = "dev.example.mismatch",
+        .name = "mismatch-demo",
+        .version = "1.0.0",
+        .capabilities = &capabilities,
+    };
+    try std.testing.expectError(error.WebViewLayerMismatch, createPackage(std.testing.allocator, std.testing.io, .{
+        .metadata = metadata,
+        .target = .windows,
+        .output_path = root ++ "/demo-windows",
+        .binary_path = root ++ "/app.exe",
+        .assets_dir = root ++ "/assets",
+    }));
 }
 
 // ---------------------------------------------------------------------------

@@ -853,6 +853,12 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\    chromium,
         \\};
         \\
+        \\const WebLayerOption = enum {
+        \\    auto,
+        \\    include,
+        \\    exclude,
+        \\};
+        \\
         \\const PackageTarget = enum {
         \\    macos,
         \\    windows,
@@ -876,6 +882,7 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\    const automation_enabled = b.option(bool, "automation", "Enable Native SDK automation artifacts") orelse false;
         \\    const js_bridge_enabled = b.option(bool, "js-bridge", "Enable optional JavaScript bridge stubs") orelse false;
         \\    const web_engine_override = b.option(WebEngineOption, "web-engine", "Override app.zon web engine: system, chromium");
+        \\    const web_layer_override = b.option(WebLayerOption, "web-layer", "Override app.zon webview_layer: auto, include, exclude");
         \\    const cef_dir_override = b.option([]const u8, "cef-dir", "Override CEF root directory for Chromium builds");
         \\    const cef_auto_install_override = b.option(bool, "cef-auto-install", "Override app.zon CEF auto-install setting");
         \\    const package_target = b.option(PackageTarget, "package-target", "Package target: macos, windows, linux") orelse .macos;
@@ -894,13 +901,14 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\    if (selected_platform == .windows and target.result.os.tag != .windows) {
         \\        @panic("-Dplatform=windows requires a Windows target");
         \\    }
-        \\    const app_web_engine = appWebEngineConfig();
-        \\    const web_engine = web_engine_override orelse app_web_engine.web_engine;
-        \\    const cef_dir = cef_dir_override orelse defaultCefDir(selected_platform, app_web_engine.cef_dir);
-        \\    const cef_auto_install = cef_auto_install_override orelse app_web_engine.cef_auto_install;
+        \\    const app_config = appManifestBuildConfig(b);
+        \\    const web_engine = web_engine_override orelse app_config.web_engine;
+        \\    const cef_dir = cef_dir_override orelse defaultCefDir(selected_platform, app_config.cef_dir);
+        \\    const cef_auto_install = cef_auto_install_override orelse app_config.cef_auto_install;
         \\    if (web_engine == .chromium and selected_platform != .macos) {
         \\        @panic("-Dweb-engine=chromium currently requires -Dplatform=macos");
         \\    }
+        \\    const web_layer = resolveWebLayer(app_config, web_engine, web_layer_override);
         \\
         \\    const native_sdk_mod = nativeSdkModule(b, target, optimize, native_sdk_path);
         \\    const options = b.addOptions();
@@ -916,6 +924,7 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\    options.addOption(bool, "debug_overlay", debug_overlay);
         \\    options.addOption(bool, "automation", automation_enabled);
         \\    options.addOption(bool, "js_bridge", js_bridge_enabled);
+        \\    options.addOption(bool, "web_layer", web_layer);
         \\    const options_mod = options.createModule();
         \\
         \\    const runner_mod = localModule(b, target, optimize, "src/runner.zig");
@@ -930,7 +939,7 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\        .name = app_exe_name,
         \\        .root_module = app_mod,
         \\    });
-        \\    linkPlatform(b, target, app_mod, exe, selected_platform, web_engine, native_sdk_path, cef_dir, cef_auto_install);
+        \\    linkPlatform(b, target, app_mod, exe, selected_platform, web_engine, web_layer, native_sdk_path, cef_dir, cef_auto_install);
         \\    b.installArtifact(exe);
         \\
         \\    const frontend_install = b.addSystemCommand(&.{ "npm", "install", "--prefix", "frontend" });
@@ -945,13 +954,13 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\    const run = b.addRunArtifact(exe);
         \\    run.step.dependOn(&frontend_build.step);
         \\    addCefRuntimeRunFiles(b, target, run, exe, web_engine, cef_dir);
-        \\    addWebView2RuntimeRunFiles(b, target, run, web_engine, native_sdk_path);
+        \\    addWebView2RuntimeRunFiles(b, target, run, web_engine, web_layer, native_sdk_path);
         \\    const run_step = b.step("run", "Run the app");
         \\    run_step.dependOn(&run.step);
         \\
         \\    const dev = b.addSystemCommand(&.{ "native", "dev", "--manifest", "app.zon", "--binary" });
         \\    dev.addFileArg(exe.getEmittedBin());
-        \\    addWebView2RuntimeRunFiles(b, target, dev, web_engine, native_sdk_path);
+        \\    addWebView2RuntimeRunFiles(b, target, dev, web_engine, web_layer, native_sdk_path);
         \\    dev.step.dependOn(&exe.step);
         \\    dev.step.dependOn(&frontend_install.step);
         \\    const dev_step = b.step("dev", "Run the frontend dev server and native shell");
@@ -982,6 +991,13 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\    package.setEnvironmentVariable("NATIVE_SDK_PATH", b.pathFromRoot(native_sdk_path));
         \\    package.addFileArg(exe.getEmittedBin());
         \\    package.addArgs(&.{ "--web-engine", @tagName(web_engine), "--cef-dir", cef_dir });
+        \\    // Forward the RESOLVED web-layer decision, never the raw inputs:
+        \\    // this graph already decided web vs native-only for the exe it is
+        \\    // packaging (app.zon declarations plus -Dweb-layer/-Dweb-engine),
+        \\    // and the CLI re-inferring from app.zon alone would miss a
+        \\    // flag-driven override. Handing over the decision itself makes
+        \\    // exe/package agreement structural.
+        \\    package.addArgs(&.{ "--web-layer", if (web_layer) "include" else "exclude" });
         \\    if (cef_auto_install) package.addArg("--cef-auto-install");
         \\    package.step.dependOn(&exe.step);
         \\    package.step.dependOn(&frontend_build.step);
@@ -1074,7 +1090,7 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\    });
         \\}
         \\
-        \\fn linkPlatform(b: *std.Build, target: std.Build.ResolvedTarget, app_mod: *std.Build.Module, exe: *std.Build.Step.Compile, platform: PlatformOption, web_engine: WebEngineOption, native_sdk_path: []const u8, cef_dir: []const u8, cef_auto_install: bool) void {
+        \\fn linkPlatform(b: *std.Build, target: std.Build.ResolvedTarget, app_mod: *std.Build.Module, exe: *std.Build.Step.Compile, platform: PlatformOption, web_engine: WebEngineOption, web_layer: bool, native_sdk_path: []const u8, cef_dir: []const u8, cef_auto_install: bool) void {
         \\    if (platform == .macos) {
         \\        switch (web_engine) {
         \\            .system => {
@@ -1147,7 +1163,7 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\        if (web_engine == .chromium) app_mod.linkSystemLibrary("stdc++", .{});
         \\    } else if (platform == .windows) {
         \\        switch (web_engine) {
-        \\            .system => {
+        \\            .system => if (web_layer) {
         \\                // The vendored WebView2 SDK header (third_party/webview2)
         \\                // turns on the host's embedded-WebView layer; the host
         \\                // fails the compile by design if it cannot be found.
@@ -1159,6 +1175,16 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\                // touch it.
         \\                const loader = b.addInstallBinFile(nativeSdkPath(b, native_sdk_path, webView2LoaderSubPath(target)), "WebView2Loader.dll");
         \\                b.getInstallStep().dependOn(&loader.step);
+        \\            } else {
+        \\                // Native-only app (nothing in app.zon declares web use):
+        \\                // compile the host without the embedded-WebView layer.
+        \\                // The stub define excludes the layer outright — the host
+        \\                // honors it before probing for the WebView2 header, so
+        \\                // the layer stays out even on machines where the SDK
+        \\                // headers are reachable through the system include paths
+        \\                // — no WebView2Loader.dll is installed or path-wired,
+        \\                // and the executable carries no reference to it at all.
+        \\                app_mod.addCSourceFile(.{ .file = nativeSdkPath(b, native_sdk_path, "src/platform/windows/webview2_host.cpp"), .flags = &.{ "-std=c++17", "-DNATIVE_SDK_ALLOW_WEBVIEW2_STUB" } });
         \\            },
         \\            .chromium => {
         \\                const cef_check = addCefCheck(b, target, cef_dir);
@@ -1204,9 +1230,11 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\/// `zig build run` and `zig build dev` execute the cached artifact, which
         \\/// has no installed WebView2Loader.dll beside it; the vendored loader's
         \\/// directory goes on the step's PATH so the host's LoadLibrary resolves it
-        \\/// (`native dev` passes its environment on to the app it spawns).
-        \\fn addWebView2RuntimeRunFiles(b: *std.Build, target: std.Build.ResolvedTarget, run: *std.Build.Step.Run, web_engine: WebEngineOption, native_sdk_path: []const u8) void {
+        \\/// (`native dev` passes its environment on to the app it spawns). A
+        \\/// native-only build never loads the library, so its PATH stays clean.
+        \\fn addWebView2RuntimeRunFiles(b: *std.Build, target: std.Build.ResolvedTarget, run: *std.Build.Step.Run, web_engine: WebEngineOption, web_layer: bool, native_sdk_path: []const u8) void {
         \\    if (web_engine != .system) return;
+        \\    if (!web_layer) return;
         \\    if (target.result.os.tag != .windows) return;
         \\    const loader_dir = std.fs.path.dirname(webView2LoaderSubPath(target)).?;
         \\    run.addPathDir(b.pathFromRoot(b.pathJoin(&.{ native_sdk_path, loader_dir })));
@@ -1280,10 +1308,42 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\    };
         \\}
         \\
-        \\const AppWebEngineConfig = struct {
+        \\/// What this build graph reads out of app.zon: the web-engine/CEF
+        \\/// knobs and the web-layer inference inputs. An unreadable or
+        \\/// unparsable manifest falls back to the system engine WITH the web
+        \\/// layer kept — over-inclusion is a size cost, wrong exclusion is a
+        \\/// broken app.
+        \\const AppManifestBuildConfig = struct {
         \\    web_engine: WebEngineOption = .system,
         \\    cef_dir: []const u8 = "third_party/cef/macos",
         \\    cef_auto_install: bool = false,
+        \\    webview_layer: WebLayerOption = .auto,
+        \\    /// The first web declaration found (for teaching messages), or
+        \\    /// null when app.zon declares no web use. `web_engine = "system"`
+        \\    /// alone is NOT web intent — it is the default in many canvas
+        \\    /// manifests.
+        \\    web_declaration: ?[]const u8 = null,
+        \\};
+        \\
+        \\/// The lenient app.zon shape parsed for inference: only the fields
+        \\/// that decide the web layer and the web engine; everything else is
+        \\/// ignored. Full schema validation stays with `native validate`.
+        \\const InferenceManifest = struct {
+        \\    capabilities: []const []const u8 = &.{},
+        \\    web_engine: []const u8 = "system",
+        \\    webview_layer: []const u8 = "auto",
+        \\    cef: struct {
+        \\        dir: []const u8 = "third_party/cef/macos",
+        \\        auto_install: bool = false,
+        \\    } = .{},
+        \\    frontend: ?struct {} = null,
+        \\    shell: struct {
+        \\        windows: []const struct {
+        \\            views: []const struct {
+        \\                kind: []const u8 = "",
+        \\            } = &.{},
+        \\        } = &.{},
+        \\    } = .{},
         \\};
         \\
         \\fn defaultCefDir(platform: PlatformOption, configured: []const u8) []const u8 {
@@ -1295,17 +1355,62 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\    };
         \\}
         \\
-        \\fn appWebEngineConfig() AppWebEngineConfig {
-        \\    const source = @embedFile("app.zon");
-        \\    var config: AppWebEngineConfig = .{};
-        \\    if (stringField(source, ".web_engine")) |value| {
-        \\        config.web_engine = parseWebEngine(value) orelse .system;
-        \\    }
-        \\    if (objectSection(source, ".cef")) |cef| {
-        \\        if (stringField(cef, ".dir")) |value| config.cef_dir = value;
-        \\        if (boolField(cef, ".auto_install")) |value| config.cef_auto_install = value;
-        \\    }
+        \\fn appManifestBuildConfig(b: *std.Build) AppManifestBuildConfig {
+        \\    // The fallback for a manifest this lenient parse cannot read
+        \\    // keeps the web layer (see AppManifestBuildConfig): a shape
+        \\    // mismatch here is not proof the app declares no web use.
+        \\    const fallback: AppManifestBuildConfig = .{ .web_declaration = "an app.zon this build graph could not parse" };
+        \\    const source: [:0]const u8 = @embedFile("app.zon");
+        \\    @setEvalBranchQuota(2000);
+        \\    const raw = std.zon.parse.fromSliceAlloc(InferenceManifest, b.allocator, source, null, .{ .ignore_unknown_fields = true }) catch return fallback;
+        \\    var config: AppManifestBuildConfig = .{
+        \\        .web_engine = parseWebEngine(raw.web_engine) orelse .system,
+        \\        .cef_dir = raw.cef.dir,
+        \\        .cef_auto_install = raw.cef.auto_install,
+        \\        .webview_layer = parseWebLayer(raw.webview_layer) orelse @panic("app.zon .webview_layer must be \"auto\", \"include\", or \"exclude\""),
+        \\    };
+        \\    config.web_declaration = blk: {
+        \\        if (raw.frontend != null) break :blk "a .frontend block";
+        \\        for (raw.capabilities) |capability| {
+        \\            if (std.mem.eql(u8, capability, "webview")) break :blk "the \"webview\" capability";
+        \\        }
+        \\        for (raw.shell.windows) |window| {
+        \\            for (window.views) |view| {
+        \\                if (std.mem.eql(u8, view.kind, "webview")) break :blk "a .shell webview view";
+        \\            }
+        \\        }
+        \\        break :blk null;
+        \\    };
         \\    return config;
+        \\}
+        \\
+        \\/// The web-layer decision for this build — the same declare-to-use
+        \\/// contract the Native SDK's standard build graph, CLI, and runner
+        \\/// apply: an app is WEB when app.zon declares web use (a .frontend
+        \\/// block, the "webview" capability, a .shell webview view) or the
+        \\/// build resolves to the Chromium engine; otherwise it is
+        \\/// NATIVE-ONLY and the platform host compiles without the
+        \\/// embedded-WebView layer. `.webview_layer` (and `-Dweb-layer`)
+        \\/// override the inference — but an exclude that contradicts a web
+        \\/// declaration is a hard configure error, never a silently broken
+        \\/// app.
+        \\fn resolveWebLayer(config: AppManifestBuildConfig, web_engine: WebEngineOption, override: ?WebLayerOption) bool {
+        \\    const setting = override orelse config.webview_layer;
+        \\    const declaration: ?[]const u8 = config.web_declaration orelse
+        \\        (if (web_engine == .chromium) "the Chromium web engine" else null);
+        \\    return switch (setting) {
+        \\        .include => true,
+        \\        .auto => declaration != null,
+        \\        .exclude => {
+        \\            if (declaration) |reason| {
+        \\                std.debug.panic(
+        \\                    "the web layer is excluded ({s}) but the app declares web use ({s}); remove the exclude or drop the web declaration",
+        \\                    .{ if (override != null) "-Dweb-layer=exclude" else "app.zon .webview_layer = \"exclude\"", reason },
+        \\                );
+        \\            }
+        \\            return false;
+        \\        },
+        \\    };
         \\}
         \\
         \\fn parseWebEngine(value: []const u8) ?WebEngineOption {
@@ -1314,39 +1419,10 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\    return null;
         \\}
         \\
-        \\fn stringField(source: []const u8, field: []const u8) ?[]const u8 {
-        \\    const field_index = std.mem.indexOf(u8, source, field) orelse return null;
-        \\    const equals = std.mem.indexOfScalarPos(u8, source, field_index, '=') orelse return null;
-        \\    const start_quote = std.mem.indexOfScalarPos(u8, source, equals, '"') orelse return null;
-        \\    const end_quote = std.mem.indexOfScalarPos(u8, source, start_quote + 1, '"') orelse return null;
-        \\    return source[start_quote + 1 .. end_quote];
-        \\}
-        \\
-        \\fn objectSection(source: []const u8, field: []const u8) ?[]const u8 {
-        \\    const field_index = std.mem.indexOf(u8, source, field) orelse return null;
-        \\    const open = std.mem.indexOfScalarPos(u8, source, field_index, '{') orelse return null;
-        \\    var depth: usize = 0;
-        \\    var index = open;
-        \\    while (index < source.len) : (index += 1) {
-        \\        switch (source[index]) {
-        \\            '{' => depth += 1,
-        \\            '}' => {
-        \\                depth -= 1;
-        \\                if (depth == 0) return source[open + 1 .. index];
-        \\            },
-        \\            else => {},
-        \\        }
-        \\    }
-        \\    return null;
-        \\}
-        \\
-        \\fn boolField(source: []const u8, field: []const u8) ?bool {
-        \\    const field_index = std.mem.indexOf(u8, source, field) orelse return null;
-        \\    const equals = std.mem.indexOfScalarPos(u8, source, field_index, '=') orelse return null;
-        \\    var index = equals + 1;
-        \\    while (index < source.len and std.ascii.isWhitespace(source[index])) : (index += 1) {}
-        \\    if (std.mem.startsWith(u8, source[index..], "true")) return true;
-        \\    if (std.mem.startsWith(u8, source[index..], "false")) return false;
+        \\fn parseWebLayer(value: []const u8) ?WebLayerOption {
+        \\    if (std.mem.eql(u8, value, "auto")) return .auto;
+        \\    if (std.mem.eql(u8, value, "include")) return .include;
+        \\    if (std.mem.eql(u8, value, "exclude")) return .exclude;
         \\    return null;
         \\}
         \\
@@ -1516,6 +1592,7 @@ fn runnerZig() []const u8 {
     \\    fn appInfo(self: RunOptions, buffers: *StateBuffers) native_sdk.AppInfo {
     \\        var info: native_sdk.AppInfo = .{
     \\            .app_name = self.app_name,
+    \\            .has_web_content = manifestHasWebContent(),
     \\            .window_title = self.window_title,
     \\            .bundle_id = self.bundle_id,
     \\            .icon_path = self.icon_path,
@@ -1766,6 +1843,7 @@ fn runnerZig() []const u8 {
     \\        .builtin_bridge = options.builtin_bridge,
     \\        .security = options.security,
     \\        .js_window_api = options.js_window_api,
+    \\        .web_layer = webLayerEnabled(),
     \\        .commands = commands,
     \\        .menus = menus,
     \\        .shortcuts = shortcuts,
@@ -1815,6 +1893,7 @@ fn runnerZig() []const u8 {
     \\        .builtin_bridge = options.builtin_bridge,
     \\        .security = options.security,
     \\        .js_window_api = options.js_window_api,
+    \\        .web_layer = webLayerEnabled(),
     \\        .commands = commands,
     \\        .menus = menus,
     \\        .shortcuts = shortcuts,
@@ -1864,6 +1943,7 @@ fn runnerZig() []const u8 {
     \\        .builtin_bridge = options.builtin_bridge,
     \\        .security = options.security,
     \\        .js_window_api = options.js_window_api,
+    \\        .web_layer = webLayerEnabled(),
     \\        .commands = commands,
     \\        .menus = menus,
     \\        .shortcuts = shortcuts,
@@ -1913,6 +1993,7 @@ fn runnerZig() []const u8 {
     \\        .builtin_bridge = options.builtin_bridge,
     \\        .security = options.security,
     \\        .js_window_api = options.js_window_api,
+    \\        .web_layer = webLayerEnabled(),
     \\        .commands = commands,
     \\        .menus = menus,
     \\        .shortcuts = shortcuts,
@@ -1934,6 +2015,48 @@ fn runnerZig() []const u8 {
     \\fn webEngine() native_sdk.WebEngine {
     \\    if (comptime std.mem.eql(u8, build_options.web_engine, "chromium")) return .chromium;
     \\    return .system;
+    \\}
+    \\
+    \\/// Whether app.zon declares web content — the shared declare-to-use
+    \\/// contract (native_sdk.app_manifest.web_layer) over the comptime
+    \\/// manifest import: a .frontend block, the "webview" capability, a
+    \\/// .shell webview view, or .web_engine = "chromium". Hosts build
+    \\/// honest default menus from this — web items like Reload only exist
+    \\/// when a webview can answer them.
+    \\fn manifestHasWebContent() bool {
+    \\    return manifestWebDeclaration() != null;
+    \\}
+    \\
+    \\/// The first web declaration visible in app.zon, evaluated at
+    \\/// comptime. The engine input is the MANIFEST engine: the runner
+    \\/// never sees the -Dweb-engine flag, so an engine resolved to
+    \\/// Chromium by flag alone stays a configure-time error in build.zig,
+    \\/// which does see the flag.
+    \\fn manifestWebDeclaration() ?native_sdk.app_manifest.web_layer.Declaration {
+    \\    const engine: native_sdk.app_manifest.WebEngine = comptime blk: {
+    \\        if (!@hasField(@TypeOf(app_manifest), "web_engine")) break :blk .system;
+    \\        break :blk native_sdk.app_manifest.web_layer.parseWebEngine(app_manifest.web_engine) orelse .system;
+    \\    };
+    \\    return comptime native_sdk.app_manifest.web_layer.webDeclaration(app_manifest, engine);
+    \\}
+    \\
+    \\/// Whether this build ships the embedded web layer (build.zig's
+    \\/// -Dweb-layer inference); a build_options module that predates the
+    \\/// option keeps the layer — over-inclusion is safe.
+    \\fn webLayerEnabled() bool {
+    \\    if (comptime !@hasDecl(build_options, "web_layer")) return true;
+    \\    return build_options.web_layer;
+    \\}
+    \\
+    \\// A build that excludes the web layer while app.zon declares web use
+    \\// must fail at compile time: the declared webviews of a layerless
+    \\// host would otherwise only fail later, at runtime.
+    \\comptime {
+    \\    if (!webLayerEnabled()) {
+    \\        if (manifestWebDeclaration()) |declaration| {
+    \\            @compileError("this build excludes the web layer (-Dweb-layer=exclude) but app.zon declares web use (" ++ declaration.text() ++ "); remove the exclude or drop the web declaration");
+    \\        }
+    \\    }
     \\}
     \\
     \\const StateBuffers = struct {
@@ -2875,13 +2998,29 @@ test "writeDefaultApp emits Vite project files" {
     try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "frontend_build.step.dependOn(&frontend_install.step)") != null);
     try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "\"native\", \"dev\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "dev.step.dependOn(&frontend_install.step)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "addWebView2RuntimeRunFiles(b, target, dev, web_engine, native_sdk_path)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "addWebView2RuntimeRunFiles(b, target, dev, web_engine, web_layer, native_sdk_path)") != null);
     try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "package.setEnvironmentVariable(\"NATIVE_SDK_PATH\", b.pathFromRoot(native_sdk_path))") != null);
     try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "chromium") != null);
     try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "cef-dir") != null);
     try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "src/platform/macos/cef_host.mm") != null);
     try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "src/platform/linux/gtk_host.c") != null);
     try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "app_manifest_zon") != null);
+    // The generated graph carries the whole web-layer feature: the
+    // override option, the app.zon inference with its conflict panic,
+    // the option handed to the runner, and the conditional WebView2
+    // wiring (include + source + loader when web, stubbed host and no
+    // loader when native-only).
+    try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "b.option(WebLayerOption, \"web-layer\", \"Override app.zon webview_layer: auto, include, exclude\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "const web_layer = resolveWebLayer(app_config, web_engine, web_layer_override)") != null);
+    // The emitted package step forwards the graph's resolved decision so
+    // the packaged artifact structurally agrees with the compiled exe.
+    try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "package.addArgs(&.{ \"--web-layer\", if (web_layer) \"include\" else \"exclude\" })") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "options.addOption(bool, \"web_layer\", web_layer)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "std.zon.parse.fromSliceAlloc(InferenceManifest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "the web layer is excluded ({s}) but the app declares web use ({s})") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build_zig_text, ".system => if (web_layer) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "\"-DNATIVE_SDK_ALLOW_WEBVIEW2_STUB\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build_zig_text, "if (!web_layer) return;") != null);
     try std.testing.expect(std.mem.indexOf(u8, main_zig_text, "frontend/dist") != null);
     try std.testing.expect(std.mem.indexOf(u8, main_zig_text, "127.0.0.1:5173") != null);
     try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "@import(\"app_manifest_zon\")") != null);
@@ -2902,6 +3041,13 @@ test "writeDefaultApp emits Vite project files" {
     try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "defer std.heap.page_allocator.destroy(runtime)") != null);
     try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "native_sdk.Runtime.initAt(runtime, .{") != null);
     try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "Runtime.init(.{") == null);
+    // The generated runner consumes the same web-layer contract: the
+    // shared inference for honest menus, the build option threaded into
+    // every runtime init, and the comptime conflict guard.
+    try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, ".has_web_content = manifestHasWebContent()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "native_sdk.app_manifest.web_layer.webDeclaration(app_manifest, engine)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, ".web_layer = webLayerEnabled(),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "@compileError(\"this build excludes the web layer") != null);
     try std.testing.expect(std.mem.indexOf(u8, package_json_text, "\"vite\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, main_js_text, "window.zero") != null);
 

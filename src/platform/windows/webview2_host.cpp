@@ -27,20 +27,26 @@
 #include <thread>
 #include <vector>
 
-/* The WebView2 SDK header is vendored (third_party/webview2/include) and
- * every first-party build graph puts it on the include path, so a build
- * that cannot see it is misconfigured — fail it loudly instead of
- * shipping a host whose WebView loads report WebViewNotFound at runtime.
- * NATIVE_SDK_ALLOW_WEBVIEW2_STUB opts a hand-rolled build into the old
- * stubbed layer (canvas apps are unaffected by the stub). */
-#if __has_include(<WebView2.h>) && __has_include(<wrl.h>)
+/* NATIVE_SDK_ALLOW_WEBVIEW2_STUB is the build graph's declaration that
+ * this app uses no web layer, and it wins over header visibility: on a
+ * machine where the WebView2 SDK headers happen to be reachable through
+ * the system include paths, testing __has_include first would compile
+ * the full embedded-WebView layer into a native-only build and
+ * reintroduce the WebView2Loader.dll reference its executable must not
+ * carry (canvas apps are unaffected by the stub). Without the define the
+ * header is required: the WebView2 SDK is vendored
+ * (third_party/webview2/include) and every web-declaring build graph
+ * puts it on the include path, so a web build that cannot see it is
+ * misconfigured — fail it loudly instead of shipping a host whose
+ * WebView loads report WebViewNotFound at runtime. */
+#if defined(NATIVE_SDK_ALLOW_WEBVIEW2_STUB)
+#define NATIVE_SDK_HAS_WEBVIEW2 0
+#pragma message("Embedded WebView layer excluded by the build configuration: building the Windows host without it (canvas apps unaffected; WebView loads will report WebViewNotFound)")
+#elif __has_include(<WebView2.h>) && __has_include(<wrl.h>)
 #include <WebView2.h>
 #include <wrl.h>
 #define NATIVE_SDK_HAS_WEBVIEW2 1
 using Microsoft::WRL::ComPtr;
-#elif defined(NATIVE_SDK_ALLOW_WEBVIEW2_STUB)
-#define NATIVE_SDK_HAS_WEBVIEW2 0
-#pragma message("WebView2.h not found: building the Windows host without the embedded WebView layer (canvas apps unaffected; WebView loads will report WebViewNotFound)")
 #else
 #error "WebView2.h not found: add third_party/webview2/include to the include path, or define NATIVE_SDK_ALLOW_WEBVIEW2_STUB to build without the embedded WebView layer"
 #endif

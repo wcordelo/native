@@ -2,6 +2,10 @@ const std = @import("std");
 const types = @import("types.zig");
 const validation = @import("validation.zig");
 
+/// The web-layer inference contract: the one declare-to-use definition
+/// every boundary (build graph, CLI tooling, app runner) consumes.
+pub const web_layer = @import("web_layer.zig");
+
 pub const ValidationError = types.ValidationError;
 pub const max_shortcuts = types.max_shortcuts;
 pub const max_shortcut_id_bytes = types.max_shortcut_id_bytes;
@@ -27,6 +31,7 @@ pub const max_url_schemes = types.max_url_schemes;
 pub const Platform = types.Platform;
 pub const PackageKind = types.PackageKind;
 pub const WebEngine = types.WebEngine;
+pub const WebViewLayer = types.WebViewLayer;
 pub const CefConfig = types.CefConfig;
 pub const IconPurpose = types.IconPurpose;
 pub const PermissionKind = types.PermissionKind;
@@ -87,6 +92,8 @@ pub const validateFileAssociations = validation.validateFileAssociations;
 pub const validateUrlSchemes = validation.validateUrlSchemes;
 pub const validateShortcutsForPlatforms = validation.validateShortcutsForPlatforms;
 pub const validateCefConfig = validation.validateCefConfig;
+pub const validateWebViewLayer = validation.validateWebViewLayer;
+pub const manifestDeclaresWebContent = validation.manifestDeclaresWebContent;
 pub const AppIdMode = validation.AppIdMode;
 pub const validateAppId = validation.validateAppId;
 pub const validateName = validation.validateName;
@@ -106,4 +113,5 @@ pub const versionString = validation.versionString;
 test {
     std.testing.refAllDecls(@This());
     _ = @import("tests.zig");
+    _ = @import("web_layer.zig");
 }
