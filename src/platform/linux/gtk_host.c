@@ -24,8 +24,17 @@
  * NATIVE_SDK_ALLOW_WEBVIEW2_STUB. */
 #if defined(NATIVE_SDK_ALLOW_WEBKITGTK_STUB)
 #define NATIVE_SDK_HAS_WEBKITGTK 0
-#pragma message("Embedded web layer excluded by the build configuration: building the GTK host without WebKitGTK (canvas apps unaffected; WebView loads will report WebViewNotFound)")
-/* The stubbed web layer keeps the window/webview bookkeeping SHAPE so
+/* Deliberately NO compiler diagnostic in this branch — not even an
+ * informational #pragma message. The stub is the expected, configured
+ * state of every native-only Linux build, and zig renders every clang
+ * diagnostic of a failing translation unit as `error:` (its serialized
+ * clang diagnostics carry no severity into the error bundle), so an
+ * informational note here masquerades as the build-killing error the
+ * moment any unrelated real error appears anywhere in this file. The
+ * teaching lives where it is actionable instead: a stubbed host
+ * reports WebViewNotFound the moment an app actually uses a WebView.
+ *
+ * The stubbed web layer keeps the window/webview bookkeeping SHAPE so
  * every GTK-only path (overlay reordering, focus lookups, window
  * teardown) compiles unchanged: the web-view pointers below are opaque
  * and permanently NULL — every path that could create one is compiled
@@ -41,6 +50,18 @@ typedef struct native_sdk_absent_content_manager WebKitUserContentManager;
 #define NATIVE_SDK_HAS_WEBKITGTK 1
 #else
 #error "webkit/webkit.h not found: install the WebKitGTK 6.0 development package (libwebkitgtk-6.0-dev on Debian/Ubuntu), or define NATIVE_SDK_ALLOW_WEBKITGTK_STUB to build without the embedded web layer"
+#endif
+
+/* G_APPLICATION_DEFAULT_FLAGS arrived in GLib 2.74 as the
+ * non-deprecated spelling of "no flags". This host's GTK floor is 4.10
+ * (the GtkFileDialog family below), and GTK 4.10's own GLib floor is
+ * 2.72 — distros that backport GTK 4.10 onto a GLib 2.72 base (Ubuntu
+ * 22.04 derivatives) must still compile this file. Same value, gated to
+ * older GLib only; the pre-2.74 name G_APPLICATION_FLAGS_NONE is not
+ * used because it is deprecated from 2.74 on and would emit a warning
+ * exactly where the newer name exists. */
+#if !GLIB_CHECK_VERSION(2, 74, 0)
+#define G_APPLICATION_DEFAULT_FLAGS ((GApplicationFlags) 0)
 #endif
 
 #define NATIVE_SDK_MAX_WINDOWS 16
