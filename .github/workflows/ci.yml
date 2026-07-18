@@ -190,6 +190,35 @@ jobs:
       - name: Build and drive ui-inbox headless
         run: .github/scripts/linux-canvas-smoke.sh
 
+  linux-dev-smoke:
+    name: Linux Dev Smoke (Debug scaffold)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # The scaffold default is the TypeScript core; its transpiler runs
+      # under node at build time from this checkout's packages/core.
+      - run: npm ci --prefix packages/core
+      # No WebKitGTK dev package, same as linux-canvas-smoke: the scaffold
+      # declares no web use, so its host compiles with the stub seam.
+      - name: Install GTK and Xvfb
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev xvfb
+      # The Debug half of the Linux runtime story: linux-canvas-smoke runs
+      # at the graph's release default, and Release always uses the LLVM
+      # backend — a Debug-only x86_64 codegen fault (self-hosted backend,
+      # the mode every fresh `native init` + `native dev` builds) stays
+      # invisible to it. This job scaffolds the default template with the
+      # CLI, builds it -Doptimize=Debug with automation, runs it under
+      # Xvfb, and requires the startup scene to come up (ready=true,
+      # gpu_nonblank=true, template widgets in the snapshot).
+      - name: Scaffold and drive the Debug template headless
+        run: .github/scripts/linux-dev-smoke.sh
+
   windows-canvas-smoke:
     name: Windows Canvas Smoke (Wine)
     runs-on: ubuntu-latest
