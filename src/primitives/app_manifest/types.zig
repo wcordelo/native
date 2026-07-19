@@ -310,6 +310,31 @@ pub const WindowTitlebarStyle = enum {
     chromeless,
 };
 
+/// What the window's CLOSE affordance (the red traffic light, cmd+W,
+/// the caption X) does. `.quit` is the classic document-app default:
+/// the window really closes, and closing the last one follows the
+/// host's exit semantics — behavior unchanged for every app that never
+/// declares the field.
+///
+/// `.hide` is the menu-bar/tray-app shape: the close affordance hides
+/// the window (it stays alive with its views, `WindowState.hidden`
+/// flips true) and the app keeps running behind its status item — a
+/// tray action's `Effects.showWindow`, or the macOS Dock reopen,
+/// brings it back. Supported where the host can re-show a hidden
+/// window (macOS, Windows); platforms without that affordance refuse
+/// the declaration loudly at create time rather than stranding a
+/// hidden window.
+///
+/// Room is deliberately left for a future `.event` tier — the model
+/// receives the close request as a Msg and owns the consequence
+/// (unsaved-changes prompts) — which is NOT implemented yet;
+/// model-declared secondary windows already have that shape today via
+/// `WindowDescriptor.on_close`.
+pub const WindowClosePolicy = enum {
+    quit,
+    hide,
+};
+
 pub const Window = struct {
     label: []const u8 = "main",
     title: ?[]const u8 = null,
@@ -329,6 +354,8 @@ pub const Window = struct {
     /// layout clamping/clipping panes below it. 0 = no floor.
     min_width: f32 = 0,
     min_height: f32 = 0,
+    /// What the user's close affordance does — see `WindowClosePolicy`.
+    close_policy: WindowClosePolicy = .quit,
 };
 
 pub const ViewKind = enum {
@@ -459,6 +486,11 @@ pub const ShellWindow = struct {
     /// runtime-created windows apply their own declaration at create.
     min_width: f32 = 0,
     min_height: f32 = 0,
+    /// What the user's close affordance does — see `WindowClosePolicy`.
+    /// Like `titlebar`, close handling is host window state: the
+    /// STARTUP window threads it through the host create, and
+    /// runtime-created windows apply their own declaration at create.
+    close_policy: WindowClosePolicy = .quit,
     views: []const ShellView = &.{},
 };
 

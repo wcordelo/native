@@ -9,6 +9,7 @@ pub const Error = error{
     CreateFailed,
     FocusFailed,
     CloseFailed,
+    UnsupportedWindowClosePolicy,
 };
 
 const WindowsHost = opaque {};
@@ -45,6 +46,9 @@ const WindowsEvent = extern struct {
     y: f64,
     open: c_int,
     focused: c_int,
+    /// Nonzero while the window is alive but hidden by its close_policy
+    /// (`open` stays 1 for the whole hidden stretch).
+    hidden: c_int,
     label: [*]const u8,
     label_len: usize,
     title: [*]const u8,
@@ -134,6 +138,8 @@ extern fn native_sdk_windows_cancel_timer(host: *WindowsHost, timer_id: u64) voi
 extern fn native_sdk_windows_focus_window(host: *WindowsHost, window_id: u64) c_int;
 extern fn native_sdk_windows_close_window(host: *WindowsHost, window_id: u64) c_int;
 extern fn native_sdk_windows_minimize_window(host: *WindowsHost, window_id: u64) c_int;
+extern fn native_sdk_windows_show_window(host: *WindowsHost, window_id: u64) c_int;
+extern fn native_sdk_windows_set_window_close_policy(host: *WindowsHost, window_id: u64, close_policy: c_int) c_int;
 extern fn native_sdk_windows_create_view(host: *WindowsHost, window_id: u64, label: [*]const u8, label_len: usize, kind: c_int, parent: [*]const u8, parent_len: usize, x: f64, y: f64, width: f64, height: f64, layer: c_int, visible: c_int, enabled: c_int, role: [*]const u8, role_len: usize, accessibility_label: [*]const u8, accessibility_label_len: usize, text: [*]const u8, text_len: usize, command: [*]const u8, command_len: usize) c_int;
 extern fn native_sdk_windows_update_view(host: *WindowsHost, window_id: u64, label: [*]const u8, label_len: usize, has_frame: c_int, x: f64, y: f64, width: f64, height: f64, has_layer: c_int, layer: c_int, has_visible: c_int, visible: c_int, has_enabled: c_int, enabled: c_int, has_role: c_int, role: [*]const u8, role_len: usize, has_accessibility_label: c_int, accessibility_label: [*]const u8, accessibility_label_len: usize, has_text: c_int, text: [*]const u8, text_len: usize, has_command: c_int, command: [*]const u8, command_len: usize) c_int;
 extern fn native_sdk_windows_set_view_frame(host: *WindowsHost, window_id: u64, label: [*]const u8, label_len: usize, x: f64, y: f64, width: f64, height: f64) c_int;
@@ -219,6 +225,23 @@ const WindowsMessageDialogOpts = extern struct {
     tertiary_button_len: usize,
 };
 
+/// The startup-window twin of the runtime's create-time `.hide` gate:
+/// on windows, hide-on-close is honest only when the app declares a
+/// tray (status item) — SW_HIDE removes the taskbar entry and windows
+/// has no dock-reopen path, so without a tray a hidden window is a
+/// running, invisible, unreachable app. The generated runner refuses
+/// the declaration at comptime, the runtime refuses secondary windows
+/// at create (through the conditional `window_hide_on_close` answer
+/// below), and this refuses the platform-created main window at init.
+/// Pure (no Win32 externs), so the refusal is unit-testable on every
+/// host.
+fn refuseUnsupportedMainWindowClosePolicy(app_info: platform_mod.AppInfo) Error!void {
+    if (app_info.resolvedMainWindow().close_policy != .hide) return;
+    if (app_info.declares_tray) return;
+    std.debug.print("window close_policy \"hide\" on windows requires the \"tray\" capability: hiding removes the taskbar entry and windows has no dock-reopen path, so only a status item (tray) could bring the hidden window back - add \"tray\" to .capabilities and install a status item, or declare \"quit\" (the default)\n", .{});
+    return error.UnsupportedWindowClosePolicy;
+}
+
 pub const WindowsPlatform = struct {
     host: *WindowsHost,
     web_engine: platform_mod.WebEngine,
@@ -236,9 +259,21 @@ pub const WindowsPlatform = struct {
 
     pub fn initWithOptions(size: geometry.SizeF, web_engine: platform_mod.WebEngine, app_info: platform_mod.AppInfo) Error!WindowsPlatform {
         const window_options = app_info.resolvedMainWindow();
+        // The MAIN window is created right here, before any runtime
+        // exists, so the runtime's create-time `.hide` gate (the
+        // window_hide_on_close feature check) never sees it — the same
+        // seam the GTK host holds for its unconditional refusal. On
+        // windows the refusal is conditional: hiding removes the
+        // taskbar entry and windows has no dock-reopen path, so a
+        // declared tray (status item) is the ONLY re-show affordance.
+        try refuseUnsupportedMainWindowClosePolicy(app_info);
         const window_title = window_options.resolvedTitle(app_info.app_name);
         const frame = window_options.default_frame;
         const host = native_sdk_windows_create(app_info.app_name.ptr, app_info.app_name.len, window_title.ptr, window_title.len, app_info.bundle_id.ptr, app_info.bundle_id.len, app_info.icon_path.ptr, app_info.icon_path.len, window_options.label.ptr, window_options.label.len, frame.x, frame.y, frame.width, frame.height, if (window_options.restore_state) 1 else 0, if (window_options.resizable) 1 else 0, titlebarStyleInt(window_options.titlebar), minSizeFloor(window_options.min_width), minSizeFloor(window_options.min_height)) orelse return error.CreateFailed;
+        // The manifest's declared close policy rides right after the
+        // create, like the min-size floor: close handling is host
+        // window state fixed for the window's life.
+        applyWindowClosePolicy(host, window_options.id, window_options.close_policy);
         return .{
             .host = host,
             .web_engine = web_engine,
@@ -277,6 +312,8 @@ pub const WindowsPlatform = struct {
                 .focus_window_fn = focusWindow,
                 .close_window_fn = closeWindow,
                 .minimize_window_fn = minimizeWindow,
+                .show_window_fn = showWindow,
+                .quit_app_fn = quitApp,
                 .start_window_drag_fn = startWindowDrag,
                 .set_window_drag_regions_fn = setWindowDragRegions,
                 .window_chrome_fn = windowChrome,
@@ -354,6 +391,14 @@ pub const WindowsPlatform = struct {
             .audio_playback,
             .audio_streaming,
             => self.web_engine == .system,
+            // close_policy .hide: WM_CLOSE hides (ShowWindow SW_HIDE),
+            // the window stays in the host map, and the tray is the
+            // ONLY re-show affordance — SW_HIDE removes the taskbar
+            // entry and windows has no dock-reopen path. An app that
+            // declares no tray gets an honest false, so the runtime's
+            // create-time gates refuse a `.hide` declaration instead of
+            // stranding a hidden window nothing could re-show.
+            .window_hide_on_close => self.web_engine == .system and self.app_info.declares_tray,
             // Spectrum analysis captures the app's OWN audio session
             // through process-scoped WASAPI loopback, which the OS grew
             // in Windows 10 2004 — the host probes the activation
@@ -454,6 +499,7 @@ fn windowsCallback(context: ?*anyopaque, event: *const WindowsEvent) callconv(.c
                 .scale_factor = @floatCast(event.scale),
                 .open = event.open != 0,
                 .focused = event.focused != 0,
+                .hidden = event.hidden != 0,
             } });
         },
         .shortcut => state.emit(.{ .shortcut = .{
@@ -690,6 +736,20 @@ fn titlebarStyleInt(style: platform_mod.WindowTitlebarStyle) c_int {
 
 /// Zero/negative/non-finite floors are the "no floor" sentinel (the
 /// host leaves that axis at its natural minimum).
+fn closePolicyInt(policy: platform_mod.WindowClosePolicy) c_int {
+    return switch (policy) {
+        .quit => 0,
+        .hide => 1,
+    };
+}
+
+/// Register a window's declared close policy with the host right after
+/// create. `.quit` skips the call — it IS the host default.
+fn applyWindowClosePolicy(host: *WindowsHost, window_id: u64, policy: platform_mod.WindowClosePolicy) void {
+    if (policy == .quit) return;
+    _ = native_sdk_windows_set_window_close_policy(host, window_id, closePolicyInt(policy));
+}
+
 fn minSizeFloor(value: f32) f64 {
     return if (std.math.isFinite(value) and value > 0) value else 0;
 }
@@ -699,6 +759,7 @@ fn createWindow(context: ?*anyopaque, options: platform_mod.WindowOptions) anyer
     const title = options.resolvedTitle(self.app_info.app_name);
     const frame = options.default_frame;
     if (native_sdk_windows_create_window(self.host, options.id, title.ptr, title.len, options.label.ptr, options.label.len, frame.x, frame.y, frame.width, frame.height, if (options.restore_state) 1 else 0, if (options.resizable) 1 else 0, titlebarStyleInt(options.titlebar), minSizeFloor(options.min_width), minSizeFloor(options.min_height)) == 0) return error.CreateFailed;
+    applyWindowClosePolicy(self.host, options.id, options.close_policy);
     return .{
         .id = options.id,
         .label = options.label,
@@ -723,6 +784,19 @@ fn closeWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!
 fn minimizeWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!void {
     const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
     if (native_sdk_windows_minimize_window(self.host, window_id) == 0) return error.WindowNotFound;
+}
+
+fn showWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!void {
+    const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
+    if (native_sdk_windows_show_window(self.host, window_id) == 0) return error.WindowNotFound;
+}
+
+/// The graceful quit: stop the message loop the same way the last
+/// window's WM_DESTROY does (PostQuitMessage); the run loop's exit
+/// emits the same shutdown event.
+fn quitApp(context: ?*anyopaque) anyerror!void {
+    const self: *WindowsPlatform = @ptrCast(@alignCast(context.?));
+    native_sdk_windows_stop(self.host);
 }
 
 fn startWindowDrag(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!void {
@@ -1448,6 +1522,57 @@ test "windows chromium reports unsupported native surfaces" {
     try std.testing.expect(!WindowsPlatform.supportsFeature(&chromium, .gpu_surfaces));
     try std.testing.expect(!WindowsPlatform.supportsFeature(&chromium, .audio_playback));
     try std.testing.expect(!WindowsPlatform.supportsFeature(&chromium, .audio_streaming));
+}
+
+test "windows hide-on-close support requires the declared tray (the only re-show affordance)" {
+    // A system-engine host with a declared tray keeps hide-on-close.
+    var with_tray = testPlatformWithEngine(.system);
+    with_tray.app_info.declares_tray = true;
+    try std.testing.expect(WindowsPlatform.supportsFeature(&with_tray, .window_hide_on_close));
+    // Without the declaration the answer is an honest false: SW_HIDE
+    // removes the taskbar entry and windows has no dock-reopen path, so
+    // the runtime's create-time gates must refuse a `.hide` declaration
+    // instead of stranding a hidden window nothing could re-show.
+    var without_tray = testPlatformWithEngine(.system);
+    try std.testing.expect(!WindowsPlatform.supportsFeature(&without_tray, .window_hide_on_close));
+    // The chromium engine answers false regardless, tray or not.
+    var chromium = testPlatformWithEngine(.chromium);
+    chromium.app_info.declares_tray = true;
+    try std.testing.expect(!WindowsPlatform.supportsFeature(&chromium, .window_hide_on_close));
+}
+
+test "windows refuses a tray-less .hide main window at platform init instead of stranding it hidden" {
+    // The pre-created MAIN window never passes through the runtime's
+    // create gate, so the platform's init gate must hold the same line
+    // (the GTK host's init refusal is the unconditional twin).
+    const hide_no_tray: platform_mod.AppInfo = .{ .app_name = "player", .main_window = .{ .close_policy = .hide } };
+    try std.testing.expectError(error.UnsupportedWindowClosePolicy, refuseUnsupportedMainWindowClosePolicy(hide_no_tray));
+    // The declared tray is the re-show affordance: with it, the same
+    // declaration passes.
+    const hide_with_tray: platform_mod.AppInfo = .{ .app_name = "player", .declares_tray = true, .main_window = .{ .close_policy = .hide } };
+    try refuseUnsupportedMainWindowClosePolicy(hide_with_tray);
+    // The default (.quit) never consults the tray.
+    const quit_app: platform_mod.AppInfo = .{ .app_name = "player" };
+    try refuseUnsupportedMainWindowClosePolicy(quit_app);
+}
+
+test "windows WM_CLOSE hide consults the live tray state and downgrades to a real close without it" {
+    // The downgrade branch is C++ this test suite cannot execute, so
+    // this pins the tray-alive consult and the loud downgrade line
+    // textually: a refactor that drops either fails here. Compilation
+    // is covered by the cross-target syntax checks the packaging path
+    // runs; live close behavior stays windows-host territory.
+    const host_source = @embedFile("webview2_host.cpp");
+    const close_at = std.mem.indexOf(u8, host_source, "case WM_CLOSE:");
+    try std.testing.expect(close_at != null);
+    const close_hook = host_source[close_at.?..];
+    const consult_at = std.mem.indexOf(u8, close_hook, "if (!host->tray_active)");
+    const hide_at = std.mem.indexOf(u8, close_hook, "ShowWindow(hwnd, SW_HIDE);");
+    try std.testing.expect(consult_at != null);
+    try std.testing.expect(hide_at != null);
+    // The consult sits INSIDE the close hook, BEFORE the hide.
+    try std.testing.expect(consult_at.? < hide_at.?);
+    try std.testing.expect(std.mem.indexOf(u8, close_hook, "downgraded to a real close") != null);
 }
 
 test "windows audio event maps kinds and payload" {

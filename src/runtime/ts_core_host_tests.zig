@@ -145,6 +145,8 @@ const mini_core = struct {
         drop_save, // 40: cancel "save" (silent write_file drop)
         drop_get, // 41: cancel "get" (silent fetch drop)
         drop_paste, // 42: cancel "paste" (silent clip_read drop)
+        open_win, // 43: window_show "player" (the tray Open consequence)
+        quit_app, // 44: quit_app (the tray Quit consequence)
     };
 
     pub const InitResult = struct { model: *const Model, cmd: []const u8 };
@@ -322,6 +324,8 @@ const mini_core = struct {
             .drop_save => return .{ .model = model, .cmd = cmdCancel("save") },
             .drop_get => return .{ .model = model, .cmd = cmdCancel("get") },
             .drop_paste => return .{ .model = model, .cmd = cmdCancel("paste") },
+            .open_win => return .{ .model = model, .cmd = cmdWindowShow("player") },
+            .quit_app => return .{ .model = model, .cmd = cmdQuitApp() },
         }
     }
 
@@ -521,6 +525,20 @@ const mini_core = struct {
         @memcpy(out[2..][0..key.len], key);
         out[2 + key.len] = verb;
         std.mem.writeInt(u64, out[2 + key.len + 1 ..][0..8], @bitCast(value), .little);
+        return out;
+    }
+
+    fn cmdWindowShow(label: []const u8) []const u8 {
+        const out = rt.frameAlloc(u8, 2 + label.len);
+        out[0] = 0x10;
+        out[1] = @intCast(label.len);
+        @memcpy(out[2..][0..label.len], label);
+        return out;
+    }
+
+    fn cmdQuitApp() []const u8 {
+        const out = rt.frameAlloc(u8, 1);
+        out[0] = 0x11;
         return out;
     }
 
@@ -1405,4 +1423,27 @@ test "a URL audio_play with no cache path derives the content-addressed path whe
     // fills the empty field.
     Host.dispatch(fx, .play_stream);
     try std.testing.expectEqualStrings("cache/a.mp3", fx.pendingAudio().?.cache_path);
+}
+
+test "window verbs bridge to the effects channel's label-addressed verbs" {
+    const fx = freshChannel();
+    defer fx.deinit();
+    Host.init(fx);
+    const boot_pending = fx.pendingHostCount();
+
+    // window_show decodes onto fx.showWindow: under the fake executor
+    // the mirror records the request — count and label — exactly the
+    // Zig tier's contract, so replay and hermetic tests see the same
+    // observable.
+    Host.dispatch(fx, .open_win);
+    try std.testing.expectEqual(@as(u32, 1), fx.windowActionState().show_count);
+    try std.testing.expectEqualStrings("player", fx.windowActionState().lastLabel());
+
+    // quit_app decodes onto fx.quitApp — the graceful terminate request.
+    Host.dispatch(fx, .quit_app);
+    try std.testing.expectEqual(@as(u32, 1), fx.windowActionState().quit_count);
+
+    // Fire-and-forget: neither verb parked a keyed effect or dispatched
+    // a result Msg of its own — only init's boot request is pending.
+    try std.testing.expectEqual(boot_pending, fx.pendingHostCount());
 }

@@ -193,6 +193,10 @@ struct WindowsEvent {
     double y;
     int open;
     int focused;
+    /* kWindowFrame: nonzero while the window is alive but hidden by its
+     * close_policy (.hide intercepted WM_CLOSE). open stays 1 for the
+     * window's whole hidden stretch. */
+    int hidden;
     const char *label;
     size_t label_len;
     const char *title;
@@ -315,6 +319,14 @@ struct Window {
      * behind the button cluster matches the app's header). */
     COLORREF hidden_caption_color = 0;
     bool hidden_caption_color_set = false;
+    /* close_policy: 0 = quit (WM_CLOSE destroys; the default), 1 = hide
+     * (WM_CLOSE hides — SW_HIDE — and the app keeps running behind its
+     * tray icon, the Win32 tray-player shape). Applied right after
+     * create via native_sdk_windows_set_window_close_policy. */
+    int close_policy = 0;
+    /* True while the .hide policy has this window off the glass; the
+     * hwnd stays live and the map entry stays owned. */
+    bool policy_hidden = false;
 };
 
 /* One rectangle of a canvas view's window-drag mirror (runtime push,
@@ -1166,6 +1178,7 @@ static void emit(Host *host, const Window &window, EventKind kind) {
     event.y = window.y;
     event.open = window.hwnd != nullptr;
     event.focused = window.hwnd && GetFocus() == window.hwnd;
+    event.hidden = window.policy_hidden ? 1 : 0;
     event.label = window.label.c_str();
     event.label_len = window.label.size();
     event.title = window.title.c_str();
@@ -1817,11 +1830,15 @@ constexpr uint64_t kGpuFrameIntervalNs = 16666667ull;
  * riding the frame channel (on_frame interpolation, armed tweens) and
  * snap it on restore; the heartbeat keeps those models gently current
  * while event-driven truth (audio position, input) flows at its own
- * cadence. Minimize (IsIconic on the root window) is the one occlusion
- * signal Win32 reports reliably for this GDI-presenting host; a window
- * fully covered by other windows has no dependable signal without a
- * DXGI presentation path, so covered-but-not-minimized windows keep
- * full cadence deliberately rather than guess. */
+ * cadence. Two occlusion facts key the throttle: minimize (IsIconic on
+ * the root window — the one signal Win32 reports reliably for this
+ * GDI-presenting host) and the close_policy .hide hide (host-owned
+ * bookkeeping: a policy-hidden window is SW_HIDE'd off the glass, and
+ * the menu-bar app shape keeps it that way for days — full-rate frame
+ * completions there are pure background CPU burn). A window fully
+ * covered by OTHER windows has no dependable signal without a DXGI
+ * presentation path, so covered-but-not-minimized windows keep full
+ * cadence deliberately rather than guess. */
 constexpr uint64_t kGpuOccludedHeartbeatNs = 1000000000ull;
 /* Placeholder pump timer (repeating, retired by the first present). */
 constexpr UINT_PTR kGpuFrameTimerId = 1;
@@ -2398,13 +2415,19 @@ static void gpuSurfaceAdvancePacingClock(NativeView &view) {
     }
 }
 
-/* Frame completions run on the minimized heartbeat when the surface has
- * presented at least once and its top-level window is iconic — the same
- * first-present exemption the macOS occluded pacing keeps, so surface
- * establishment (and the nonblank verdict automation reads) is never
- * throttled. */
-static bool gpuSurfaceOccludedPacingActive(const NativeView &view) {
+/* Frame completions run on the occluded heartbeat when the surface has
+ * presented at least once and its window is off the glass — iconic, or
+ * alive-but-hidden under close_policy .hide (see kGpuOccludedHeartbeatNs:
+ * both facts are reliable, and a policy-hidden menu-bar app would
+ * otherwise spin its frame loop full-rate for days). First-present
+ * exemption as on macOS, so surface establishment (and the nonblank
+ * verdict automation reads) is never throttled. */
+static bool gpuSurfaceOccludedPacingActive(Host *host, const NativeView &view) {
     if (!view.gpu_presented || !view.hwnd) return false;
+    if (host) {
+        auto owner = host->windows.find(view.window_id);
+        if (owner != host->windows.end() && owner->second.policy_hidden) return true;
+    }
     HWND root = GetAncestor(view.hwnd, GA_ROOT);
     return root != nullptr && IsIconic(root);
 }
@@ -2438,7 +2461,7 @@ static void gpuSurfaceEmitFrame(Host *host, NativeView &view, HWND hwnd) {
     /* Heartbeat-paced completions are not latency endpoints: their
      * timestamp measures the deliberate minimized cadence, not a paint
      * — the runtime skips input-latency stamping for them. */
-    event.occluded = gpuSurfaceOccludedPacingActive(view) ? 1 : 0;
+    event.occluded = gpuSurfaceOccludedPacingActive(host, view) ? 1 : 0;
     emitGpuSurfaceEvent(host, view, event);
 }
 
@@ -2449,16 +2472,17 @@ static void gpuSurfaceEmitFrame(Host *host, NativeView &view, HWND hwnd) {
  * re-enter the engine — and the pacing clock's grid stamping keeps the
  * message hop out of the period. SetTimer clamps short delays up to its
  * ~10 ms floor; the clock absorbs that as jitter, not drift. */
-static void gpuSurfaceScheduleFrameEmission(NativeView &view) {
+static void gpuSurfaceScheduleFrameEmission(Host *host, NativeView &view) {
     if (!view.hwnd || view.gpu_emission_scheduled) return;
     const uint64_t now = gpuTimestampNs();
-    /* Minimized surfaces pace on the heartbeat, not the frame grid —
-     * see kGpuOccludedHeartbeatNs. Exempt: an input's responding frame
-     * (external truth on its own cadence; it cannot sustain a spin).
-     * Restore re-arms the pending timer at the grid delay (the
-     * top-level WM_SIZE handler), so the long delay never gates the
-     * return to full cadence. */
-    const uint64_t pace_ns = (!view.gpu_prompt_frame_pending && gpuSurfaceOccludedPacingActive(view)) ? kGpuOccludedHeartbeatNs : kGpuFrameIntervalNs;
+    /* Occluded surfaces (minimized or policy-hidden) pace on the
+     * heartbeat, not the frame grid — see kGpuOccludedHeartbeatNs.
+     * Exempt: an input's responding frame (external truth on its own
+     * cadence; it cannot sustain a spin). Reveal re-arms the pending
+     * timer at the grid delay (restore through the top-level WM_SIZE
+     * handler, re-show through the show verb), so the long delay never
+     * gates the return to full cadence. */
+    const uint64_t pace_ns = (!view.gpu_prompt_frame_pending && gpuSurfaceOccludedPacingActive(host, view)) ? kGpuOccludedHeartbeatNs : kGpuFrameIntervalNs;
     uint64_t delay_ns = 0;
     if (view.gpu_last_emit_ns > 0 && now < view.gpu_last_emit_ns + pace_ns) {
         delay_ns = view.gpu_last_emit_ns + pace_ns - now;
@@ -2554,7 +2578,7 @@ static LRESULT CALLBACK gpuSurfaceProc(HWND hwnd, UINT message, WPARAM wparam, L
                     KillTimer(hwnd, kGpuFrameTimerId);
                     return 0;
                 }
-                gpuSurfaceScheduleFrameEmission(*view);
+                gpuSurfaceScheduleFrameEmission(host, *view);
                 return 0;
             }
             if (wparam == kGpuEmitTimerId) {
@@ -3564,16 +3588,19 @@ static void audioSpectrumStartCapture(Host *host) {
 }
 
 /* Whether any of the host's top-level windows still reaches the glass.
- * Minimize-keyed on purpose: IsIconic is the one occlusion fact this
- * host trusts (the same decision the minimized frame heartbeat makes —
- * the covered-but-not-minimized case has no reliable cheap signal on
- * the DXGI presentation path), so covered windows keep full spectrum
- * cadence and only an all-minimized app goes quiet. Checked across the
- * whole window table because a spectrum consumer may draw its bands in
- * any of the app's windows. */
+ * Keyed on the two occlusion facts this host trusts (the same decision
+ * the occluded frame heartbeat makes): minimize (IsIconic) and the
+ * close_policy .hide hide (policy_hidden — a menu-bar app's window off
+ * the glass behind its tray icon must not keep 25 Hz spectrum
+ * emissions flowing for a display nobody can see). The
+ * covered-but-not-minimized case has no reliable cheap signal without
+ * a DXGI presentation path, so covered windows keep full spectrum
+ * cadence and only an app with every window minimized or policy-hidden
+ * goes quiet. Checked across the whole window table because a spectrum
+ * consumer may draw its bands in any of the app's windows. */
 static bool audioAnyWindowReachesGlass(Host *host) {
     for (auto &entry : host->windows) {
-        if (entry.second.hwnd && !IsIconic(entry.second.hwnd)) return true;
+        if (entry.second.hwnd && !IsIconic(entry.second.hwnd) && !entry.second.policy_hidden) return true;
     }
     return false;
 }
@@ -3584,12 +3611,13 @@ static bool audioAnyWindowReachesGlass(Host *host) {
  * transports emit nothing — the bars freeze honestly — while silence on
  * a rolling transport still emits its row of zeros. The occluded-
  * emission rule gates delivery too: SPECTRUM bands describe a display,
- * so while every window is minimized no report is emitted — no event
- * wakes the runtime's update loop for glass nobody can see, and the
- * journal records the stretch as honest silence. The capture thread
- * keeps its ring fresh (it must drain the loopback client regardless,
- * and its FFT runs off the loop thread), so the first beat after a
- * restore delivers current bands — honest within one report. */
+ * so while every window is minimized or policy-hidden no report is
+ * emitted — no event wakes the runtime's update loop for glass nobody
+ * can see, and the journal records the stretch as honest silence. The
+ * capture thread keeps its ring fresh (it must drain the loopback
+ * client regardless, and its FFT runs off the loop thread), so the
+ * first beat after a restore or re-show delivers current bands —
+ * honest within one report. */
 static void audioHandleSpectrumMessage(Host *host, WPARAM generation) {
     AudioState &audio = host->audio;
     AudioSpectrumState &spectrum = host->spectrum;
@@ -4792,7 +4820,7 @@ static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wparam, LPARA
                         if (surface.kind != kViewGpuSurface || !surface.hwnd || !surface.gpu_emission_scheduled) continue;
                         if (GetAncestor(surface.hwnd, GA_ROOT) != hwnd) continue;
                         surface.gpu_emission_scheduled = false;
-                        gpuSurfaceScheduleFrameEmission(surface);
+                        gpuSurfaceScheduleFrameEmission(host, surface);
                     }
                 }
             }
@@ -4905,6 +4933,38 @@ static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wparam, LPARA
             if (host) emitAppearanceIfChanged(host, false);
             break;
         case WM_CLOSE:
+            /* close_policy .hide: the user's close (caption X, Alt+F4)
+             * hides the window instead of destroying it — the hwnd and
+             * every view stay live, the app keeps running behind its
+             * tray icon, and the frame event reports the hidden state.
+             * Runtime-initiated closes call DestroyWindow directly
+             * (native_sdk_windows_close_window) and bypass this hook. */
+            if (host) {
+                for (auto &entry : host->windows) {
+                    if (entry.second.hwnd == hwnd && entry.second.close_policy == 1) {
+                        /* The hide is honest only while a tray icon is
+                         * live: SW_HIDE removes the taskbar entry and
+                         * Windows has no dock-reopen path, so without a
+                         * tray the hidden window is a running, invisible,
+                         * unreachable app. tray_active is set only when
+                         * Shell_NotifyIcon actually added the icon, so a
+                         * declared tray whose creation FAILED at runtime
+                         * lands here too. The trade: consulting the live
+                         * state at close time means a close that arrives
+                         * before the app installs its tray (or after it
+                         * removes it) really closes — a loud, visible
+                         * close beats a silently stranded process. */
+                        if (!host->tray_active) {
+                            fprintf(stderr, "native-sdk: close_policy \"hide\" downgraded to a real close: no live tray icon exists (tray creation failed or no status item was installed), so a hidden window would have no re-show affordance\n");
+                            break;
+                        }
+                        entry.second.policy_hidden = true;
+                        ShowWindow(hwnd, SW_HIDE);
+                        emit(host, entry.second, kWindowFrame);
+                        return 0;
+                    }
+                }
+            }
             DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
@@ -4914,6 +4974,8 @@ static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wparam, LPARA
                         destroyNativeViewsForWindow(host, entry.first);
                         destroyChildWebViewsForWindow(host, entry.first);
                         entry.second.hwnd = nullptr;
+                        /* Destroyed means closed, never hidden. */
+                        entry.second.policy_hidden = false;
                         emit(host, entry.second, kWindowFrame);
                     }
                 }
@@ -5603,6 +5665,47 @@ int native_sdk_windows_minimize_window(Host *host, uint64_t window_id) {
     return 1;
 }
 
+/* The show verb: bring the window back to the glass and foreground it —
+ * the counterpart to a close_policy hide (and the tray-menu "Open"
+ * consequence). Restores a minimized window on the way. */
+int native_sdk_windows_show_window(Host *host, uint64_t window_id) {
+    if (!host) return 0;
+    auto found = host->windows.find(window_id);
+    if (found == host->windows.end() || !found->second.hwnd) return 0;
+    found->second.policy_hidden = false;
+    ShowWindow(found->second.hwnd, IsIconic(found->second.hwnd) ? SW_RESTORE : SW_SHOW);
+    /* Re-show returns full frame cadence without dropping a beat, the
+     * same supersede the top-level WM_SIZE handler runs on restore:
+     * SW_SHOW on a same-size window dispatches no WM_SIZE, so a
+     * heartbeat-paced emission parked up to a second out on a child
+     * surface's one-shot timer is re-armed here at the frame-grid
+     * delay (policy_hidden just cleared, so the scheduler paces on the
+     * grid again; SetTimer with the same id replaces the pending
+     * timer). */
+    for (auto &view_entry : host->native_views) {
+        NativeView &surface = view_entry.second;
+        if (surface.kind != kViewGpuSurface || !surface.hwnd || !surface.gpu_emission_scheduled) continue;
+        if (surface.window_id != window_id) continue;
+        surface.gpu_emission_scheduled = false;
+        gpuSurfaceScheduleFrameEmission(host, surface);
+    }
+    SetForegroundWindow(found->second.hwnd);
+    SetFocus(found->second.hwnd);
+    emit(host, found->second, kWindowFrame);
+    return 1;
+}
+
+/* What the user's close affordance does: 0 = quit (destroy; the
+ * default), 1 = hide (SW_HIDE and keep running). Applied right after
+ * create — close handling is host window state for the window's life. */
+int native_sdk_windows_set_window_close_policy(Host *host, uint64_t window_id, int close_policy) {
+    if (!host) return 0;
+    auto found = host->windows.find(window_id);
+    if (found == host->windows.end()) return 0;
+    found->second.close_policy = close_policy;
+    return 1;
+}
+
 int native_sdk_windows_create_view(Host *host, uint64_t window_id, const char *label, size_t label_len, int kind, const char *parent, size_t parent_len, double x, double y, double width, double height, int layer, int visible, int enabled, const char *role, size_t role_len, const char *accessibility_label, size_t accessibility_label_len, const char *text, size_t text_len, const char *command, size_t command_len) {
     if (!host || label_len == 0 || !isSupportedNativeViewKind(kind) || !validNativeViewFrame(x, y, width, height)) return 0;
     auto window = host->windows.find(window_id);
@@ -5749,7 +5852,7 @@ int native_sdk_windows_request_gpu_surface_frame(Host *host, uint64_t window_id,
      * frame-event scheduler: repaint retained content and arm the next
      * grid-paced emission (folding into one already in flight). */
     InvalidateRect(found->second.hwnd, nullptr, FALSE);
-    gpuSurfaceScheduleFrameEmission(found->second);
+    gpuSurfaceScheduleFrameEmission(host, found->second);
     return 1;
 }
 
@@ -5767,7 +5870,7 @@ int native_sdk_windows_note_gpu_surface_input(Host *host, uint64_t window_id, co
     view.gpu_prompt_frame_pending = true;
     if (view.gpu_emission_scheduled) {
         view.gpu_emission_scheduled = false;
-        gpuSurfaceScheduleFrameEmission(view);
+        gpuSurfaceScheduleFrameEmission(host, view);
     }
     return 1;
 }
@@ -5835,7 +5938,7 @@ int native_sdk_windows_present_gpu_surface_pixels(Host *host, uint64_t window_id
     const bool first_present = !view.gpu_presented;
     view.gpu_presented = true;
     if (first_present) view.gpu_prompt_frame_pending = true;
-    gpuSurfaceScheduleFrameEmission(view);
+    gpuSurfaceScheduleFrameEmission(host, view);
     return 1;
 }
 

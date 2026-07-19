@@ -102,6 +102,7 @@ pub const Metadata = struct {
             allocator.free(window.label);
             if (window.title) |title| allocator.free(title);
             allocator.free(window.titlebar);
+            allocator.free(window.close_policy);
         }
         if (self.windows.len > 0) allocator.free(self.windows);
         for (self.shell.windows) |window| {
@@ -109,6 +110,7 @@ pub const Metadata = struct {
             if (window.title) |title| allocator.free(title);
             allocator.free(window.restore_policy);
             allocator.free(window.titlebar);
+            allocator.free(window.close_policy);
             for (window.views) |view| {
                 allocator.free(view.label);
                 allocator.free(view.kind);
@@ -200,6 +202,7 @@ pub const WindowMetadata = struct {
     titlebar: []const u8 = "standard",
     min_width: f32 = 0,
     min_height: f32 = 0,
+    close_policy: []const u8 = "quit",
 };
 
 pub const ShellMetadata = struct {
@@ -237,6 +240,7 @@ pub const ShellWindowMetadata = struct {
     titlebar: []const u8 = "standard",
     min_width: f32 = 0,
     min_height: f32 = 0,
+    close_policy: []const u8 = "quit",
     views: []const ShellViewMetadata = &.{},
 };
 
@@ -592,6 +596,7 @@ fn convertRawWindows(allocator: std.mem.Allocator, windows: []const RawWindow) !
             .titlebar = try allocator.dupe(u8, window.titlebar),
             .min_width = window.min_width,
             .min_height = window.min_height,
+            .close_policy = try allocator.dupe(u8, window.close_policy),
         };
     }
     return converted;
@@ -644,6 +649,7 @@ fn convertRawShellWindows(allocator: std.mem.Allocator, windows: []const RawShel
             .titlebar = try allocator.dupe(u8, window.titlebar),
             .min_width = window.min_width,
             .min_height = window.min_height,
+            .close_policy = try allocator.dupe(u8, window.close_policy),
             .views = try convertRawShellViews(allocator, window.views),
         };
     }
@@ -843,6 +849,7 @@ fn convertWindows(allocator: std.mem.Allocator, windows: []const WindowMetadata)
             .titlebar = try parseTitlebarStyle(window.titlebar),
             .min_width = try parseWindowMinSize(window.min_width),
             .min_height = try parseWindowMinSize(window.min_height),
+            .close_policy = try parseClosePolicy(window.close_policy),
         };
     }
     return converted;
@@ -867,6 +874,7 @@ fn parseShell(allocator: std.mem.Allocator, shell: ShellMetadata) !app_manifest.
         const titlebar = try parseTitlebarStyle(window.titlebar);
         const min_width = try parseWindowMinSize(window.min_width);
         const min_height = try parseWindowMinSize(window.min_height);
+        const close_policy = try parseClosePolicy(window.close_policy);
         const views = try parseShellViews(allocator, window.views);
         windows[index] = .{
             .label = window.label,
@@ -881,6 +889,7 @@ fn parseShell(allocator: std.mem.Allocator, shell: ShellMetadata) !app_manifest.
             .titlebar = titlebar,
             .min_width = min_width,
             .min_height = min_height,
+            .close_policy = close_policy,
             .views = views,
         };
         initialized += 1;
@@ -1271,6 +1280,12 @@ fn parseTitlebarStyle(value: []const u8) !app_manifest.WindowTitlebarStyle {
     if (std.mem.eql(u8, value, "hidden_inset_tall")) return .hidden_inset_tall;
     if (std.mem.eql(u8, value, "chromeless")) return .chromeless;
     return error.InvalidWindowTitlebarStyle;
+}
+
+fn parseClosePolicy(value: []const u8) !app_manifest.WindowClosePolicy {
+    if (std.mem.eql(u8, value, "quit")) return .quit;
+    if (std.mem.eql(u8, value, "hide")) return .hide;
+    return error.InvalidWindowClosePolicy;
 }
 
 /// Same validation posture as the titlebar style: a min-size floor the
@@ -1858,6 +1873,66 @@ test "manifest parser rejects negative window min sizes" {
 
     try std.testing.expectError(error.InvalidWindowMinSize, convertWindows(std.testing.allocator, metadata.windows));
     try std.testing.expectError(error.InvalidWindowMinSize, parseShell(std.testing.allocator, metadata.shell));
+}
+
+test "manifest parser reads window close policies" {
+    const metadata = try parseText(std.testing.allocator,
+        \\.{
+        \\  .id = "com.example.app",
+        \\  .name = "example",
+        \\  .version = "1.2.3",
+        \\  .windows = .{
+        \\    .{ .label = "main", .close_policy = "hide" },
+        \\    .{ .label = "doc" },
+        \\  },
+        \\  .shell = .{
+        \\    .windows = .{
+        \\      .{ .label = "scene", .close_policy = "hide", .views = .{ .{ .label = "content", .kind = "webview", .url = "zero://app/index.html" } } },
+        \\    },
+        \\  },
+        \\}
+    );
+    defer metadata.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("hide", metadata.windows[0].close_policy);
+    try std.testing.expectEqualStrings("quit", metadata.windows[1].close_policy);
+    try std.testing.expectEqualStrings("hide", metadata.shell.windows[0].close_policy);
+
+    const windows = try convertWindows(std.testing.allocator, metadata.windows);
+    defer std.testing.allocator.free(windows);
+    try std.testing.expectEqual(app_manifest.WindowClosePolicy.hide, windows[0].close_policy);
+    // Undeclared stays the .quit default — behavior unchanged for
+    // every existing app.
+    try std.testing.expectEqual(app_manifest.WindowClosePolicy.quit, windows[1].close_policy);
+
+    const shell = try parseShell(std.testing.allocator, metadata.shell);
+    defer deinitParsedShell(std.testing.allocator, shell);
+    try std.testing.expectEqual(app_manifest.WindowClosePolicy.hide, shell.windows[0].close_policy);
+}
+
+test "manifest parser rejects unknown window close policy" {
+    const metadata = try parseText(std.testing.allocator,
+        \\.{
+        \\  .id = "com.example.app",
+        \\  .name = "example",
+        \\  .version = "1.2.3",
+        \\  .windows = .{
+        \\    .{ .label = "main", .close_policy = "minimize" },
+        \\  },
+        \\  .shell = .{
+        \\    .windows = .{
+        \\      .{ .label = "scene", .close_policy = "event", .views = .{ .{ .label = "content", .kind = "webview", .url = "zero://app/index.html" } } },
+        \\    },
+        \\  },
+        \\}
+    );
+    defer metadata.deinit(std.testing.allocator);
+
+    // "event" is the deliberately reserved future tier (model-decides
+    // close); it parses as unknown until it ships — staged honestly,
+    // never accepted early.
+    try std.testing.expectError(error.InvalidWindowClosePolicy, convertWindows(std.testing.allocator, metadata.windows));
+    try std.testing.expectError(error.InvalidWindowClosePolicy, parseShell(std.testing.allocator, metadata.shell));
 }
 
 test "manifest parser rejects unknown window titlebar style" {

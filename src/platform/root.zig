@@ -78,6 +78,7 @@ pub const WindowChrome = types.WindowChrome;
 pub const FormFactor = types.FormFactor;
 pub const WindowDragRegion = types.WindowDragRegion;
 pub const WindowShowMode = types.WindowShowMode;
+pub const WindowClosePolicy = types.WindowClosePolicy;
 pub const WindowOptions = types.WindowOptions;
 pub const WindowState = types.WindowState;
 pub const WindowInfo = types.WindowInfo;

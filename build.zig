@@ -219,6 +219,14 @@ pub fn build(b: *std.Build) void {
     markup_cli_mod.addImport("markup_lsp", markup_lsp_mod);
     const markup_cli_tests = testArtifact(b, markup_cli_mod);
 
+    // The evals harness's Cmd wire-format decoder (copied next to every
+    // ts-track case harness at grading time). Its own tests run here —
+    // NOT at eval time — because a decoder that lags a
+    // cmd_format_version bump panics mid-eval inside case harnesses,
+    // where the failure reads as the graded app's, not the tooling's.
+    const evals_cmdview_mod = module(b, target, optimize, "evals/harness-lib/cmdview.zig");
+    const evals_cmdview_tests = testArtifact(b, evals_cmdview_mod);
+
     // `native version` names the commit the binary was built from, so
     // binary/framework skew ("your native binary may be stale") is a
     // one-command check. Falls back to "unknown" outside a git checkout.
@@ -438,6 +446,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(markup_lsp_tests).step);
     test_step.dependOn(&b.addRunArtifact(automation_cli_tests).step);
     test_step.dependOn(&b.addRunArtifact(markup_cli_tests).step);
+    test_step.dependOn(&b.addRunArtifact(evals_cmdview_tests).step);
     addFileContainsCheckStep(b, file_contains_checker, test_step, "test-package-types", "Verify package TypeScript platform feature names", &.{
         .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "NativeSdkCommandInfo" },
         .{ .path = "packages/native-sdk/native-sdk.d.ts", .pattern = "list(): Promise<NativeSdkCommandInfo[]>" },
@@ -570,6 +579,46 @@ pub fn build(b: *std.Build) void {
         .{ .path = "src/platform/linux/gtk_host.c", .pattern = "change != NATIVE_SDK_GST_STATE_CHANGE_ASYNC" },
         .{ .path = "src/platform/linux/gtk_host.c", .pattern = "#define NATIVE_SDK_GST_STATE_CHANGE_ASYNC 2" },
     });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-linux-init-close-policy-refusal", "Verify the Linux platform init refuses a .hide main window with the one shared teaching (the pre-created startup window never passes the runtime's create gate, so a silent drop here meant quit-on-close for direct-SDK users)", &.{
+        // The gate itself is unit-tested cross-host (it is extern-free);
+        // this pins its WIRING into initWithOptions, which only a Linux
+        // link can execute.
+        .{ .path = "src/platform/linux/root.zig", .pattern = "try refuseUnsupportedMainWindowClosePolicy(window_options);" },
+        // One message, all seams: the platform-init refusal and the
+        // generated runner's comptime refusal teach with the same text.
+        .{ .path = "src/platform/linux/root.zig", .pattern = "close_policy \\\"hide\\\" is not supported on linux: the GTK host has no status item (tray), so nothing could bring the hidden window back - declare \\\"quit\\\" (the default), or scope the .hide declaration to macos/windows builds" },
+        .{ .path = "src/app_runner/root.zig", .pattern = "close_policy \\\"hide\\\" is not supported on linux: the GTK host has no status item (tray), so nothing could bring the hidden window back - declare \\\"quit\\\" (the default), or scope the .hide declaration to macos/windows builds" },
+        .{ .path = "src/tooling/templates.zig", .pattern = "close_policy \\\\\\\"hide\\\\\\\" is not supported on linux" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-macos-close-clears-policy-hidden", "Verify every macOS close exit leaves the policy-hidden set before its open=false emit (both hosts derive the frame event's hidden flag from set membership, and the Dock reopen re-shows every member — a close exit that skips the cleanup emits {open=false, hidden=true} and lets the reopen resurrect an app-closed window)", &.{
+        // AppKit: every close routes through NSWindow close/performClose,
+        // so the delegate's windowWillClose is the one cleanup site.
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "[self.host.policyHiddenWindows removeObject:@(self.windowId)];\n    [self.host emitWindowFrameForWindowId:self.windowId open:NO];" },
+        // CEF: the delegate cleanup covers the [window close] fallback,
+        // and the app-driven close of a browser-bearing window exits
+        // through orderOut WITHOUT reaching windowWillClose — that
+        // branch must do the set cleanup itself, before its emit.
+        .{ .path = "src/platform/macos/cef_host.mm", .pattern = "[self.host.policyHiddenWindows removeObject:@(self.windowId)];\n    [self.host emitWindowFrameForWindowId:self.windowId open:NO];" },
+        .{ .path = "src/platform/macos/cef_host.mm", .pattern = "[self.policyHiddenWindows removeObject:@(windowId)];\n                [window orderOut:nil];\n                [self emitWindowFrameForWindowId:windowId open:NO];" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-macos-cef-window-verbs-synchronous", "Verify the CEF host's show and minimize verbs run synchronously on the main thread, the close verb's discipline (a dispatch_async show returns success while the window is still in policyHiddenWindows — the runtime's post-success focus flip then emits {focused:true, hidden:true} until the queued block lands — and a show-then-close in one dispatch re-orders: the queued show lands AFTER the synchronous close and puts a retained ordered-out closed window back on the glass)", &.{
+        // The show verb: direct on main, dispatch_sync hop otherwise,
+        // with the window lookup INSIDE the block so a window closed
+        // before an off-main hop lands is a no-op, not a resurrection.
+        .{ .path = "src/platform/macos/cef_host.mm", .pattern = "if ([NSThread isMainThread]) {\n        showBlock();\n    } else {\n        dispatch_sync(dispatch_get_main_queue(), showBlock);\n    }" },
+        // The minimize twin (a queued miniaturize captured past a
+        // synchronous close genies an app-closed window into the Dock).
+        .{ .path = "src/platform/macos/cef_host.mm", .pattern = "if ([NSThread isMainThread]) {\n        miniaturizeBlock();\n    } else {\n        dispatch_sync(dispatch_get_main_queue(), miniaturizeBlock);\n    }" },
+        // The C shims return success only after the synchronous verb —
+        // no dispatch_async between the lookup and the method call.
+        .{ .path = "src/platform/macos/cef_host.mm", .pattern = "if (!object.windows[@(window_id)]) return 0;\n    [object miniaturizeWindowWithId:window_id];\n    return 1;" },
+        .{ .path = "src/platform/macos/cef_host.mm", .pattern = "[object showWindowWithId:window_id];\n    return 1;" },
+        // The AppKit host's twins are already synchronous direct calls
+        // (its runtime callbacks arrive on the main thread); these pins
+        // hold that symmetry.
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "[object showWindowWithId:window_id];\n    return 1;" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "[object miniaturizeWindowWithId:window_id];\n    return 1;" },
+    });
     // The embedded-WebView layer must stay real AND declare-to-use: the
     // standard build graph puts the vendored WebView2 SDK header on the
     // include path exactly when app.zon declares web use (`if
@@ -693,6 +742,59 @@ pub fn build(b: *std.Build) void {
         .{ .path = "src/platform/macos/appkit_host.m", .pattern = "- (void)scheduleFrameEventEmission" },
         .{ .path = "src/platform/macos/appkit_host.m", .pattern = "- (void)emitScheduledFrameEvent" },
     });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-quit-stop-queued", "Verify the quit verb's stop is queued to the next loop turn on every synchronous-emit host (a synchronous emitShutdown nests the shutdown dispatch inside the requesting command's dispatch, seals the session journal before the command commits, and replay diverges)", &.{
+        // macOS (AppKit and CEF hosts): the main-queue hop, with the
+        // pre-run-loop inline fallback the failed-START precedent needs.
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "if (!NSApp.running) {" },
+        .{ .path = "src/platform/macos/cef_host.mm", .pattern = "if (!NSApp.running) {" },
+        // Linux: the idle hop — the same seam the wake and
+        // frame-request paths ride.
+        .{ .path = "src/platform/linux/gtk_host.c", .pattern = "static gboolean native_sdk_stop_idle(gpointer data)" },
+        .{ .path = "src/platform/linux/gtk_host.c", .pattern = "g_idle_add(native_sdk_stop_idle, host);" },
+        // Windows was queued from the start: stop posts, the loop
+        // exits, and the shutdown emits after the loop at top level.
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "void native_sdk_windows_stop(Host *host) {" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "PostQuitMessage(0);" },
+        // The runtime ordering the queue protects: the recorder seals
+        // on the shutdown dispatch's exit, and the modeled host's
+        // queued seam keeps the runtime suites honest about it.
+        .{ .path = "src/runtime/flow.zig", .pattern = "if (event_value == .app_shutdown) recorder.finish();" },
+        .{ .path = "src/platform/null_platform.zig", .pattern = "pub fn takeQueuedQuit" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-quit-pre-run-pending", "Verify a PRE-RUN quit verb on the macOS hosts parks as a pending flag drained at top level, never the inline emit (an inline pre-run emit nests the shutdown inside the boot dispatch that requested it — the recorder seals the journal before that dispatch commits, the same bug the running-path queue fixes)", &.{
+        // The quit verb's own landing point: pre-run it PARKS — the
+        // inline emitShutdown+stop stays exclusive to
+        // native_sdk_appkit_stop, the host-side failure request the
+        // failed-START precedent rides (runWithCallback's didShutdown
+        // check).
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "void native_sdk_appkit_request_stop(native_sdk_appkit_host_t *host) {" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "object.pendingPreRunStop = YES;" },
+        .{ .path = "src/platform/macos/cef_host.mm", .pattern = "void native_sdk_appkit_request_stop(native_sdk_appkit_host_t *host) {" },
+        .{ .path = "src/platform/macos/cef_host.mm", .pattern = "object.pendingPreRunStop = YES;" },
+        // The drains: after the START dispatch (at the didShutdown
+        // decision point) and after the remaining pre-run dispatches
+        // (appearance/resize/window-frame, and AppKit's synchronous
+        // first canvas frame) — emitShutdown + stop at TOP LEVEL, once.
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "- (BOOL)drainPendingPreRunStop {\n    if (!self.pendingPreRunStop) return NO;\n    self.pendingPreRunStop = NO;\n    if (self.didShutdown) return NO;\n    [self emitShutdown];\n    [self stop];\n    return YES;\n}" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "[self drainPendingPreRunStop];\n    // A failed START handler requests shutdown synchronously" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "if ([self drainPendingPreRunStop]) return;" },
+        .{ .path = "src/platform/macos/cef_host.mm", .pattern = "- (BOOL)drainPendingPreRunStop {\n    if (!self.pendingPreRunStop) return NO;\n    self.pendingPreRunStop = NO;\n    if (self.didShutdown) return NO;\n    [self emitShutdown];\n    [self stop];\n    return YES;\n}" },
+        .{ .path = "src/platform/macos/cef_host.mm", .pattern = "[self drainPendingPreRunStop];\n    // A failed START handler requests shutdown synchronously" },
+        .{ .path = "src/platform/macos/cef_host.mm", .pattern = "if ([self drainPendingPreRunStop]) {\n        shutdownCefIfNeeded();\n        return;\n    }" },
+        // The Zig split: the quit verb rides request_stop; the failed
+        // emit keeps the byte-for-byte host-side stop.
+        .{ .path = "src/platform/macos/root.zig", .pattern = "native_sdk_appkit_request_stop(self.host);" },
+        .{ .path = "src/platform/macos/root.zig", .pattern = "if (self.self) |mac| native_sdk_appkit_stop(mac.host);" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-gtk-stop-idle-tracked", "Verify the GTK quit-stop idle source is tracked on the host, coalesced while pending, skipped after shutdown, and removed at destroy (an untracked second g_idle_add leaves a source holding a freed host after the loop quits)", &.{
+        .{ .path = "src/platform/linux/gtk_host.c", .pattern = "guint stop_idle_source;" },
+        // The idle retires its own tracking before it emits.
+        .{ .path = "src/platform/linux/gtk_host.c", .pattern = "host->stop_idle_source = 0;\n    if (!host->did_shutdown) {" },
+        // Coalesce + post-shutdown skip, then the tracked add.
+        .{ .path = "src/platform/linux/gtk_host.c", .pattern = "if (host->did_shutdown || host->stop_idle_source) return;\n    host->stop_idle_source = g_idle_add(native_sdk_stop_idle, host);" },
+        // Destroy removes a still-pending stop turn.
+        .{ .path = "src/platform/linux/gtk_host.c", .pattern = "if (host->stop_idle_source) {\n        g_source_remove(host->stop_idle_source);\n        host->stop_idle_source = 0;\n    }" },
+    });
     addFileContainsCheckStep(b, file_contains_checker, test_step, "test-gpu-occluded-frame-heartbeat", "Verify occluded windows throttle frame completions to a heartbeat and restore full cadence on reveal", &.{
         // macOS: occluded surfaces pace logical completions on the ~1 Hz
         // heartbeat (never stopping — on_frame-driven models stay gently
@@ -709,13 +811,20 @@ pub fn build(b: *std.Build) void {
         // sustain a spin.
         .{ .path = "src/platform/macos/appkit_host.m", .pattern = "scheduleFrameEventEmissionForPresentCompletion:YES" },
         .{ .path = "src/platform/macos/appkit_host.m", .pattern = "- (void)noteGpuSurfaceInputActivity" },
-        // Windows: the same throttle keyed on the one reliable Win32
-        // occlusion signal (minimize); restore re-arms the pending
-        // one-shot timer at the frame-grid delay, and the input /
+        // Windows: the same throttle keyed on the two reliable
+        // occlusion facts — minimize (IsIconic) and the close_policy
+        // .hide hide (policy_hidden: a hidden menu-bar app must not
+        // spin its frame loop or its spectrum emissions full-rate for
+        // days). Restore re-arms the pending one-shot timer at the
+        // frame-grid delay through WM_SIZE, re-show through the show
+        // verb (SW_SHOW dispatches no WM_SIZE), and the input /
         // first-present exemptions ride one prompt-frame flag.
         .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "kGpuOccludedHeartbeatNs = 1000000000ull" },
         .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "gpuSurfaceOccludedPacingActive" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "owner->second.policy_hidden) return true;" },
         .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "IsIconic(root)" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "!IsIconic(entry.second.hwnd) && !entry.second.policy_hidden" },
+        .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "Re-show returns full frame cadence without dropping a beat" },
         .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "gpu_prompt_frame_pending" },
         .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "native_sdk_windows_note_gpu_surface_input" },
         // The runtime side of the measurement honesty: occluded logical
@@ -1022,6 +1131,7 @@ pub fn build(b: *std.Build) void {
     addTestStep(b, "test-automation-protocol", "Run automation protocol tests", automation_protocol_tests);
     addTestStep(b, "test-automation-cli", "Run native automate CLI tests", automation_cli_tests);
     addTestStep(b, "test-markup-cli", "Run native markup CLI tests", markup_cli_tests);
+    addTestStep(b, "test-evals-cmdview", "Run the evals harness Cmd wire decoder tests", evals_cmdview_tests);
     addTestStep(b, "test-tooling", "Run Native SDK tooling tests", tooling_tests);
     addTestStep(b, "test-eject-components", "Run ejected-component widget-identity tests", eject_components_tests);
 
@@ -1152,6 +1262,7 @@ pub fn build(b: *std.Build) void {
     addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-system-monitor", "Run system monitor example tests", "examples/system-monitor", .managed);
     addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-system-monitor-ts", "Run system-monitor-ts example tests", "examples/system-monitor-ts", .managed);
     addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-effects-probe", "Run effects probe example tests", "examples/effects-probe", .managed);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-menu-bar", "Run menu-bar lifecycle example tests", "examples/menu-bar", .managed);
     addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-feed", "Run feed example tests", "examples/feed", .managed);
     addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-canvas-preview", "Run canvas preview example tests", "examples/canvas-preview", .managed);
     addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-capabilities", "Run capabilities example tests", "examples/capabilities", .owned);

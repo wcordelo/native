@@ -79,6 +79,14 @@ macOS, Linux, and Windows run full desktop apps through their own platform hosts
       <td><Tier tier="none" /></td>
     </tr>
     <tr>
+      <td>Menu-bar app lifecycle (<code>close_policy = "hide"</code>)</td>
+      <td><Tier tier="full" note="close hides, the Dock reopen re-shows, tray Open/Quit drive showWindow/quitApp" /></td>
+      <td><Tier tier="full" note="close hides (SW_HIDE); the tray icon is the re-show affordance" /></td>
+      <td><Tier tier="none" note="no status item exists to bring a hidden window back, so the declaration is refused at build/create time with a teaching" fn={5} /></td>
+      <td><Tier tier="none" /></td>
+      <td><Tier tier="none" /></td>
+    </tr>
+    <tr>
       <td>Web content (WebViews)</td>
       <td><Tier tier="full" note="system WebView by default; optional bundled Chromium via CEF" fn={7} /></td>
       <td><Tier tier="caveats" note="system WebView (WebView2); needs the WebView2 runtime, preinstalled on current Windows" fn={7} /></td>

@@ -3656,6 +3656,65 @@ export function f(x: number, y: number): number { return pick(x, y, x < y); }`,
 // taught rules everywhere else.
 const streamingCases: Case[] = [
   {
+    name: "the window verbs emit in their documented shapes",
+    src: `
+import { Cmd } from "@native-sdk/core";
+${streamMsg}
+export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
+  switch (msg.kind) {
+    case "go":
+      if (msg.which === 0) return [model, Cmd.showWindow("player")];
+      if (msg.which === 1) return [model, Cmd.batch([Cmd.showWindow("player"), Cmd.quitApp()])];
+      return [model, Cmd.quitApp()];
+${streamTail}
+`,
+  },
+  {
+    name: "a dynamic showWindow label is taught (window labels are declarations)",
+    gate: "NS1027",
+    src: `
+import { Cmd } from "@native-sdk/core";
+${streamMsg}
+export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
+  switch (msg.kind) {
+    case "go": {
+      const label = msg.which === 0 ? "player" : "settings";
+      return [model, Cmd.showWindow(label)];
+    }
+${streamTail}
+`,
+  },
+  {
+    // The wire's label length prefix counts BYTES: 100 CJK characters
+    // are 100 UTF-16 code units but 300 UTF-8 bytes, so the 255-byte
+    // teaching must fire on the byte count, not on \`.length\`.
+    name: "a showWindow label over 255 UTF-8 bytes is taught (100 CJK chars = 300 bytes)",
+    gate: "NS9001",
+    src: `
+import { Cmd } from "@native-sdk/core";
+${streamMsg}
+export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
+  switch (msg.kind) {
+    case "go":
+      return [model, Cmd.showWindow("${"音".repeat(100)}")];
+${streamTail}
+`,
+  },
+  {
+    // The under-bound twin: a multibyte label whose BYTE length fits
+    // (250 bytes) emits and compiles — the byte gate must not over-refuse.
+    name: "a multibyte showWindow label under 255 bytes emits (250 UTF-8 bytes)",
+    src: `
+import { Cmd } from "@native-sdk/core";
+${streamMsg}
+export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
+  switch (msg.kind) {
+    case "go":
+      return [model, Cmd.showWindow("${"音".repeat(83)}x")];
+${streamTail}
+`,
+  },
+  {
     name: "spawn and the audio verbs emit in their documented shapes",
     src: `
 import { Cmd, asciiBytes } from "@native-sdk/core";

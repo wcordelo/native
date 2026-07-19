@@ -220,6 +220,13 @@ pub fn shellTitlebarStyle(style: app_manifest.WindowTitlebarStyle) platform.Wind
     };
 }
 
+pub fn shellClosePolicy(policy: app_manifest.WindowClosePolicy) platform.WindowClosePolicy {
+    return switch (policy) {
+        .quit => .quit,
+        .hide => .hide,
+    };
+}
+
 /// Present-before-show policy for a shell window: a window whose content
 /// is a canvas (any `gpu_surface` view) is created ordered-out and shown
 /// only after its first canvas frame has completed presentation, so the

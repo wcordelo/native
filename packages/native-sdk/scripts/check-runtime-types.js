@@ -10,6 +10,7 @@ const repoRoot = join(projectRoot, '..', '..');
 
 const runtimeSource = readFileSync(join(repoRoot, 'src', 'runtime', 'bridge_responses.zig'), 'utf8');
 const platformSource = readFileSync(join(repoRoot, 'src', 'platform', 'types.zig'), 'utf8');
+const bridgePayloadSource = readFileSync(join(repoRoot, 'src', 'runtime', 'bridge_payload.zig'), 'utf8');
 const typeSource = readFileSync(join(projectRoot, 'native-sdk.d.ts'), 'utf8');
 
 const errors = [];
@@ -68,7 +69,7 @@ function platformEnumTags(enumName) {
 }
 
 function typeUnionTags(typeName) {
-  const match = typeSource.match(new RegExp(`export type ${typeName} = ([^;]+);`));
+  const match = typeSource.match(new RegExp(`export type ${typeName} =\\s*([^;]+);`));
   if (!match) {
     addError(`missing type union: ${typeName}`);
     return [];
@@ -94,6 +95,71 @@ for (const tag of cursorTags) {
 for (const tag of typeCursorTags) {
   if (!cursorTags.includes(tag)) {
     addError(`NativeSdkCursor includes unknown platform cursor "${tag}"`);
+  }
+}
+
+// The bridge's camelCase alias table capitalizes "webview" as "WebView"
+// (mainWebView, childWebViews); every other segment follows plain
+// first-letter capitalization. Deriving the same spellings here keeps the
+// check pinned to the aliases JavaScript callers actually send.
+const camelSegmentSpellings = new Map([
+  ['webview', 'WebView'],
+  ['webviews', 'WebViews'],
+]);
+
+function camelPlatformFeature(tag) {
+  const [head, ...rest] = tag.split('_');
+  return (
+    head +
+    rest
+      .map((segment) => camelSegmentSpellings.get(segment) ?? segment[0].toUpperCase() + segment.slice(1))
+      .join('')
+  );
+}
+
+// The manual alias entries inside platformFeatureFromString: snake_case
+// spellings resolve through comptime enum reflection, so the table only
+// needs to hold the camelCase forms.
+function bridgePlatformFeatureAliases() {
+  const body = sliceBetween(bridgePayloadSource, 'pub fn platformFeatureFromString', '\n}');
+  const aliases = new Map();
+  for (const match of body.matchAll(/std\.mem\.eql\(u8, value, "([^"]+)"\)\) return \.([A-Za-z0-9_]+);/g)) {
+    aliases.set(match[1], match[2]);
+  }
+  return aliases;
+}
+
+const featureTags = platformEnumTags('PlatformFeature');
+const expectedFeatureUnion = featureTags.flatMap((tag) => {
+  const camel = camelPlatformFeature(tag);
+  return camel === tag ? [tag] : [tag, camel];
+});
+const typeFeatureTags = typeUnionTags('NativeSdkPlatformFeature');
+for (const tag of expectedFeatureUnion) {
+  if (!typeFeatureTags.includes(tag)) {
+    addError(`NativeSdkPlatformFeature is missing platform feature "${tag}"`);
+  }
+}
+for (const tag of typeFeatureTags) {
+  if (!expectedFeatureUnion.includes(tag)) {
+    addError(`NativeSdkPlatformFeature includes unknown platform feature "${tag}"`);
+  }
+}
+
+const bridgeFeatureAliases = bridgePlatformFeatureAliases();
+for (const tag of featureTags) {
+  const camel = camelPlatformFeature(tag);
+  if (camel === tag) continue;
+  const target = bridgeFeatureAliases.get(camel);
+  if (target === undefined) {
+    addError(`bridge_payload.zig platformFeatureFromString is missing alias "${camel}" -> ${tag}`);
+  } else if (target !== tag) {
+    addError(`bridge_payload.zig platformFeatureFromString maps alias "${camel}" to ${target}, expected ${tag}`);
+  }
+}
+for (const [camel, target] of bridgeFeatureAliases) {
+  if (!featureTags.includes(target) || camelPlatformFeature(target) !== camel) {
+    addError(`bridge_payload.zig platformFeatureFromString includes unknown alias "${camel}" -> ${target}`);
   }
 }
 

@@ -110,6 +110,13 @@ pub fn platformFeatureFromString(value: []const u8) ?platform.PlatformFeature {
     if (std.mem.eql(u8, value, "fileDrops")) return .file_drops;
     if (std.mem.eql(u8, value, "appActivationEvents")) return .app_activation_events;
     if (std.mem.eql(u8, value, "gpuSurfaces")) return .gpu_surfaces;
+    if (std.mem.eql(u8, value, "gpuSurfaceScrollDrivers")) return .gpu_surface_scroll_drivers;
+    if (std.mem.eql(u8, value, "contextMenus")) return .context_menus;
+    if (std.mem.eql(u8, value, "viewSurfaceAdoption")) return .view_surface_adoption;
+    if (std.mem.eql(u8, value, "audioPlayback")) return .audio_playback;
+    if (std.mem.eql(u8, value, "audioStreaming")) return .audio_streaming;
+    if (std.mem.eql(u8, value, "audioSpectrum")) return .audio_spectrum;
+    if (std.mem.eql(u8, value, "windowHideOnClose")) return .window_hide_on_close;
     return null;
 }
 

@@ -153,6 +153,15 @@ pub const PlatformFeature = enum {
     /// keeps emitting; the null platform models the rule through its
     /// windows' modeled occlusion so the suites can pin it.
     audio_spectrum,
+    /// The `close_policy = .hide` window shape: the host can intercept
+    /// the user's close affordance, keep the window alive off the
+    /// glass, and re-show it later (`show_window_fn`, tray actions, the
+    /// macOS Dock reopen). macOS and Windows implement it; GTK reports
+    /// false — Linux has no status-item affordance in this toolkit, so
+    /// a hidden window would be unreachable, and window create refuses
+    /// the policy with a teaching error instead. The null platform
+    /// models full support.
+    window_hide_on_close,
 };
 
 pub const WebViewSourceKind = enum {
@@ -522,6 +531,24 @@ pub const WindowShowMode = enum {
     on_first_present,
 };
 
+/// What the user's close affordance (the red traffic light, cmd+W, the
+/// caption X) does to this window.
+/// `.quit` is the default and today's behavior unchanged: the window
+/// really closes, and the last close follows the host's exit semantics.
+/// `.hide` is the menu-bar/tray-app shape: the close affordance hides
+/// the window instead — it stays alive in the host's records (no
+/// shutdown), `WindowState.hidden` flips true on the frame channel,
+/// and `Effects.showWindow` / the macOS Dock reopen bring it back.
+/// Hosts that cannot re-show a hidden window (GTK has no status item
+/// to click) refuse `.hide` at create time with a teaching error —
+/// never a silent no-op that strands the window.
+/// Deliberate enum room for a future `.event` tier (model-decides
+/// close, for unsaved-changes flows) — not implemented yet.
+pub const WindowClosePolicy = enum {
+    quit,
+    hide,
+};
+
 pub const WindowOptions = struct {
     id: WindowId = 1,
     label: []const u8 = "main",
@@ -539,6 +566,9 @@ pub const WindowOptions = struct {
     /// does not grow an already-smaller restored frame.
     min_width: f32 = 0,
     min_height: f32 = 0,
+    /// What the user's close affordance does — see `WindowClosePolicy`.
+    /// Fixed at create like the titlebar: it is host window state.
+    close_policy: WindowClosePolicy = .quit,
 
     pub fn resolvedTitle(self: WindowOptions, app_name: []const u8) []const u8 {
         return if (self.title.len > 0) self.title else app_name;
@@ -555,6 +585,16 @@ pub const WindowState = struct {
     focused: bool = true,
     maximized: bool = false,
     fullscreen: bool = false,
+    /// True while the window is alive but off the glass because its
+    /// `close_policy = .hide` intercepted a user close (the menu-bar-app
+    /// shape): the window keeps its views and native identity, `open`
+    /// stays true, and a show — `Effects.showWindow`, a tray action's
+    /// consequence, the macOS Dock reopen — flips it back. Distinct from
+    /// minimized (which keeps a Dock/taskbar affordance) and from
+    /// closed (`open = false`, the window is gone). Session-transient:
+    /// never persisted to the window-state store, so every launch
+    /// starts shown.
+    hidden: bool = false,
 };
 
 pub const WindowInfo = struct {
@@ -565,6 +605,8 @@ pub const WindowInfo = struct {
     scale_factor: f32 = 1,
     open: bool = true,
     focused: bool = false,
+    /// Alive but policy-hidden — see `WindowState.hidden`.
+    hidden: bool = false,
 
     pub fn state(self: WindowInfo) WindowState {
         return .{
@@ -575,6 +617,7 @@ pub const WindowInfo = struct {
             .scale_factor = self.scale_factor,
             .open = self.open,
             .focused = self.focused,
+            .hidden = self.hidden,
         };
     }
 };
@@ -593,6 +636,8 @@ pub const WindowCreateOptions = struct {
     /// `WindowOptions.min_width`/`min_height`); 0 = no floor.
     min_width: f32 = 0,
     min_height: f32 = 0,
+    /// See `WindowOptions.close_policy`.
+    close_policy: WindowClosePolicy = .quit,
     source: ?WebViewSource = null,
 
     pub fn windowOptions(self: WindowCreateOptions, id: WindowId, label: []const u8) WindowOptions {
@@ -608,6 +653,7 @@ pub const WindowCreateOptions = struct {
             .show = self.show,
             .min_width = self.min_width,
             .min_height = self.min_height,
+            .close_policy = self.close_policy,
         };
     }
 };
@@ -1094,6 +1140,14 @@ pub const AppInfo = struct {
     /// default menus: web items like Reload only exist when a webview
     /// can answer them.
     has_web_content: bool = false,
+    /// Whether the manifest declares the "tray" capability (a status
+    /// item). Close policy `.hide` leans on it where the OS has no
+    /// built-in re-show affordance: hiding a window on windows removes
+    /// its taskbar entry and windows has no dock-reopen path, so only a
+    /// tray icon can bring the hidden window back. The Windows host
+    /// folds this into its `window_hide_on_close` answer; macOS ignores
+    /// it (the Dock reopen path always exists).
+    declares_tray: bool = false,
     window_title: []const u8 = "",
     bundle_id: []const u8 = "dev.native_sdk.app",
     icon_path: []const u8 = "",
@@ -2050,6 +2104,30 @@ pub const PlatformServices = struct {
     /// controls — chromeless windows have no system button to click.
     /// Platforms without the concept leave this null.
     minimize_window_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId) anyerror!void = null,
+    /// The real OS show verb: unhide + activate (macOS deminiaturize +
+    /// makeKeyAndOrderFront + activate, Windows SW_RESTORE/SW_SHOW +
+    /// foreground, GTK `gtk_window_present`) — the counterpart to a
+    /// `close_policy = .hide` hide, and the tray "Open" consequence.
+    /// Platforms without the concept leave this null.
+    show_window_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId) anyerror!void = null,
+    /// The graceful app quit: terminate through the SAME shutdown path
+    /// a last-window close takes — but the host QUEUES the emit, so
+    /// `app_shutdown` dispatches on its NEXT loop turn, only after the
+    /// dispatch that requested the quit has returned. Never emit
+    /// synchronously from inside this call: the request arrives mid
+    /// dispatch (the command whose update returned it is still on the
+    /// recorder's staged-event stack), and a nested emit seals the
+    /// session journal before the requesting command commits — the
+    /// record is lost and replay diverges. Before the run loop starts
+    /// (a quit from App.start's update, or from a boot command in the
+    /// synchronous first canvas frame) the host parks the request and
+    /// drains it at top level after the current callback returns.
+    /// Either way `app.stop` runs exactly once, and the shutdown is
+    /// journaled like any platform event. The null platform's
+    /// `quit_pending`/`takeQueuedQuit` seam is the reference model of
+    /// the queued shape. Platforms without the concept leave this
+    /// null.
+    quit_app_fn: ?*const fn (context: ?*anyopaque) anyerror!void = null,
     /// Hand the ACTIVE pointer-down to the platform as a window-drag
     /// gesture (the hidden-titlebar drag-region channel): the window
     /// moves once the pointer actually moves — a plain click moves
@@ -2354,6 +2432,16 @@ pub const PlatformServices = struct {
     pub fn minimizeWindow(self: PlatformServices, window_id: WindowId) anyerror!void {
         const minimize_fn = self.minimize_window_fn orelse return error.UnsupportedService;
         return minimize_fn(self.context, window_id);
+    }
+
+    pub fn showWindow(self: PlatformServices, window_id: WindowId) anyerror!void {
+        const show_fn = self.show_window_fn orelse return error.UnsupportedService;
+        return show_fn(self.context, window_id);
+    }
+
+    pub fn quitApp(self: PlatformServices) anyerror!void {
+        const quit_fn = self.quit_app_fn orelse return error.UnsupportedService;
+        return quit_fn(self.context);
     }
 
     pub fn startWindowDrag(self: PlatformServices, window_id: WindowId) anyerror!void {
@@ -2822,6 +2910,10 @@ fn defaultSupportsFeature(services: PlatformServices, feature: PlatformFeature) 
         // cannot see it; platforms that analyze answer through their own
         // `supports_fn` (like file_drops and gpu_surfaces above).
         .audio_spectrum => false,
+        // Hide-on-close is host close-delegate behavior, not a service
+        // verb: hosts that implement it answer through their own
+        // `supports_fn`. The generic floor is honest refusal.
+        .window_hide_on_close => false,
     };
 }
 

@@ -96,6 +96,7 @@ pub const RawWindow = struct {
     titlebar: []const u8 = "standard",
     min_width: f32 = 0,
     min_height: f32 = 0,
+    close_policy: []const u8 = "quit",
 };
 
 pub const RawShell = struct {
@@ -133,6 +134,7 @@ pub const RawShellWindow = struct {
     titlebar: []const u8 = "standard",
     min_width: f32 = 0,
     min_height: f32 = 0,
+    close_policy: []const u8 = "quit",
     views: []const RawShellView = &.{},
 };
 

@@ -347,6 +347,13 @@ struct native_sdk_gtk_host {
     int did_shutdown;
     int app_active;
     guint frame_timer;
+    /* The quit verb's queued stop turn (native_sdk_gtk_stop), tracked
+     * like frame_timer so it can be coalesced while pending and
+     * removed at destroy — a bare g_idle_add would leave a second stop
+     * request (the shutdown handler's error path can make one) holding
+     * a freed host after the loop quits. Zero while none is queued;
+     * the idle clears it as its first act. */
+    guint stop_idle_source;
 
     char **allowed_origins;
     int allowed_origins_count;
@@ -2845,6 +2852,12 @@ void native_sdk_gtk_destroy(native_sdk_gtk_host_t *host) {
      * anything else goes away; everything runs on this thread. */
     native_sdk_audio_release(host, 1);
     if (host->frame_timer) g_source_remove(host->frame_timer);
+    /* A stop turn still queued at teardown (the loop quit before the
+     * idle ran) must not fire into freed memory. */
+    if (host->stop_idle_source) {
+        g_source_remove(host->stop_idle_source);
+        host->stop_idle_source = 0;
+    }
     for (int i = 0; i < NATIVE_SDK_MAX_TIMERS; i++) {
         if (host->timers[i].in_use && host->timers[i].source) g_source_remove(host->timers[i].source);
         host->timers[i].in_use = 0;
@@ -2873,7 +2886,15 @@ void native_sdk_gtk_run(native_sdk_gtk_host_t *host, native_sdk_gtk_event_callba
     g_application_run(G_APPLICATION(host->app), 0, NULL);
 }
 
-void native_sdk_gtk_stop(native_sdk_gtk_host_t *host) {
+/* Runs on the GLib main loop: the quit verb's deferred stop turn. The
+ * same emitShutdown-then-quit the last window's close-request runs,
+ * just one loop turn later (see native_sdk_gtk_stop). */
+static gboolean native_sdk_stop_idle(gpointer data) {
+    native_sdk_gtk_host_t *host = data;
+    /* This turn is running: clear the tracked id FIRST, so the source
+     * cannot be double-removed (destroy) or wrongly treated as still
+     * pending (a re-quit during the shutdown dispatch below). */
+    host->stop_idle_source = 0;
     if (!host->did_shutdown) {
         host->did_shutdown = 1;
         native_sdk_emit(host, (native_sdk_gtk_event_t){ .kind = NATIVE_SDK_GTK_EVENT_SHUTDOWN });
@@ -2883,6 +2904,33 @@ void native_sdk_gtk_stop(native_sdk_gtk_host_t *host) {
         host->frame_timer = 0;
     }
     g_application_quit(G_APPLICATION(host->app));
+    return G_SOURCE_REMOVE;
+}
+
+void native_sdk_gtk_stop(native_sdk_gtk_host_t *host) {
+    /* Queued, never synchronous: this stop is the quit verb's landing
+     * point, and the verb arrives MID DISPATCH (a menu command's
+     * update returned it), so a synchronous SHUTDOWN emit would nest
+     * the shutdown dispatch inside the requesting command's — the
+     * session recorder commits nested events innermost-first and seals
+     * the journal on shutdown, so the nested seal drops the command
+     * record and replay diverges. The idle hop (the same seam the wake
+     * and frame-request paths ride) emits the identical
+     * emitShutdown + quit on the next loop turn, after the requesting
+     * dispatch has committed; g_application_run keeps pumping until
+     * the queued g_application_quit lands, so a quit that is the last
+     * thing an app ever does still exits promptly.
+     *
+     * Exactly-once hygiene: once the shutdown has emitted there is
+     * nothing left to stop, and while a stop turn is already queued a
+     * second request coalesces into it — a second bare g_idle_add
+     * (the shutdown handler's error path can request one) would leave
+     * an untracked source holding this host after the loop quits and
+     * the host is freed. The pending source id is tracked on the host
+     * (stop_idle_source, cleared by the idle itself) and removed at
+     * native_sdk_gtk_destroy. */
+    if (host->did_shutdown || host->stop_idle_source) return;
+    host->stop_idle_source = g_idle_add(native_sdk_stop_idle, host);
 }
 
 /* Runs on the GLib main loop: emit the wake event there, so the runtime

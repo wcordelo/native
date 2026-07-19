@@ -25,6 +25,8 @@ export interface NativeSdkWindowInfo {
   title: string;
   open: boolean;
   focused: boolean;
+  /** Alive but hidden by `close_policy = "hide"` — still open, not focused, invisible until re-shown. */
+  hidden: boolean;
   x: number;
   y: number;
   width: number;
@@ -419,7 +421,21 @@ export type NativeSdkPlatformFeature =
   | "app_activation_events"
   | "appActivationEvents"
   | "gpu_surfaces"
-  | "gpuSurfaces";
+  | "gpuSurfaces"
+  | "gpu_surface_scroll_drivers"
+  | "gpuSurfaceScrollDrivers"
+  | "context_menus"
+  | "contextMenus"
+  | "view_surface_adoption"
+  | "viewSurfaceAdoption"
+  | "audio_playback"
+  | "audioPlayback"
+  | "audio_streaming"
+  | "audioStreaming"
+  | "audio_spectrum"
+  | "audioSpectrum"
+  | "window_hide_on_close"
+  | "windowHideOnClose";
 
 export type NativeSdkPlatformFeatureSelector =
   | { feature: NativeSdkPlatformFeature; name?: never }

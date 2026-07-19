@@ -291,6 +291,14 @@ try runtime.run(my_app.app());
       <td>Close a window</td>
     </tr>
     <tr>
+      <td><code>showWindow(id) !void</code></td>
+      <td>Un-hide and activate a window (the counterpart to a <code>close_policy = "hide"</code> hide; also restores a minimized window)</td>
+    </tr>
+    <tr>
+      <td><code>quitApp() !void</code></td>
+      <td>Quit gracefully through the same shutdown path a last-window close takes</td>
+    </tr>
+    <tr>
       <td><code>invalidate()</code></td>
       <td>Request a redraw</td>
     </tr>

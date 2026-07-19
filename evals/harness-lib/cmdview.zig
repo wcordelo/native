@@ -1,5 +1,5 @@
 //! Decoder over the app-core Cmd/Sub wire format (rt.zig, cmd_format_version
-//! 2), shared by the ts-track behavioral harnesses. The graders copy this
+//! 3), shared by the ts-track behavioral harnesses. The graders copy this
 //! file next to each case's harness so assertions read decoded ops — "a
 //! fetch with key `feed` targeting this URL", "the delay re-armed" — instead
 //! of hand-built byte strings, which keeps harnesses lenient about the parts
@@ -26,6 +26,8 @@ pub const Op = union(enum) {
     spawn: Spawn,
     audio_play: struct { key: []const u8, event_tag: u8, path: []const u8, url: []const u8, cache_path: []const u8, expected_bytes: f64 },
     audio_ctl: struct { key: []const u8, verb: u8, value: f64 },
+    window_show: struct { label: []const u8 },
+    quit_app,
 
     pub const Host = struct {
         name: []const u8,
@@ -209,6 +211,16 @@ pub const CmdIter = struct {
                 off += 8;
                 break :blk .{ .audio_ctl = .{ .key = key, .verb = verb, .value = value } };
             },
+            // window_show [op][label_len u8][label] — the record shape the
+            // runtime's decoder reads (src/runtime/ts_core_host.zig, 0x10:
+            // one short-bytes label, nothing else).
+            0x10 => blk: {
+                const label = shortBytes(b, &off);
+                break :blk .{ .window_show = .{ .label = label } };
+            },
+            // quit_app [op] — a bare op byte, no payload (ts_core_host.zig,
+            // 0x11).
+            0x11 => .quit_app,
             else => std.debug.panic("cmdview: unknown op byte 0x{X:0>2} at offset {d}", .{ op, self.off }),
         };
         self.off = off;
@@ -298,4 +310,33 @@ pub fn findTimer(bytes: []const u8) ?@FieldType(SubOp, "timer") {
         return op.timer;
     }
     return null;
+}
+
+// ------------------------------------------------------------------- tests
+//
+// The wire bytes below are the encoders' pinned output (rt.zig
+// cmdWindowShow/cmdQuitApp — the same bytes packages/core/test/effects.test.ts
+// asserts), so a decoder drift from the format is caught here instead of
+// panicking mid-eval inside a case harness.
+
+test "window_show and quit_app decode, alone and inside a batch" {
+    // window_show: [op 0x10][label_len u8][label bytes].
+    const shown = findOp(&.{ 0x10, 6, 'p', 'l', 'a', 'y', 'e', 'r' }, .window_show) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("player", shown.label);
+
+    // quit_app: [op 0x11], no payload.
+    try std.testing.expectEqual(@as(usize, 1), countOps(&.{0x11}, .quit_app));
+
+    // A batch is a flat concatenation: both records must advance the
+    // iterator exactly their own length, so the trailing now record
+    // still decodes (a length drift would misread its op byte).
+    const batch = [_]u8{ 0x10, 4, 'm', 'a', 'i', 'n', 0x11, 0x02, 7 };
+    var iter = CmdIter.init(&batch);
+    const first = iter.next() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("main", first.window_show.label);
+    const second = iter.next() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(second == .quit_app);
+    const third = iter.next() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u8, 7), third.now.msg_tag);
+    try std.testing.expectEqual(@as(?Op, null), iter.next());
 }

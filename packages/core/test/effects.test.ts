@@ -26,7 +26,10 @@ export type Msg =
   | { readonly kind: "save" }
   | { readonly kind: "stamp" }
   | { readonly kind: "tick"; readonly at: number }
-  | { readonly kind: "ship" };
+  | { readonly kind: "ship" }
+  | { readonly kind: "open_player" }
+  | { readonly kind: "open_cjk" }
+  | { readonly kind: "quit" };
 
 export function initialModel(): Model {
   return { count: 0, saved: 0 };
@@ -39,6 +42,9 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
     case "stamp": return [model, Cmd.now("tick")];
     case "tick": return { ...model, count: msg.at };
     case "ship": return [model, Cmd.batch([Cmd.persist(), Cmd.host("beep", model.count, 2)])];
+    case "open_player": return [model, Cmd.showWindow("player")];
+    case "open_cjk": return [model, Cmd.showWindow("播放器")];
+    case "quit": return [model, Cmd.quitApp()];
   }
 }
 `;
@@ -66,9 +72,9 @@ fn dispatch(msg: core.Msg) []const u8 {
 }
 
 test "cmd bytes flow through update -> commit -> effect log" {
-    // v2 is additive: the v1 op records asserted below are byte-identical
-    // under the bumped version.
-    try std.testing.expectEqual(@as(u32, 2), rt.cmd_format_version);
+    // v3 is additive: the v1/v2 op records asserted below are
+    // byte-identical under the bumped version.
+    try std.testing.expectEqual(@as(u32, 3), rt.cmd_format_version);
 
     rt.resetAll();
     g_model = core.commitModelRoot(core.initialModel());
@@ -106,8 +112,22 @@ test "cmd bytes flow through update -> commit -> effect log" {
     const ship = dispatch(.ship);
     try std.testing.expectEqualSlices(u8, &expected, ship);
 
+    // window_show: [op 0x10][label_len][label] — the declared window
+    // label, exactly the Zig tier's fx.showWindow address.
+    const open_player = dispatch(.open_player);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x10, 6, 'p', 'l', 'a', 'y', 'e', 'r' }, open_player);
+
+    // A multibyte label's length prefix counts UTF-8 BYTES, not
+    // characters: three CJK characters are nine bytes on the wire.
+    const open_cjk = dispatch(.open_cjk);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x10, 9 } ++ "\\xe6\\x92\\xad\\xe6\\x94\\xbe\\xe5\\x99\\xa8", open_cjk);
+
+    // quit_app: [op 0x11], no payload.
+    const quit = dispatch(.quit);
+    try std.testing.expectEqualSlices(u8, &.{0x11}, quit);
+
     // The accumulated host-side log is every dispatch's bytes in order.
-    try std.testing.expectEqual(@as(usize, 1 + 2 + 24), g_effects_len);
+    try std.testing.expectEqual(@as(usize, 1 + 2 + 24 + 8 + 11 + 1), g_effects_len);
 }
 `;
 
@@ -217,7 +237,7 @@ fn expectRecord(bytes: []const u8, expected: []const u8) !void {
 }
 
 test "v2 wire: init command, payloads, routing, cancel, subscriptions" {
-    try std.testing.expectEqual(@as(u32, 2), rt.cmd_format_version);
+    try std.testing.expectEqual(@as(u32, 3), rt.cmd_format_version);
 
     var log: [512]u8 = undefined;
 
@@ -389,7 +409,7 @@ fn appendLong(list: *std.ArrayList(u8), a: std.mem.Allocator, bytes: []const u8)
 }
 
 test "named-op wire records match the documented additive layout" {
-    try std.testing.expectEqual(@as(u32, 2), rt.cmd_format_version);
+    try std.testing.expectEqual(@as(u32, 3), rt.cmd_format_version);
     const a = std.testing.allocator;
     var log: [512]u8 = undefined;
 

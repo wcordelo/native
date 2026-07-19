@@ -78,8 +78,11 @@ pub const magic = "NSDKSJNL";
 /// have reported the file corrupt instead of refusing the skew; v5
 /// added the pinch magnification `scale` field to gpu-surface input
 /// records (a layout change every v4 reader would misparse) plus the
-/// `pinch_begin`/`pinch_change`/`pinch_end` input kinds (codes 12-14).
-pub const format_version: u32 = 5;
+/// `pinch_begin`/`pinch_change`/`pinch_end` input kinds (codes 12-14);
+/// v6 added the `hidden` flag to window-frame records (the
+/// `close_policy = .hide` window state — a layout change every v5
+/// reader would misparse).
+pub const format_version: u32 = 6;
 
 // ------------------------------------------------------------- budgets
 //
@@ -429,6 +432,8 @@ pub fn encodeEvent(event: platform.Event, buffer: []u8) JournalError![]const u8 
             try cursor.writeBool(state.focused);
             try cursor.writeBool(state.maximized);
             try cursor.writeBool(state.fullscreen);
+            // v6: alive-but-policy-hidden (`close_policy = .hide`).
+            try cursor.writeBool(state.hidden);
         },
         .window_focused => |window_id| {
             try cursor.writeEnum(EventTag.window_focused);
@@ -616,6 +621,7 @@ pub fn decodeEvent(bytes: []const u8, storage: *EventDecodeStorage) JournalError
                 .focused = try cursor.readBool(),
                 .maximized = try cursor.readBool(),
                 .fullscreen = try cursor.readBool(),
+                .hidden = try cursor.readBool(),
             } };
         },
         .window_focused => .{ .window_focused = try cursor.readInt(u64) },
@@ -1137,6 +1143,22 @@ test "event codec round-trips every payload variant" {
         } });
         try testing.expectEqualStrings("settings", decoded.window_frame_changed.label);
         try testing.expect(!decoded.window_frame_changed.open);
+        try testing.expect(!decoded.window_frame_changed.hidden);
+    }
+    {
+        // v6: a policy-hide keeps the window alive (`open` true) and
+        // rides the `hidden` flag — both must survive the round trip.
+        const decoded = try roundTripEvent(.{ .window_frame_changed = .{
+            .id = 1,
+            .label = "main",
+            .title = "Player",
+            .frame = geometry.RectF.init(0, 0, 480, 360),
+            .open = true,
+            .focused = false,
+            .hidden = true,
+        } });
+        try testing.expect(decoded.window_frame_changed.open);
+        try testing.expect(decoded.window_frame_changed.hidden);
     }
     {
         const decoded = try roundTripEvent(.{ .bridge_message = .{

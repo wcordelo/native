@@ -51,6 +51,9 @@ const AppKitEvent = extern struct {
     y: f64,
     open: c_int,
     focused: c_int,
+    /// WINDOW_FRAME: nonzero while the window is alive but hidden by
+    /// its close_policy (`open` stays 1 for the whole hidden stretch).
+    hidden: c_int,
     label: [*]const u8,
     label_len: usize,
     shortcut_id: [*]const u8,
@@ -131,6 +134,7 @@ extern fn native_sdk_appkit_set_dock_icon_rgba(host: *AppKitHost, pixels: [*]con
 extern fn native_sdk_appkit_set_dock_icon_file(host: *AppKitHost, path: [*]const u8, path_len: usize) void;
 extern fn native_sdk_appkit_run(host: *AppKitHost, callback: AppKitCallback, context: ?*anyopaque) void;
 extern fn native_sdk_appkit_stop(host: *AppKitHost) void;
+extern fn native_sdk_appkit_request_stop(host: *AppKitHost) void;
 extern fn native_sdk_appkit_load_webview(host: *AppKitHost, source: [*]const u8, source_len: usize, source_kind: c_int, asset_root: [*]const u8, asset_root_len: usize, asset_entry: [*]const u8, asset_entry_len: usize, asset_origin: [*]const u8, asset_origin_len: usize, spa_fallback: c_int) void;
 extern fn native_sdk_appkit_load_window_webview(host: *AppKitHost, window_id: u64, source: [*]const u8, source_len: usize, source_kind: c_int, asset_root: [*]const u8, asset_root_len: usize, asset_entry: [*]const u8, asset_entry_len: usize, asset_origin: [*]const u8, asset_origin_len: usize, spa_fallback: c_int) void;
 extern fn native_sdk_appkit_set_bridge_callback(host: *AppKitHost, callback: AppKitBridgeCallback, context: ?*anyopaque) void;
@@ -147,6 +151,8 @@ extern fn native_sdk_appkit_set_window_content_min_size(host: *AppKitHost, windo
 extern fn native_sdk_appkit_focus_window(host: *AppKitHost, window_id: u64) c_int;
 extern fn native_sdk_appkit_close_window(host: *AppKitHost, window_id: u64) c_int;
 extern fn native_sdk_appkit_minimize_window(host: *AppKitHost, window_id: u64) c_int;
+extern fn native_sdk_appkit_show_window(host: *AppKitHost, window_id: u64) c_int;
+extern fn native_sdk_appkit_set_window_close_policy(host: *AppKitHost, window_id: u64, close_policy: c_int) c_int;
 extern fn native_sdk_appkit_start_window_drag(host: *AppKitHost, window_id: u64) c_int;
 extern fn native_sdk_appkit_window_chrome_insets(host: *AppKitHost, window_id: u64, top: *f64, left: *f64, bottom: *f64, right: *f64, buttons_x: *f64, buttons_y: *f64, buttons_width: *f64, buttons_height: *f64) c_int;
 extern fn native_sdk_appkit_create_view(host: *AppKitHost, window_id: u64, label: [*]const u8, label_len: usize, kind: c_int, parent: [*]const u8, parent_len: usize, x: f64, y: f64, width: f64, height: f64, layer: c_int, visible: c_int, enabled: c_int, role: [*]const u8, role_len: usize, accessibility_label: [*]const u8, accessibility_label_len: usize, text: [*]const u8, text_len: usize, command: [*]const u8, command_len: usize) c_int;
@@ -546,6 +552,10 @@ pub const MacPlatform = struct {
         // (AppKit `contentMinSize`); the create call above registers
         // the window under its id, so the floor applies right after.
         applyWindowContentMinSize(host, window_options.id, window_options.min_width, window_options.min_height);
+        // Same timing for the declared close policy: the manifest's
+        // .hide threads through here so the STARTUP window's red
+        // button hides from the first frame on.
+        applyWindowClosePolicy(host, window_options.id, window_options.close_policy);
         return .{
             .host = host,
             .web_engine = web_engine,
@@ -584,6 +594,8 @@ pub const MacPlatform = struct {
                 .focus_window_fn = focusWindow,
                 .close_window_fn = closeWindow,
                 .minimize_window_fn = minimizeWindow,
+                .show_window_fn = showWindow,
+                .quit_app_fn = quitApp,
                 .start_window_drag_fn = startWindowDrag,
                 .window_chrome_fn = windowChrome,
                 .create_view_fn = createView,
@@ -667,6 +679,10 @@ pub const MacPlatform = struct {
             .recent_documents,
             .credentials,
             .app_activation_events,
+            // close_policy .hide: windowShouldClose orders the window
+            // out instead of closing, the Dock reopen re-shows it —
+            // both hosts (AppKit and the CEF variant) implement it.
+            .window_hide_on_close,
             => true,
             .context_menus => true,
             .native_views,
@@ -771,6 +787,7 @@ fn appkitCallback(context: ?*anyopaque, event: *const AppKitEvent) callconv(.c) 
                 .scale_factor = @floatCast(event.scale),
                 .open = event.open != 0,
                 .focused = event.focused != 0,
+                .hidden = event.hidden != 0,
             } });
         },
         .shortcut => state.emit(.{ .shortcut = .{
@@ -1046,6 +1063,22 @@ fn showModeInt(mode: platform_mod.WindowShowMode) c_int {
     };
 }
 
+fn closePolicyInt(policy: platform_mod.WindowClosePolicy) c_int {
+    return switch (policy) {
+        .quit => 0,
+        .hide => 1,
+    };
+}
+
+/// Register a window's declared close policy with the host, right
+/// after create (the min-size-floor pattern: close handling is host
+/// window state fixed for the window's life). `.quit` skips the call —
+/// it IS the host default.
+fn applyWindowClosePolicy(host: *AppKitHost, window_id: u64, policy: platform_mod.WindowClosePolicy) void {
+    if (policy == .quit) return;
+    _ = native_sdk_appkit_set_window_close_policy(host, window_id, closePolicyInt(policy));
+}
+
 /// Apply a declared content min-size floor to a created window
 /// (AppKit `contentMinSize`). Zero/negative/non-finite floors are the
 /// "no floor" sentinel and skip the call — the window keeps AppKit's
@@ -1063,6 +1096,7 @@ fn createWindow(context: ?*anyopaque, options: platform_mod.WindowOptions) anyer
     const frame = options.default_frame;
     if (native_sdk_appkit_create_window(self.host, options.id, title.ptr, title.len, options.label.ptr, options.label.len, frame.x, frame.y, frame.width, frame.height, if (options.restore_state) 1 else 0, if (options.resizable) 1 else 0, titlebarStyleInt(options.titlebar), showModeInt(options.show)) == 0) return error.CreateFailed;
     applyWindowContentMinSize(self.host, options.id, options.min_width, options.min_height);
+    applyWindowClosePolicy(self.host, options.id, options.close_policy);
     return .{
         .id = options.id,
         .label = options.label,
@@ -1087,6 +1121,28 @@ fn closeWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!
 fn minimizeWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!void {
     const self: *MacPlatform = @ptrCast(@alignCast(context.?));
     if (native_sdk_appkit_minimize_window(self.host, window_id) == 0) return error.WindowNotFound;
+}
+
+fn showWindow(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!void {
+    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    if (native_sdk_appkit_show_window(self.host, window_id) == 0) return error.WindowNotFound;
+}
+
+/// The graceful quit: the same emitShutdown + stop the last-window
+/// close runs, ALWAYS deferred past the dispatch that requested it —
+/// this verb arrives mid dispatch (the command whose update returned
+/// it is still being dispatched), and `app_shutdown` must emit only
+/// after that dispatch returns, or a recording session seals its
+/// journal before the requesting command commits (the command record
+/// is lost and replay diverges). While the run loop is live the host
+/// queues one loop turn; before [NSApp run] (a quit from App.start's
+/// update, or from a boot command during the synchronous first canvas
+/// frame) it parks the request and drains it at top level — never the
+/// inline emit `native_sdk_appkit_stop` keeps for the host-side
+/// failed-START request.
+fn quitApp(context: ?*anyopaque) anyerror!void {
+    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    native_sdk_appkit_request_stop(self.host);
 }
 
 fn startWindowDrag(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!void {

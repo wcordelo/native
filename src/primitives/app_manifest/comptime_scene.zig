@@ -83,6 +83,9 @@ fn shellWindowFrom(comptime window: anytype) types.ShellWindow {
     }
     if (@hasField(@TypeOf(window), "min_width")) out.min_width = window.min_width;
     if (@hasField(@TypeOf(window), "min_height")) out.min_height = window.min_height;
+    if (@hasField(@TypeOf(window), "close_policy")) {
+        out.close_policy = enumField(types.WindowClosePolicy, window.close_policy, "close_policy");
+    }
     if (@hasField(@TypeOf(window), "views")) {
         var views: []const types.ShellView = &.{};
         for (window.views) |view| {
@@ -210,6 +213,7 @@ test "shellConfigFrom converts a zon-shaped scene" {
                     .height = 320,
                     .restore_state = false,
                     .restore_policy = "center_on_primary",
+                    .close_policy = "hide",
                     .views = .{
                         .{ .label = "main-canvas", .kind = "gpu_surface", .fill = true, .gpu_backend = "metal", .gpu_vsync = true },
                     },
@@ -223,6 +227,7 @@ test "shellConfigFrom converts a zon-shaped scene" {
     try std.testing.expectEqualStrings("Demo", scene.windows[0].title.?);
     try std.testing.expectEqual(@as(f32, 480), scene.windows[0].width);
     try std.testing.expectEqual(types.WindowRestorePolicy.center_on_primary, scene.windows[0].restore_policy);
+    try std.testing.expectEqual(types.WindowClosePolicy.hide, scene.windows[0].close_policy);
     try std.testing.expectEqual(@as(usize, 1), scene.windows[0].views.len);
     try std.testing.expectEqual(types.ViewKind.gpu_surface, scene.windows[0].views[0].kind);
     try std.testing.expectEqual(types.GpuSurfaceBackend.metal, scene.windows[0].views[0].gpu_backend.?);

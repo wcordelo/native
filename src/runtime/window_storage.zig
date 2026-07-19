@@ -37,6 +37,29 @@ pub fn RuntimeWindowStorage(comptime Runtime: type) type {
 
         pub fn focusWindow(self: *Runtime, window_id: platform.WindowId) anyerror!void {
             const index = Self.findWindowIndexById(self, window_id) orelse return error.WindowNotFound;
+            // Liveness before the platform call, like showWindow: a
+            // closed window keeps its table slot until the id or label
+            // is re-created, and close clears `hidden` with `open`, so
+            // a dead slot would skip the hidden-routing below and reach
+            // the platform's focus verb directly — the CEF host retains
+            // browser-bearing windows past their close and would order
+            // the closed window back front. Dead slots answer
+            // WindowNotFound, the runtime's one answer for them.
+            if (!self.windows[index].info.open) return error.WindowNotFound;
+            // Focus implies visibility: a window hidden by its .hide
+            // close policy must leave the hidden state through the REAL
+            // show verb before it takes key. The hosts' focus paths
+            // order a window forward without touching their
+            // policy-hidden bookkeeping (macOS would report hidden=true
+            // on a window standing on the glass; Windows never shows an
+            // SW_HIDE'd window at all, leaving focused=true on an
+            // invisible one), while their show paths clear that
+            // bookkeeping and emit the state — and the runtime's
+            // showWindow flips its own hidden flag with rollback on
+            // platform failure. One rule, at this seam, so every focus
+            // ingress (the app verb, the JS bridge's window.focus)
+            // resolves hidden-then-focus the same way.
+            if (self.windows[index].info.hidden) try self.showWindow(window_id);
             try self.options.platform.services.focusWindow(window_id);
             try Self.setFocusedIndex(self, index);
             self.invalidated = true;
@@ -64,6 +87,14 @@ pub fn RuntimeWindowStorage(comptime Runtime: type) type {
             }
             const id = if (options.id != 0) options.id else Self.allocateWindowId(self);
             try validateWindowFrame(options.default_frame);
+            // `.hide` needs a host that can keep a closed-by-the-user
+            // window alive and re-show it; refusing here is the loud
+            // teaching (GTK: no status item exists to bring the window
+            // back, declare .quit — the default — instead). NEVER a
+            // silent no-op that strands a hidden window.
+            if (options.close_policy == .hide and !self.options.platform.supports(.window_hide_on_close)) {
+                return error.UnsupportedWindowClosePolicy;
+            }
             if (Self.findWindowIndexById(self, id) != null) return error.DuplicateWindowId;
             if (Self.findWindowIndexByLabel(self, label) != null) return error.DuplicateWindowLabel;
             const index = try Self.reserveWindow(self, id, label, options.title, source, source_reloads_from_app);
@@ -151,6 +182,7 @@ pub fn RuntimeWindowStorage(comptime Runtime: type) type {
             self.windows[index].info.frame = state.frame;
             self.windows[index].info.scale_factor = state.scale_factor;
             self.windows[index].info.open = state.open;
+            self.windows[index].info.hidden = state.hidden;
             if (!self.windows[index].main_frame_set) {
                 self.windows[index].main_frame = geometry.RectF.init(0, 0, state.frame.width, state.frame.height);
             }

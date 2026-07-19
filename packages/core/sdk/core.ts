@@ -10,7 +10,7 @@
 // return path (NS1017) — they never live in the Model, in a Msg, in a local,
 // or in a helper.
 //
-// The v2 command set:
+// The v3 command set:
 //
 //   Cmd.none                     no effects (what a bare `return model` means)
 //   Cmd.persist()                ask the host to persist the committed model
@@ -103,6 +103,21 @@
 //                                forget control verbs whose consequences arrive
 //                                on the event stream; aimed at a key with no
 //                                open stream they no-op.
+//
+// The window verbs (fire-and-forget, no result Msg — the window's own
+// frame event carries the state):
+//
+//   Cmd.showWindow(label)        un-hide + activate the window with the
+//                                declared label — the counterpart to a
+//                                `close_policy = "hide"` hide and the tray
+//                                "Open" consequence; also restores a
+//                                minimized window. An unknown label is a
+//                                no-op.
+//   Cmd.quitApp()                graceful terminate, the tray "Quit"
+//                                consequence: the host quits through the
+//                                SAME shutdown path a last-window close
+//                                takes, so the stop hook runs exactly once
+//                                and a recording session seals its journal.
 //
 // The keyed-effect discipline is ONE rule: a keyed effect REPLACES its live
 // predecessor (the superseded effect's result is dropped — no message), and
@@ -431,6 +446,8 @@ export type Cmd<M extends Msgish> =
       /// Seek position (ms) / volume (0..1); 0 for the value-less verbs.
       readonly value: number;
     }
+  | { readonly op: "window_show"; readonly label: string }
+  | { readonly op: "quit_app" }
   | { readonly op: "batch"; readonly cmds: readonly Cmd<M>[] };
 
 /// The wire encoding of a host record payload, byte-identical to what the
@@ -657,6 +674,24 @@ export const Cmd = {
   /// next audioPlay re-applies it.
   audioSetVolume(key: string, volume: number): Cmd<never> {
     return { op: "audio_ctl", key, verb: "volume", value: volume };
+  },
+
+  /// Show the window with the declared `label`: un-hide + activate — the
+  /// counterpart to a `close_policy = "hide"` hide and the tray "Open"
+  /// consequence; also restores a minimized window. Fire-and-forget: no
+  /// result Msg (the window's own frame event carries the state), and an
+  /// unknown label is a no-op. The label is a string literal — window
+  /// labels are declarations.
+  showWindow(label: string): Cmd<never> {
+    return { op: "window_show", label };
+  },
+
+  /// Quit the app for real — the graceful terminate, and the tray "Quit"
+  /// consequence. The host quits through the SAME shutdown path a
+  /// last-window close takes, so the stop hook runs exactly once and a
+  /// recording session seals its journal. Fire-and-forget.
+  quitApp(): Cmd<never> {
+    return { op: "quit_app" };
   },
 
   /// Several commands from one dispatch, performed in order.

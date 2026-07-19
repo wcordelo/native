@@ -280,6 +280,23 @@ pub const NullPlatform = struct {
     /// the null platform has no Dock to genie into, so the count IS the
     /// behavior tests pin.
     window_minimize_count: [max_windows]u32 = [_]u32{0} ** max_windows,
+    /// Show calls per window (`show_window_fn`), indexed like `windows`
+    /// — the counterpart seam (tray "Open", the un-hide verb).
+    window_show_count: [max_windows]u32 = [_]u32{0} ** max_windows,
+    /// Graceful-quit requests (`quit_app_fn`). The real hosts QUEUE
+    /// the stop onto their run loop (macOS dispatch_async, GTK
+    /// g_idle_add, Windows PostQuitMessage) so `app_shutdown` emits
+    /// only on the NEXT loop turn, after the dispatch that requested
+    /// the quit has returned — a recorded command that quits commits
+    /// to the session journal before the shutdown record seals it.
+    /// The modeled host mirrors that shape: `quitApp` only records the
+    /// request, and `takeQueuedQuit` hands the test the deferred
+    /// shutdown event to dispatch as its own loop turn.
+    quit_request_count: u32 = 0,
+    /// The queued stop `quitApp` armed and `takeQueuedQuit` has not
+    /// yet drained — the modeled twin of the hosts' pending idle/queue
+    /// entry (exactly-once, like their did-shutdown latches).
+    quit_pending: bool = false,
     /// Modeled occlusion per window, indexed like `windows`: true while
     /// the modeled window does not reach the glass (minimized, or a
     /// test covered it via `setWindowOccluded`). Drives the
@@ -292,6 +309,23 @@ pub const NullPlatform = struct {
     /// Captured `WindowOptions.show` per created window: the
     /// present-before-show policy that must survive to the create seam.
     window_show: [max_windows]types.WindowShowMode = [_]types.WindowShowMode{.immediate} ** max_windows,
+    /// Captured `WindowOptions.close_policy` per created window — the
+    /// seam-regression capture (like `window_resizable`) AND the
+    /// modeled behavior: `userCloseWindow` consults it exactly like the
+    /// real hosts' close delegates, hiding instead of closing under
+    /// `.hide`.
+    window_close_policy: [max_windows]types.WindowClosePolicy = [_]types.WindowClosePolicy{.quit} ** max_windows,
+    /// Test seam: make the NEXT `close_window_fn` call fail with
+    /// `error.CloseFailed` (the real hosts' refusal), consuming the
+    /// flag — the injection runtime rollback tests use to assert
+    /// `closeWindow` restores every flag it flipped optimistically
+    /// (open, focused, hidden).
+    fail_next_close_window: bool = false,
+    /// Test seam: make the NEXT `show_window_fn` call fail with
+    /// `error.ShowFailed`, consuming the flag — the injection the
+    /// runtime's `showWindow` rollback test uses to assert a refused
+    /// show restores hidden and moves no focus.
+    fail_next_show_window: bool = false,
     /// Captured `WindowOptions.min_width`/`min_height` per created
     /// window — the content min-size floor that must survive to the
     /// create seam (macOS applies it as `contentMinSize`); same
@@ -568,6 +602,11 @@ pub const NullPlatform = struct {
     /// path) set it false, which nulls the service AND the feature
     /// report — the same shape as a real host without a presenter.
     context_menus: bool = true,
+    /// Whether this modeled host can hide-on-close and re-show (the
+    /// `close_policy = .hide` shape). On by default, modeling
+    /// macOS/Windows; tests modeling a host without the affordance
+    /// (GTK) set it false and pin the runtime's create-time refusal.
+    window_hide_on_close: bool = true,
     /// Native context-menu recorder: presentations record the request and
     /// return; tests then feed the selection back as a
     /// `.context_menu_action` platform event.
@@ -616,6 +655,8 @@ pub const NullPlatform = struct {
                 .focus_window_fn = focusWindow,
                 .close_window_fn = closeWindow,
                 .minimize_window_fn = minimizeWindow,
+                .show_window_fn = showWindow,
+                .quit_app_fn = quitApp,
                 .start_window_drag_fn = startWindowDrag,
                 .window_chrome_fn = windowChrome,
                 .set_window_drag_regions_fn = setWindowDragRegions,
@@ -706,6 +747,11 @@ pub const NullPlatform = struct {
             // app-owned platform view into — reporting support would be a
             // lie the first adopt call exposes.
             .view_surface_adoption => false,
+            // Models the macOS/Windows hosts by default: user closes
+            // honor the captured close policy and hidden windows
+            // re-show, so the runtime suites can pin the whole
+            // menu-bar-app loop. Tests flip it false to model GTK.
+            .window_hide_on_close => self.window_hide_on_close,
             .audio_playback => self.audio_playback,
             .audio_streaming => self.audio_playback and self.audio_streaming,
             .audio_spectrum => self.audio_playback and self.audio_spectrum,
@@ -847,6 +893,7 @@ pub const NullPlatform = struct {
         self.window_resizable[self.window_count] = options.resizable;
         self.window_titlebar[self.window_count] = options.titlebar;
         self.window_show[self.window_count] = options.show;
+        self.window_close_policy[self.window_count] = options.close_policy;
         self.window_min_width[self.window_count] = options.min_width;
         self.window_min_height[self.window_count] = options.min_height;
         self.window_first_present_seq[self.window_count] = 0;
@@ -928,9 +975,19 @@ pub const NullPlatform = struct {
 
     fn closeWindow(context: ?*anyopaque, window_id: WindowId) anyerror!void {
         const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        if (self.fail_next_close_window) {
+            self.fail_next_close_window = false;
+            return error.CloseFailed;
+        }
         const index = self.findWindowIndex(window_id) orelse return error.WindowNotFound;
         self.windows[index].open = false;
         self.windows[index].focused = false;
+        // hidden clears WITH open, mirroring the real hosts' close
+        // paths (every macOS close exit leaves the policy-hidden set
+        // before its emit) and the runtime table's own close flip: a
+        // closed window is not "hidden", it is gone — a stale
+        // hidden=true here is exactly what lets a reopen resurrect it.
+        self.windows[index].hidden = false;
         self.removeViewsForWindow(window_id);
         self.removeWebViewsForWindow(window_id);
     }
@@ -946,6 +1003,54 @@ pub const NullPlatform = struct {
         self.windows[index].focused = false;
         self.window_minimize_count[index] += 1;
         self.window_occluded[index] = true;
+    }
+
+    fn showWindow(context: ?*anyopaque, window_id: WindowId) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        if (self.fail_next_show_window) {
+            self.fail_next_show_window = false;
+            return error.ShowFailed;
+        }
+        const index = self.findWindowIndex(window_id) orelse return error.WindowNotFound;
+        // The un-hide verb: back on the glass with focus, exactly the
+        // real hosts' deminiaturize + order-front + activate. Clears a
+        // policy-hide, a minimize's occlusion, and a still-deferred
+        // present-before-show alike.
+        self.windows[index].hidden = false;
+        self.window_occluded[index] = false;
+        for (self.windows[0..self.window_count], 0..) |*window, cursor| {
+            window.focused = cursor == index;
+        }
+        if (!self.window_visible[index]) {
+            self.window_visible[index] = true;
+            self.show_op_seq += 1;
+            self.window_shown_seq[index] = self.show_op_seq;
+        }
+        self.window_show_count[index] += 1;
+    }
+
+    fn quitApp(context: ?*anyopaque) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        self.quit_request_count += 1;
+        self.quit_pending = true;
+    }
+
+    /// Test seam: drain the stop the quit verb queued — the modeled
+    /// host echo, and the modeled NEXT LOOP TURN. Real hosts defer the
+    /// shutdown emit past the dispatch that requested it (see
+    /// `quit_request_count`); a test models that by dispatching the
+    /// returned event only after the quitting dispatch has returned,
+    /// exactly the `userCloseWindow` shape. The PRE-RUN quit rides the
+    /// same model: a quit requested before the hosts' run loop exists
+    /// (App.start's update, a boot command in the synchronous first
+    /// canvas frame) parks on the host and drains at top level after
+    /// the boot dispatch returns — arm here, drain here, identically.
+    /// Answers exactly once per armed quit; null while nothing is
+    /// queued.
+    pub fn takeQueuedQuit(self: *NullPlatform) ?Event {
+        if (!self.quit_pending) return null;
+        self.quit_pending = false;
+        return .app_shutdown;
     }
 
     fn createView(context: ?*anyopaque, options: ViewOptions) anyerror!void {
@@ -1965,13 +2070,34 @@ pub const NullPlatform = struct {
         self.view_count -= 1;
     }
 
-    /// Test seam: the USER closed a window. Real hosts' window
-    /// delegates tear the native window out of their records before
-    /// emitting the open=false frame event (macOS `windowWillClose`),
-    /// so the fake host mirrors that — remove the window and its views
-    /// here, then dispatch the returned event through the runtime.
+    /// Test seam: the USER closed a window. Under the default `.quit`
+    /// policy this models the real hosts' window delegates, which tear
+    /// the native window out of their records before emitting the
+    /// open=false frame event (macOS `windowWillClose`) — remove the
+    /// window and its views here, then dispatch the returned event
+    /// through the runtime. Under `close_policy = .hide` it models the
+    /// intercepting delegate instead (macOS `windowShouldClose`
+    /// answering NO + `orderOut`, Win32 `WM_CLOSE` answering with
+    /// `SW_HIDE`): the window and its views stay, only the glass loses
+    /// it, and the returned frame event carries open=true hidden=true.
     pub fn userCloseWindow(self: *NullPlatform, window_id: WindowId) ?Event {
         const index = self.findWindowIndex(window_id) orelse return null;
+        if (self.window_close_policy[index] == .hide) {
+            self.windows[index].hidden = true;
+            self.windows[index].focused = false;
+            self.window_occluded[index] = true;
+            const info = self.windows[index];
+            return .{ .window_frame_changed = .{
+                .id = info.id,
+                .label = info.label,
+                .title = info.title,
+                .frame = info.frame,
+                .scale_factor = info.scale_factor,
+                .open = true,
+                .focused = false,
+                .hidden = true,
+            } };
+        }
         const info = self.windows[index];
         self.removeViewsForWindow(window_id);
         self.removeWebViewsForWindow(window_id);
@@ -1987,11 +2113,62 @@ pub const NullPlatform = struct {
         } };
     }
 
+    /// Test seam: the user asked the app to come back with no window on
+    /// the glass (the macOS Dock-icon reopen). Models the host's
+    /// `applicationShouldHandleReopen:` — every window hidden by its
+    /// `.hide` close policy re-shows — and returns one frame event per
+    /// re-shown window (dispatch them through the runtime like any
+    /// platform event). Windows hidden some other way (minimized,
+    /// occluded) are the OS's to restore, exactly like the real host.
+    pub fn userReopenApp(self: *NullPlatform, output: []Event) []const Event {
+        var count: usize = 0;
+        for (self.windows[0..self.window_count], 0..) |*window, index| {
+            if (!window.hidden) continue;
+            // Liveness, not just the hidden flag: a closed window keeps
+            // its slot in this mirror, and the reopen must never
+            // resurrect one — even if a close path left the hidden flag
+            // stale, re-showing a window the app closed (hidden=false,
+            // focused=true, a frame event) is the exact bug the real
+            // hosts' set hygiene prevents.
+            if (!window.open) continue;
+            if (count >= output.len) break;
+            window.hidden = false;
+            window.focused = count == 0;
+            self.window_occluded[index] = false;
+            output[count] = .{ .window_frame_changed = .{
+                .id = window.id,
+                .label = window.label,
+                .title = window.title,
+                .frame = window.frame,
+                .scale_factor = window.scale_factor,
+                .open = true,
+                .focused = window.focused,
+                .hidden = false,
+            } };
+            count += 1;
+        }
+        return output[0..count];
+    }
+
+    /// Test seam: the captured close policy for a created window (the
+    /// create-seam regression observable, like `window_titlebar`).
+    pub fn closePolicyForWindow(self: *const NullPlatform, window_id: WindowId) ?types.WindowClosePolicy {
+        const index = self.findWindowIndex(window_id) orelse return null;
+        return self.window_close_policy[index];
+    }
+
     /// Test seam: minimize calls observed for a window (the null host
     /// has no Dock, so the count is the pinned behavior).
     pub fn minimizeCountForWindow(self: *const NullPlatform, window_id: WindowId) u32 {
         const index = self.findWindowIndex(window_id) orelse return 0;
         return self.window_minimize_count[index];
+    }
+
+    /// Test seam: show calls observed for a window (the un-hide verb's
+    /// pinned observable, like `minimizeCountForWindow`).
+    pub fn showCountForWindow(self: *const NullPlatform, window_id: WindowId) u32 {
+        const index = self.findWindowIndex(window_id) orelse return 0;
+        return self.window_show_count[index];
     }
 
     /// Test seam: model a window leaving or returning to the glass
@@ -2026,7 +2203,9 @@ pub const NullPlatform = struct {
             self.window_min_width[cursor] = self.window_min_width[cursor + 1];
             self.window_min_height[cursor] = self.window_min_height[cursor + 1];
             self.window_minimize_count[cursor] = self.window_minimize_count[cursor + 1];
+            self.window_show_count[cursor] = self.window_show_count[cursor + 1];
             self.window_occluded[cursor] = self.window_occluded[cursor + 1];
+            self.window_close_policy[cursor] = self.window_close_policy[cursor + 1];
         }
         self.window_count -= 1;
     }

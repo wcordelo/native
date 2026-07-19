@@ -1,6 +1,6 @@
 //! The native host consumer for transpiled app cores: bridges the
 //! versioned command/subscription wire format a transpiled core emits
-//! (`packages/core/rt/rt.zig`, `cmd_format_version` 2) onto the
+//! (`packages/core/rt/rt.zig`, `cmd_format_version` 3) onto the
 //! real effect engine (`effects.zig`). The transpiler's output is a
 //! pure Model/Msg/update core whose effects are INERT BYTES — this
 //! module is the one place those bytes become engine calls, so the
@@ -134,6 +134,13 @@
 //!                  (the playback it aimed at is gone). `stop` also
 //!                  retires the bridge entry — no events for that key
 //!                  after it.
+//!   window_show -> `fx.showWindow(label)` — fire-and-forget, label-
+//!                  addressed like the Zig tier's verb: un-hide +
+//!                  activate (the tray "Open" consequence of the
+//!                  menu-bar-app loop). No result Msg; the window's own
+//!                  frame event carries the state.
+//!   quit_app    -> `fx.quitApp()` — the graceful terminate through the
+//!                  same shutdown path a last-window close takes.
 //!   cancel      -> by wire key, first match wins in this order: the
 //!                  request table (`fx.cancelHostRequest`, silent), the
 //!                  named-op table (the entry is marked dropped and
@@ -546,7 +553,7 @@ pub fn TsCoreHost(comptime core: type) type {
 
         // ------------------------------------------------- command walk
 
-        /// Walk one command value (v2 wire format; batch is plain
+        /// Walk one command value (v3 wire format; batch is plain
         /// concatenation, the empty slice is `Cmd.none`).
         fn runCmd(
             fx: *Fx,
@@ -754,6 +761,13 @@ pub fn TsCoreHost(comptime core: type) type {
                         const value: f64 = @bitCast(std.mem.readInt(u64, value_bits[0..8], .little));
                         runAudioCtl(fx, key, verb, value);
                     },
+                    // window_show [op][label_len][label]
+                    0x10 => {
+                        const label = takeShortBytes(cmd, &at);
+                        fx.showWindow(label);
+                    },
+                    // quit_app [op]
+                    0x11 => fx.quitApp(),
                     else => @panic("ts core host: unknown command wire record - the core and this runtime disagree on cmd_format_version"),
                 }
             }

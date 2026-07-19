@@ -1015,7 +1015,7 @@ pub fn Kernel(comptime opts: Options) type {
 
         // -------------------------------------------------------- commands
         //
-        // Cmd wire format v2 — the byte encoding of the command value an effectful
+        // Cmd wire format v3 — the byte encoding of the command value an effectful
         // `update` (or a pair-returning `initialModel`) returns alongside the next
         // model (`UpdateResult.cmd` / `InitResult.cmd` in emitted cores). A command
         // value is a flat sequence of op records; the empty slice means "no
@@ -1052,12 +1052,15 @@ pub fn Kernel(comptime opts: Options) type {
         //              [path_len u32 LE][path][url_len u32 LE][url]
         //              [cache_len u32 LE][cache_path][expected_bytes f64 LE]
         //   audio_ctl  [op 0x0F][key_len u8][key bytes][verb u8][value f64 LE]
+        //   window_show [op 0x10][label_len u8][label bytes]
+        //   quit_app   [op 0x11]
         //
         // v2 is additive over v1: the 0x01-0x03 records are byte-identical to v1,
         // so a v1 effect log replays under a v2 reader unchanged. The named-op
         // records 0x07-0x0C are additive within v2 the same way, and so are the
         // streaming records 0x0D-0x0F: no existing record's bytes change, new
-        // opcodes only.
+        // opcodes only. v3 appends the window-verb records 0x10-0x11 under the
+        // same rule: every v2 record is byte-identical, new opcodes only.
         //
         // `method` is the closed HTTP verb set in declaration order of `CmdFetchMethod`
         // (GET 0, POST 1, PUT 2, DELETE 3, PATCH 4, HEAD 5). `timeout_ms` 0 means
@@ -1178,6 +1181,19 @@ pub fn Kernel(comptime opts: Options) type {
         //               no open stream is a no-op (the playback it aimed at
         //               is already gone). `stop` closes the stream: no
         //               events for that key after it.
+        //   window_show fire-and-forget window verb, LABEL-addressed (the
+        //               declared window label, the same address the Zig
+        //               tier's `fx.showWindow` takes): un-hide + activate
+        //               the window — the counterpart to a
+        //               `close_policy = "hide"` hide and the tray "Open"
+        //               consequence; also restores a minimized window. No
+        //               result Msg; the window's own frame event carries
+        //               the state. An unknown label is a no-op.
+        //   quit_app   fire-and-forget graceful terminate: the host quits
+        //               through the SAME shutdown path a last-window close
+        //               takes (app_shutdown emits, the stop hook runs
+        //               exactly once, a recording session seals its
+        //               journal). No payload, no result Msg.
         //
         // Key discipline is ONE rule across request, the named engine ops
         // (read_file/write_file/fetch/clip_read), and delay: issuing an
@@ -1209,7 +1225,7 @@ pub fn Kernel(comptime opts: Options) type {
         // copies) them after the model commit and BEFORE frameReset — the same
         // boundary the committed model crosses.
 
-        pub const cmd_format_version: u32 = 2;
+        pub const cmd_format_version: u32 = 3;
 
         /// An encoded command value: op records per the layout above.
         pub const Cmd = []const u8;
@@ -1230,6 +1246,8 @@ pub fn Kernel(comptime opts: Options) type {
             spawn = 0x0D,
             audio_play = 0x0E,
             audio_ctl = 0x0F,
+            window_show = 0x10,
+            quit_app = 0x11,
         };
 
         /// The spawn record's "no line routing" sentinel: a `line_tag` of
@@ -1508,6 +1526,27 @@ pub fn Kernel(comptime opts: Options) type {
             @memcpy(out[2..][0..key.len], key);
             out[2 + key.len] = @intFromEnum(verb);
             std.mem.writeInt(u64, out[2 + key.len + 1 ..][0..8], @bitCast(value), .little);
+            return out;
+        }
+
+        pub fn cmdWindowShow(label: []const u8) Cmd {
+            // The emitter's byte gate on the literal label is the
+            // build-time teaching; this is the loud runtime backstop.
+            // A std.debug.assert compiles out of ReleaseFast, where the
+            // @intCast below would then truncate the length byte and
+            // corrupt the wire record silently — panic in every build
+            // mode instead.
+            if (label.len > 255) @panic("Cmd.showWindow label over 255 bytes");
+            const out = frameAlloc(u8, 2 + label.len);
+            out[0] = @intFromEnum(CmdOp.window_show);
+            out[1] = @intCast(label.len);
+            @memcpy(out[2..][0..label.len], label);
+            return out;
+        }
+
+        pub fn cmdQuitApp() Cmd {
+            const out = frameAlloc(u8, 1);
+            out[0] = @intFromEnum(CmdOp.quit_app);
             return out;
         }
 
