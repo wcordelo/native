@@ -74,6 +74,350 @@ const f = (v: number | "nan" | "inf" | "-inf" | "-0"): Arg => ({ t: "f", v });
 
 const runCorpus: RunCase[] = [
   {
+    name: "callback-mutated scrutinee falls out of a defaultless value switch",
+    src: `
+export type AB = "a" | "b";
+export function flowSwitch(nonEmpty: boolean): number {
+  const xs: number[] = nonEmpty ? [1, 2, 3] : [];
+  let k: AB = "a";
+  const ys = xs.map((x) => {
+    k = "b";
+    return x;
+  });
+  switch (k) {
+    case "a":
+      return 1;
+  }
+  return 2 + ys.length;
+}
+`,
+    calls: [
+      { fn: "flowSwitch", args: [{ t: "b", v: false }] },
+      { fn: "flowSwitch", args: [{ t: "b", v: true }] },
+    ],
+  },
+  {
+    name: "a statically-false assignment in a try keeps the finally reading the narrow",
+    src: `
+export interface P { readonly v: number; }
+function make(a: number): P | null {
+  if (a < 0) return null;
+  return { v: a };
+}
+export function guardedFinally(a: number): number {
+  let p: P | null = make(a);
+  if (p === null) return -1;
+  let n = 0;
+  try {
+    if (false) p = null;
+    n += 1;
+  } finally {
+    n += p.v;
+  }
+  return n;
+}
+`,
+    calls: [
+      { fn: "guardedFinally", args: [i(5)] },
+      { fn: "guardedFinally", args: [i(-3)] },
+    ],
+  },
+  {
+    name: "a dead break in an always-returning branch keeps the post-loop narrow live",
+    src: `
+export function deadBreakRoute(es: number[], q: number | null): number {
+  let p: number | null = q;
+  if (p === null) return -1;
+  for (const e of es) {
+    if (e > 0) { p = null; if (false) break; return 1; }
+  }
+  return p;
+}
+export function realBreakRoute(es: number[], q: number | null): number {
+  let p: number | null = q;
+  if (p === null) return -1;
+  for (const e of es) {
+    if (e > 0) { p = null; if (e > 1) break; return 1; }
+  }
+  return p === null ? -2 : p;
+}
+`,
+    calls: [
+      { fn: "deadBreakRoute", args: [{ t: "nums", v: [] }, f(5)] },
+      { fn: "deadBreakRoute", args: [{ t: "nums", v: [-1, -2] }, f(7)] },
+      { fn: "deadBreakRoute", args: [{ t: "nums", v: [3] }, f(7)] },
+      { fn: "deadBreakRoute", args: [{ t: "nums", v: [] }, { t: "null" }] },
+      { fn: "realBreakRoute", args: [{ t: "nums", v: [2] }, f(7)] },
+      { fn: "realBreakRoute", args: [{ t: "nums", v: [-1] }, f(7)] },
+    ],
+  },
+  {
+    name: "a claimed-terminal inferred-union plain switch never reaches its closing arm",
+    src: `
+export function inferredSwitch(x: number): number {
+  const k = x > 0 ? 1 : 2;
+  switch (k) {
+    case 1: return 10;
+    case 2: return 20;
+  }
+}
+export function inferredSwitchMapped(xs: number[]): number[] {
+  return xs.map((x) => {
+    const k = x > 0 ? 1 : 2;
+    switch (k) {
+      case 1: return 10;
+      case 2: return 20;
+    }
+  });
+}
+`,
+    calls: [
+      { fn: "inferredSwitch", args: [f(3)] },
+      { fn: "inferredSwitch", args: [f(-3)] },
+      { fn: "inferredSwitchMapped", args: [{ t: "nums", v: [4, -4, 0] }] },
+    ],
+  },
+  {
+    name: "a write-only ternary arm mutates through the raw slot, no capture",
+    src: `
+export interface P { readonly v: number; }
+function make(a: number): P | null {
+  if (a < 0) return null;
+  return { v: a };
+}
+export function writeOnlyArm(a: number, xs: readonly number[]): number {
+  let p: P | null = make(a);
+  const n = p !== null ? xs.map((x) => { p = null; return x; }).length : 0;
+  return p === null ? n + 100 : n;
+}
+`,
+    calls: [
+      { fn: "writeOnlyArm", args: [i(5), { t: "nums", v: [1, 2, 3] }] },
+      { fn: "writeOnlyArm", args: [i(5), { t: "nums", v: [] }] },
+      { fn: "writeOnlyArm", args: [i(-1), { t: "nums", v: [1, 2] }] },
+    ],
+  },
+  {
+    name: "kills under keyword-literal false conditions skip the join; do-while(false) still counts",
+    src: `
+export interface P { readonly v: number; }
+function make(a: number): P | null {
+  if (a < 0) return null;
+  return { v: a };
+}
+export function deadIfKill(a: number): number {
+  let p: P | null = make(a);
+  if (p === null) return -1;
+  if (false) p = null;
+  return p.v;
+}
+export function deadWhileKill(a: number): number {
+  let p: P | null = make(a);
+  if (p === null) return -1;
+  while (false) {
+    p = null;
+  }
+  return p.v;
+}
+export function doWhileRunsOnce(a: number): number {
+  let p: P | null = make(a);
+  if (p === null) return -1;
+  let n = 0;
+  do {
+    n += 1;
+    if (a > 2) p = null;
+  } while (false);
+  if (p === null) return n + 50;
+  return p.v;
+}
+export function condKill(a: number, flag: boolean): number {
+  let p: P | null = make(a);
+  if (p === null) return -1;
+  if (flag) p = null;
+  if (p === null) return -2;
+  return p.v;
+}
+`,
+    calls: [
+      { fn: "deadIfKill", args: [i(5)] },
+      { fn: "deadIfKill", args: [i(-3)] },
+      { fn: "deadWhileKill", args: [i(7)] },
+      { fn: "doWhileRunsOnce", args: [i(9)] },
+      { fn: "doWhileRunsOnce", args: [i(1)] },
+      { fn: "condKill", args: [i(5), { t: "b", v: true }] },
+      { fn: "condKill", args: [i(5), { t: "b", v: false }] },
+    ],
+  },
+  {
+    name: "a callback after the switch keeps flow trust; one in a shared loop declines",
+    src: `
+export type Mode = "a" | "b" | "c";
+export interface P { readonly v: number; }
+function make(a: number): P | null {
+  if (a < 0) return null;
+  return { v: a };
+}
+export function laterCallback(a: number, xs: readonly number[]): number {
+  let k: Mode = a > 10 ? "a" : "b";
+  const p = make(a);
+  if (p === null) {
+    switch (k) {
+      case "a": return -1;
+      case "b": return -2;
+    }
+  }
+  return p.v + xs.filter((x) => {
+    k = "c";
+    return x > 0;
+  }).length;
+}
+export function loopShared(xs: readonly number[]): number {
+  let total = 0;
+  let k: Mode = "a";
+  for (const x of xs) {
+    switch (k) {
+      case "a":
+        total += 1;
+        break;
+    }
+    const one: number[] = [x];
+    const ys = one.map((y) => {
+      k = "c";
+      return y;
+    });
+    total += ys.length;
+  }
+  return total;
+}
+`,
+    calls: [
+      { fn: "laterCallback", args: [i(20), { t: "nums", v: [1, 2, 3] }] },
+      { fn: "laterCallback", args: [i(5), { t: "nums", v: [1] }] },
+      { fn: "laterCallback", args: [i(-1), { t: "nums", v: [1] }] },
+      { fn: "loopShared", args: [{ t: "nums", v: [1, 2, 3] }] },
+      { fn: "loopShared", args: [{ t: "nums", v: [] }] },
+    ],
+  },
+  {
+    name: "a nested helper's label reuse keeps the enclosing loop terminal; a real break still merges",
+    src: `
+export interface P { readonly v: number; }
+function make(a: number): P | null {
+  if (a < 0) return null;
+  return { v: a };
+}
+export function nestedLabel(a: number, flag: boolean): number {
+  let p: P | null = make(a);
+  if (p === null) return -1;
+  if (flag) {
+    outer: while (true) {
+      const helper = (): number => {
+        outer: while (true) {
+          break outer;
+        }
+        return 1;
+      };
+      if (a > 100) {
+        p = null;
+        continue outer;
+      }
+      return helper();
+    }
+  }
+  return p.v;
+}
+export function realBreak(a: number, flag: boolean): number {
+  let p: P | null = make(a);
+  if (p === null) return -1;
+  if (flag) {
+    outer: while (true) {
+      p = null;
+      break outer;
+    }
+  }
+  if (p === null) return -2;
+  return p.v;
+}
+`,
+    calls: [
+      { fn: "nestedLabel", args: [i(5), { t: "b", v: true }] },
+      { fn: "nestedLabel", args: [i(5), { t: "b", v: false }] },
+      { fn: "nestedLabel", args: [i(-4), { t: "b", v: true }] },
+      { fn: "realBreak", args: [i(5), { t: "b", v: true }] },
+      { fn: "realBreak", args: [i(5), { t: "b", v: false }] },
+    ],
+  },
+  {
+    name: "element-access narrows stay with their own declaration across shadowing",
+    src: `
+export interface BoxOpt { readonly b: number | null; }
+export interface BoxNum { readonly b: number; }
+export function shadowedElementRead(): number {
+  const xs: BoxNum[] = [{ b: 10 }];
+  let total = 0;
+  {
+    const xs: BoxOpt[] = [{ b: 3 }];
+    if (xs[0].b === null) return -1;
+    total += xs[0].b;
+  }
+  total += xs[0].b;
+  return total;
+}
+export function guardedOuterAfterShadow(): number {
+  const xs: BoxOpt[] = [{ b: 10 }];
+  let total = 0;
+  if (xs[0].b !== null) {
+    {
+      const xs: BoxOpt[] = [{ b: 3 }];
+      if (xs[0].b !== null) {
+        total += xs[0].b;
+      }
+    }
+    total += xs[0].b;
+  }
+  return total;
+}
+`,
+    calls: [{ fn: "shadowedElementRead", args: [] }, { fn: "guardedOuterAfterShadow", args: [] }],
+  },
+  {
+    name: "non-null reassignment inside a guarded branch reads the reassigned slot",
+    src: `
+export interface P { readonly v: number; }
+function make(a: number): P | null {
+  if (a < 0) return null;
+  return { v: a };
+}
+export function reassignNarrow(a: number): number {
+  let p: P | null = make(a);
+  let total = 0;
+  if (p !== null) {
+    total += p.v;
+    p = { v: total + 5 };
+    total += p.v;
+  }
+  return total;
+}
+export function reassignInBranch(a: number, flag: boolean): number {
+  let p: P | null = make(a);
+  if (p !== null) {
+    if (flag) {
+      p = { v: p.v + 10 };
+    }
+    return p.v;
+  }
+  return -1;
+}
+`,
+    calls: [
+      { fn: "reassignNarrow", args: [i(3)] },
+      { fn: "reassignNarrow", args: [i(-1)] },
+      { fn: "reassignInBranch", args: [i(5), { t: "b", v: true }] },
+      { fn: "reassignInBranch", args: [i(5), { t: "b", v: false }] },
+      { fn: "reassignInBranch", args: [i(-2), { t: "b", v: true }] },
+    ],
+  },
+  {
     name: "optional numeric comparisons are null-safe (null equals only null)",
     src: `
 export function isZero(cls: number | null): boolean {
@@ -149,6 +493,303 @@ export function apply(sel: number, v: number, prev: number | null): number {
       { fn: "apply", args: [i(1), i(5), { t: "null" }] },
       { fn: "apply", args: [i(1), i(5), i(0)] },
       { fn: "apply", args: [i(1), i(5), i(2)] },
+    ],
+  },
+  {
+    // A branch that reassigns a narrowed optional to null widens it back;
+    // the post-merge null check must test the LIVE value. If the branch
+    // exit resurrected the dead narrow, the null path here would read the
+    // pre-branch payload (returning v + 1) instead of taking the re-check
+    // (returning 0) — the transcripts would diverge on the flag=true rows.
+    name: "a branch reassigning a narrowed optional to null drives the post-merge re-check",
+    src: `
+export function merge(q: number | null, flag: boolean): number {
+  let p: number | null = q;
+  if (p === null) { return -1; }
+  if (flag) {
+    p = null;
+  }
+  if (p === null) { return 0; }
+  return p + 1;
+}
+`,
+    calls: [
+      { fn: "merge", args: [{ t: "null" }, { t: "b", v: true }] },
+      { fn: "merge", args: [{ t: "null" }, { t: "b", v: false }] },
+      { fn: "merge", args: [f(4), { t: "b", v: true }] },
+      { fn: "merge", args: [f(4), { t: "b", v: false }] },
+    ],
+  },
+  {
+    // The compound-guard flavor of the same kill: `r !== null && r > 0`
+    // emits its branch under the chain's `.?` substitutions, and the kill
+    // of p's narrow must survive that scope's restore. A resurrected
+    // narrow would read the pre-branch payload on the (r>0, p killed)
+    // rows (returning q + 1) instead of taking the re-check (returning 0).
+    name: "a kill under a compound null guard drives the post-merge re-check",
+    src: `
+export function merge(q: number | null, r: number | null): number {
+  let p: number | null = q;
+  if (p === null) { return -1; }
+  if (r !== null && r > 0) {
+    p = null;
+  } else {}
+  if (p === null) { return 0; }
+  return p + 1;
+}
+`,
+    calls: [
+      { fn: "merge", args: [{ t: "null" }, f(1)] },
+      { fn: "merge", args: [f(4), f(1)] },
+      { fn: "merge", args: [f(4), f(-1)] },
+      { fn: "merge", args: [f(4), { t: "null" }] },
+    ],
+  },
+  {
+    // A do-while's trailing test evaluates after the body, under the
+    // body's flow state: the terminal guard narrows the test's read, and
+    // the lowered `if (!(cond)) break;` must run it against the guarded
+    // value. Rows drive the null exit, a first pass whose test is
+    // immediately false (zero further iterations), a single-iteration
+    // stop at the limit, and a multi-iteration accumulation — each must
+    // match node byte for byte.
+    name: "a do-while trailing test reads the body-guarded value across iteration counts",
+    src: `
+export interface P { readonly v: number; }
+function make(a: number): P | null {
+  if (a < 0) { return null; }
+  return { v: a };
+}
+export function sumDo(a: number, limit: number): number {
+  const p: P | null = make(a);
+  let n = 0;
+  do {
+    if (p === null) { return -1; }
+    n += p.v;
+  } while (p.v > 0 && n < limit);
+  return n;
+}
+`,
+    calls: [
+      { fn: "sumDo", args: [f(-1), f(10)] },
+      { fn: "sumDo", args: [f(0), f(10)] },
+      { fn: "sumDo", args: [f(3), f(1)] },
+      { fn: "sumDo", args: [f(3), f(10)] },
+    ],
+  },
+  {
+    // The exiting arm's kill never reaches the merge (control left the
+    // function), so the surviving flag=false read keeps the narrow and
+    // returns q + 1; the fall-through arm's kill in the ELSE still drives
+    // the re-check. A merge that ignored the exit would widen the
+    // surviving read too; a drop that ignored fall-through would misroute
+    // the flag=true-with-else rows past the re-check.
+    name: "an exiting arm's kill stays off the surviving flow; the fall-through arm's still merges",
+    src: `
+export function survive(q: number | null, flag: boolean): number {
+  let p: number | null = q;
+  if (p === null) { return -1; }
+  if (flag) { p = null; return -2; }
+  return p + 1;
+}
+export function mixed(q: number | null, flag: boolean): number {
+  let p: number | null = q;
+  if (p === null) { return -1; }
+  if (flag) {
+    p = null;
+    return -2;
+  } else {
+    p = null;
+  }
+  if (p === null) { return 0; }
+  return p;
+}
+export function pastLoop(q: number | null, xs: readonly number[]): number {
+  let p: number | null = q;
+  if (p === null) { return -1; }
+  let acc: number = 0;
+  for (const x of xs) {
+    if (x < 0) { p = null; break; }
+    acc = acc + x;
+  }
+  if (p === null) { return acc; }
+  return p + acc;
+}
+`,
+    calls: [
+      { fn: "survive", args: [{ t: "null" }, { t: "b", v: false }] },
+      { fn: "survive", args: [f(4), { t: "b", v: true }] },
+      { fn: "survive", args: [f(4), { t: "b", v: false }] },
+      { fn: "mixed", args: [{ t: "null" }, { t: "b", v: false }] },
+      { fn: "mixed", args: [f(4), { t: "b", v: true }] },
+      { fn: "mixed", args: [f(4), { t: "b", v: false }] },
+      { fn: "pastLoop", args: [f(4), { t: "nums", v: [1, 2, -1, 8] }] },
+      { fn: "pastLoop", args: [f(4), { t: "nums", v: [1, 2, 3] }] },
+      { fn: "pastLoop", args: [{ t: "null" }, { t: "nums", v: [1] }] },
+    ],
+  },
+  {
+    // A mid-list break escapes its loop carrying the kill even though the
+    // body's terminal statement returns: the post-loop re-check must read
+    // the LIVE optional. A drop keyed on that terminal return would
+    // resurrect the narrow and return q + 1 on the negative-element row
+    // instead of taking the re-check.
+    name: "a break-escaped kill under a terminal loop return drives the post-loop re-check",
+    src: `
+export function probe(q: number | null, xs: readonly number[]): number {
+  let p: number | null = q;
+  if (p === null) { return -1; }
+  for (const x of xs) {
+    if (x < 0) { p = null; break; }
+    return -2;
+  }
+  if (p === null) { return 0; }
+  return p + 1;
+}
+`,
+    calls: [
+      { fn: "probe", args: [{ t: "null" }, { t: "nums", v: [] }] },
+      { fn: "probe", args: [f(4), { t: "nums", v: [] }] },
+      { fn: "probe", args: [f(4), { t: "nums", v: [-1] }] },
+      { fn: "probe", args: [f(4), { t: "nums", v: [2, 3] }] },
+    ],
+  },
+  {
+    // A kill+break arm exits the loop, so the fall-through `sum += p` keeps
+    // the narrow (tsc agrees — the killing path cannot reach it) and only
+    // the post-loop state re-checks. The stop rows must accumulate exactly
+    // the pre-break iterations and take the re-check (-sum - 1, dodging the
+    // -0 corner on the stop-first row); the no-stop rows run the whole loop
+    // and keep the narrow past it (sum + p). A kill misrouted onto the
+    // fall-through would not even compile; a dropped one would return
+    // sum + 10 on the stop rows.
+    name: "a kill+break arm's loop sums through the stop and no-stop paths",
+    src: `
+export function tally(vals: readonly number[], limit: number): number {
+  let p: number | null = 10;
+  if (p === null) return -1;
+  let sum: number = 0;
+  for (const v of vals) {
+    if (v > limit) { p = null; break; }
+    sum += p;
+  }
+  if (p === null) return -sum - 1;
+  return sum + p;
+}
+`,
+    calls: [
+      { fn: "tally", args: [{ t: "nums", v: [] }, f(10)] },
+      { fn: "tally", args: [{ t: "nums", v: [1, 2, 3] }, f(10)] },
+      { fn: "tally", args: [{ t: "nums", v: [1, 2, 99, 3] }, f(10)] },
+      { fn: "tally", args: [{ t: "nums", v: [99] }, f(10)] },
+    ],
+  },
+  {
+    // A throw caught by a fall-through catch resumes at the `return -2`
+    // after the try, so every route through the negative branch leaves the
+    // function and the kill drops: the surviving read keeps its narrow and
+    // returns q + 1. Both the throw and no-throw routes must land on -2
+    // exactly as node does; a merge here would strip the unwrap and not
+    // compile, a wrong drop elsewhere would misroute the re-check rows.
+    name: "a caught throw resuming into a returning tail leaves the surviving narrow intact",
+    src: `
+export interface NegError { readonly kind: "neg"; readonly at: number; }
+export function probe(q: number | null, flag: boolean): number {
+  let p: number | null = q;
+  if (p === null) { return -1; }
+  if (p < 0) {
+    try {
+      p = null;
+      if (flag) { throw { kind: "neg", at: 0 } as NegError; }
+    } catch {
+    }
+    return -2;
+  }
+  return p + 1;
+}
+`,
+    calls: [
+      { fn: "probe", args: [{ t: "null" }, { t: "b", v: true }] },
+      { fn: "probe", args: [f(-4), { t: "b", v: true }] },
+      { fn: "probe", args: [f(-4), { t: "b", v: false }] },
+      { fn: "probe", args: [f(4), { t: "b", v: true }] },
+      { fn: "probe", args: [f(4), { t: "b", v: false }] },
+    ],
+  },
+  {
+    // A caught throw resumes AFTER the try, so the intra-try read keeps its
+    // narrow and the post-try re-check reads the live optional. Both flag
+    // paths — throw-then-catch-then-re-check, and the surviving straight
+    // line — must match node row for row.
+    name: "a caught-throw kill routes past the intra-try read to the post-try re-check",
+    src: `
+export interface Boom { readonly kind: "boom"; }
+export function probe(q: number | null, flag: boolean): number {
+  let p: number | null = q;
+  if (p === null) return -1;
+  try {
+    if (flag) { p = null; throw { kind: "boom" } as Boom; }
+    return p + 1;
+  } catch {}
+  if (p === null) return 0;
+  return p + 2;
+}
+`,
+    calls: [
+      { fn: "probe", args: [{ t: "null" }, { t: "b", v: true }] },
+      { fn: "probe", args: [{ t: "null" }, { t: "b", v: false }] },
+      { fn: "probe", args: [f(4), { t: "b", v: true }] },
+      { fn: "probe", args: [f(4), { t: "b", v: false }] },
+      { fn: "probe", args: [f(-4), { t: "b", v: false }] },
+    ],
+  },
+  {
+    // A plain lexical block is no flow boundary: the guard inside it
+    // narrows the post-block read (tsc flows through), and the emitted
+    // capture must be in scope there. Both the miss and hit paths must
+    // return exactly what node returns.
+    name: "a guard inside a plain block narrows the post-block read on both paths",
+    src: `
+export interface P { readonly v: number; }
+export function probe(v: number | null): number {
+  const p: P | null = v === null ? null : { v: v };
+  { if (p === null) return -1; }
+  return p.v;
+}
+`,
+    calls: [
+      { fn: "probe", args: [{ t: "null" }] },
+      { fn: "probe", args: [f(4)] },
+      { fn: "probe", args: [f(-4)] },
+    ],
+  },
+  {
+    // A map callback whose only return trails a throw guard lifts as
+    // straight-line statements plus the return's expression; the guard's
+    // narrowing must still cover that expression (one flow scope), and the
+    // values it reads must be the guarded element's, row for row.
+    name: "a throw-guarded map callback reads the narrowed value in its trailing return",
+    src: `
+export interface BadError { readonly kind: "bad"; readonly at: number; }
+export function half(x: number): number | null {
+  if (x < 0) { return null; }
+  return x / 2;
+}
+export function total(xs: readonly number[]): number {
+  const halved = xs.map((x) => {
+    const h = half(x);
+    if (h === null) { throw { kind: "bad", at: 0 } as BadError; }
+    return h + 1;
+  });
+  let acc: number = 0;
+  for (const d of halved) { acc = acc + d; }
+  return acc;
+}
+`,
+    calls: [
+      { fn: "total", args: [{ t: "nums", v: [2, 4, 7] }] },
+      { fn: "total", args: [{ t: "nums", v: [] }] },
+      { fn: "total", args: [{ t: "nums", v: [5] }] },
     ],
   },
   {
@@ -1522,6 +2163,402 @@ export function chained(bytes: Uint8Array, from: number): Uint8Array {
       { fn: "whole", args: [{ t: "bytes", v: [9, 8] }] },
       { fn: "chained", args: [{ t: "bytes", v: [1, 2, 3, 4] }, i(1)] },
       { fn: "chained", args: [{ t: "bytes", v: [1] }, i(0)] },
+    ],
+  },
+  {
+    // Sibling arms join their kills: an arm's `p = null` must not strip a
+    // sibling arm (typed from the construct's entry state) of its narrow,
+    // while the joined kill still reaches the post-construct re-check.
+    // Every path through each construct runs on both sides.
+    name: "branch kills join at the construct exit: if/else, else-if chain, switch clauses",
+    src: `
+export type Sel = "kill" | "use" | "skip";
+export function killThenElse(a: number | null, flag: boolean): number {
+  let p: number | null = a;
+  if (p === null) return -1;
+  if (flag) {
+    p = null;
+  } else {
+    return p;
+  }
+  if (p === null) return 0;
+  return p;
+}
+export function killMiddleArm(a: number | null, sel: number): number {
+  let p: number | null = a;
+  if (p === null) return -1;
+  if (sel === 1) {
+    return 1;
+  } else if (sel === 2) {
+    p = null;
+  } else if (sel === 3) {
+    return p;
+  }
+  if (p === null) return 0;
+  return p;
+}
+export function killClause(a: number | null, sel: Sel): number {
+  let p: number | null = a;
+  if (p === null) return -1;
+  switch (sel) {
+    case "kill":
+      p = null;
+      break;
+    case "use":
+      return p;
+    case "skip":
+      break;
+  }
+  if (p === null) return 0;
+  return p;
+}
+`,
+    calls: [
+      { fn: "killThenElse", args: [{ t: "null" }, { t: "b", v: true }] },
+      { fn: "killThenElse", args: [{ t: "null" }, { t: "b", v: false }] },
+      { fn: "killThenElse", args: [i(5), { t: "b", v: true }] },
+      { fn: "killThenElse", args: [i(5), { t: "b", v: false }] },
+      { fn: "killMiddleArm", args: [{ t: "null" }, i(2)] },
+      { fn: "killMiddleArm", args: [i(6), i(1)] },
+      { fn: "killMiddleArm", args: [i(6), i(2)] },
+      { fn: "killMiddleArm", args: [i(6), i(3)] },
+      { fn: "killMiddleArm", args: [i(6), i(4)] },
+      { fn: "killClause", args: [{ t: "null" }, { t: "tag", v: "use" }] },
+      { fn: "killClause", args: [i(7), { t: "tag", v: "kill" }] },
+      { fn: "killClause", args: [i(7), { t: "tag", v: "use" }] },
+      { fn: "killClause", args: [i(7), { t: "tag", v: "skip" }] },
+    ],
+  },
+  {
+    // Terminality grouping through live paths: stacked case labels share
+    // one exiting body (the killing branch never reaches the merge, so the
+    // surviving read keeps its narrow), a group that falls out of the
+    // switch still merges its kill, and a labeled loop's break-to-label /
+    // a labeled block's break-to-label carry the kill to the re-check
+    // exactly like node. Every function's every route runs on both sides.
+    name: "stacked-clause and labeled-statement terminality routes kills like node",
+    src: `
+export type Mode = "a" | "b" | "c" | "d";
+export type Msg =
+  | { readonly kind: "inc" }
+  | { readonly kind: "dec" }
+  | { readonly kind: "reset" };
+export function pickMsg(n: number): Msg {
+  if (n === 0) { return { kind: "inc" }; }
+  if (n === 1) { return { kind: "dec" }; }
+  return { kind: "reset" };
+}
+export function stackedExit(q: number | null, flag: boolean, mode: Mode): number {
+  let p: number | null = q;
+  if (p === null) { return -1; }
+  if (flag) {
+    p = null;
+    switch (mode) {
+      case "a":
+      case "b":
+        return 10;
+      default:
+        return 20;
+    }
+  }
+  return p + 1;
+}
+export function stackedKindExit(q: number | null, flag: boolean, n: number): number {
+  const msg: Msg = pickMsg(n);
+  let p: number | null = q;
+  if (p === null) { return -1; }
+  if (flag) {
+    p = null;
+    switch (msg.kind) {
+      case "inc":
+      case "dec":
+        return 10;
+      case "reset":
+        return 20;
+    }
+  }
+  return p + 1;
+}
+export function stackedFallout(q: number | null, flag: boolean, n: number): number {
+  const msg: Msg = pickMsg(n);
+  let p: number | null = q;
+  if (p === null) { return -1; }
+  if (flag) {
+    p = null;
+    switch (msg.kind) {
+      case "inc":
+      case "dec":
+        return 10;
+      case "reset":
+        p = q;
+    }
+  }
+  if (p === null) { return 0; }
+  return p + 1;
+}
+export function labeledBreakKill(q: number | null, n: number): number {
+  let p: number | null = q;
+  if (p === null) { return -1; }
+  if (n > 0) {
+    p = null;
+    let k = 0;
+    spin: while (true) {
+      k += 1;
+      if (k >= n) { break spin; }
+    }
+  }
+  if (p === null) { return 0; }
+  return p + 1;
+}
+export function labeledBlockTerminal(q: number | null, flag: boolean): number {
+  let p: number | null = q;
+  if (p === null) { return -1; }
+  if (flag) {
+    p = null;
+    blk: {
+      return 5;
+    }
+  }
+  return p + 1;
+}
+export function labeledBlockBreak(q: number | null, flag: boolean, cut: boolean): number {
+  let p: number | null = q;
+  if (p === null) { return -1; }
+  if (flag) {
+    p = null;
+    blk: {
+      if (cut) { break blk; }
+      return 5;
+    }
+  }
+  if (p === null) { return 0; }
+  return p + 1;
+}
+`,
+    calls: [
+      { fn: "stackedExit", args: [{ t: "null" }, { t: "b", v: false }, { t: "tag", v: "a" }] },
+      { fn: "stackedExit", args: [i(5), { t: "b", v: true }, { t: "tag", v: "a" }] },
+      { fn: "stackedExit", args: [i(5), { t: "b", v: true }, { t: "tag", v: "b" }] },
+      { fn: "stackedExit", args: [i(5), { t: "b", v: true }, { t: "tag", v: "c" }] },
+      { fn: "stackedExit", args: [i(5), { t: "b", v: false }, { t: "tag", v: "d" }] },
+      { fn: "stackedKindExit", args: [{ t: "null" }, { t: "b", v: false }, i(0)] },
+      { fn: "stackedKindExit", args: [i(5), { t: "b", v: true }, i(0)] },
+      { fn: "stackedKindExit", args: [i(5), { t: "b", v: true }, i(1)] },
+      { fn: "stackedKindExit", args: [i(5), { t: "b", v: true }, i(2)] },
+      { fn: "stackedKindExit", args: [i(5), { t: "b", v: false }, i(2)] },
+      { fn: "stackedFallout", args: [{ t: "null" }, { t: "b", v: true }, i(2)] },
+      { fn: "stackedFallout", args: [i(5), { t: "b", v: true }, i(0)] },
+      { fn: "stackedFallout", args: [i(5), { t: "b", v: true }, i(1)] },
+      { fn: "stackedFallout", args: [i(5), { t: "b", v: true }, i(2)] },
+      { fn: "stackedFallout", args: [i(5), { t: "b", v: false }, i(2)] },
+      { fn: "labeledBreakKill", args: [{ t: "null" }, i(1)] },
+      { fn: "labeledBreakKill", args: [i(5), i(0)] },
+      { fn: "labeledBreakKill", args: [i(5), i(3)] },
+      { fn: "labeledBlockTerminal", args: [{ t: "null" }, { t: "b", v: false }] },
+      { fn: "labeledBlockTerminal", args: [i(5), { t: "b", v: true }] },
+      { fn: "labeledBlockTerminal", args: [i(5), { t: "b", v: false }] },
+      { fn: "labeledBlockBreak", args: [{ t: "null" }, { t: "b", v: false }, { t: "b", v: false }] },
+      { fn: "labeledBlockBreak", args: [i(5), { t: "b", v: true }, { t: "b", v: true }] },
+      { fn: "labeledBlockBreak", args: [i(5), { t: "b", v: true }, { t: "b", v: false }] },
+      { fn: "labeledBlockBreak", args: [i(5), { t: "b", v: false }, { t: "b", v: true }] },
+    ],
+  },
+  {
+    // Defaultless value-switch exhaustiveness through live paths: labels
+    // covering the scrutinee's literal union make the killing branch
+    // terminal (the surviving read keeps its narrow), one uncovered member
+    // or a plain-string scrutinee merges the kill to the re-check, and an
+    // exhaustive switch may end a value-returning function — every covered
+    // member and the narrow's value use run identically on both sides.
+    name: "defaultless exhaustive value switches route kills and returns like node",
+    src: `
+export type Mode = "a" | "b" | "c";
+export type Level = 0 | 1 | 2;
+export function coveredExit(q: number | null, flag: boolean, mode: Mode): number {
+  let p: number | null = q;
+  if (p === null) { return -1; }
+  if (flag) {
+    p = null;
+    switch (mode) {
+      case "a":
+      case "b":
+        return 10;
+      case "c":
+        return 20;
+    }
+  }
+  return p + 1;
+}
+export function coveredNumericExit(q: number | null, flag: boolean, lvl: Level): number {
+  let p: number | null = q;
+  if (p === null) { return -1; }
+  if (flag) {
+    p = null;
+    switch (lvl) {
+      case 0:
+      case 1:
+        return 10;
+      case 2:
+        return 20;
+    }
+  }
+  return p + 1;
+}
+export function uncoveredMerge(q: number | null, flag: boolean, mode: Mode): number {
+  let p: number | null = q;
+  if (p === null) { return -1; }
+  if (flag) {
+    p = null;
+    switch (mode) {
+      case "a":
+      case "b":
+        return 10;
+    }
+  }
+  if (p === null) { return 0; }
+  return p + 1;
+}
+export function plainStringMerge(q: number | null, flag: boolean, s: string): number {
+  let p: number | null = q;
+  if (p === null) { return -1; }
+  if (flag) {
+    p = null;
+    switch (s) {
+      case "x":
+        return 10;
+      case "y":
+        return 20;
+    }
+  }
+  if (p === null) { return 0; }
+  return p + 1;
+}
+export function coveredFinal(mode: Mode): number {
+  switch (mode) {
+    case "a":
+    case "b":
+      return 10;
+    case "c":
+      return 20;
+  }
+}
+`,
+    calls: [
+      { fn: "coveredExit", args: [{ t: "null" }, { t: "b", v: false }, { t: "tag", v: "a" }] },
+      { fn: "coveredExit", args: [i(7), { t: "b", v: true }, { t: "tag", v: "a" }] },
+      { fn: "coveredExit", args: [i(7), { t: "b", v: true }, { t: "tag", v: "b" }] },
+      { fn: "coveredExit", args: [i(7), { t: "b", v: true }, { t: "tag", v: "c" }] },
+      { fn: "coveredExit", args: [i(7), { t: "b", v: false }, { t: "tag", v: "c" }] },
+      { fn: "coveredNumericExit", args: [{ t: "null" }, { t: "b", v: false }, i(0)] },
+      { fn: "coveredNumericExit", args: [i(7), { t: "b", v: true }, i(0)] },
+      { fn: "coveredNumericExit", args: [i(7), { t: "b", v: true }, i(1)] },
+      { fn: "coveredNumericExit", args: [i(7), { t: "b", v: true }, i(2)] },
+      { fn: "coveredNumericExit", args: [i(7), { t: "b", v: false }, i(2)] },
+      { fn: "uncoveredMerge", args: [{ t: "null" }, { t: "b", v: true }, { t: "tag", v: "c" }] },
+      { fn: "uncoveredMerge", args: [i(7), { t: "b", v: true }, { t: "tag", v: "a" }] },
+      { fn: "uncoveredMerge", args: [i(7), { t: "b", v: true }, { t: "tag", v: "b" }] },
+      { fn: "uncoveredMerge", args: [i(7), { t: "b", v: true }, { t: "tag", v: "c" }] },
+      { fn: "uncoveredMerge", args: [i(7), { t: "b", v: false }, { t: "tag", v: "c" }] },
+      { fn: "plainStringMerge", args: [{ t: "null" }, { t: "b", v: true }, { t: "str", v: "x" }] },
+      { fn: "plainStringMerge", args: [i(7), { t: "b", v: true }, { t: "str", v: "x" }] },
+      { fn: "plainStringMerge", args: [i(7), { t: "b", v: true }, { t: "str", v: "y" }] },
+      { fn: "plainStringMerge", args: [i(7), { t: "b", v: true }, { t: "str", v: "z" }] },
+      { fn: "plainStringMerge", args: [i(7), { t: "b", v: false }, { t: "str", v: "z" }] },
+      { fn: "coveredFinal", args: [{ t: "tag", v: "a" }] },
+      { fn: "coveredFinal", args: [{ t: "tag", v: "b" }] },
+      { fn: "coveredFinal", args: [{ t: "tag", v: "c" }] },
+    ],
+  },
+  {
+    // The post-construct narrow subtracts the arms' kills: a surviving
+    // arm's `p = null` means the re-check after the statement reads the
+    // live (possibly-null) slot on every path, exactly like node.
+    name: "post-if narrows subtract branch kills: else-if, generic else, capture arms",
+    src: `
+export function killedPostIf(a: number | null, flag: boolean): number {
+  let p: number | null = a;
+  if (p === null) return -1;
+  else if (flag) {
+    p = null;
+  }
+  if (p === null) return 0;
+  return p;
+}
+export function killedGenericElse(a: number | null, flag: boolean): number {
+  let p: number | null = a;
+  let n = 0;
+  if (p === null) {
+    return -1;
+  } else {
+    if (flag) { p = null; }
+    n += 1;
+  }
+  if (p === null) return 100 + n;
+  return p;
+}
+export function killedReadingArm(a: number | null, flag: boolean): number {
+  let p: number | null = a;
+  let n = 0;
+  if (p !== null) {
+    n += p;
+    if (flag) { p = null; }
+  } else {
+    return -1;
+  }
+  if (p === null) return 100 + n;
+  return p;
+}
+`,
+    calls: [
+      { fn: "killedPostIf", args: [{ t: "null" }, { t: "b", v: false }] },
+      { fn: "killedPostIf", args: [i(4), { t: "b", v: true }] },
+      { fn: "killedPostIf", args: [i(4), { t: "b", v: false }] },
+      { fn: "killedGenericElse", args: [{ t: "null" }, { t: "b", v: true }] },
+      { fn: "killedGenericElse", args: [i(4), { t: "b", v: true }] },
+      { fn: "killedGenericElse", args: [i(4), { t: "b", v: false }] },
+      { fn: "killedReadingArm", args: [{ t: "null" }, { t: "b", v: true }] },
+      { fn: "killedReadingArm", args: [i(4), { t: "b", v: true }] },
+      { fn: "killedReadingArm", args: [i(4), { t: "b", v: false }] },
+    ],
+  },
+  {
+    // Declaration-qualified narrowing keys: a block-local or callback-
+    // parameter shadow of a narrowed outer name must read ITS value on
+    // every path — with text keys the outer capture rewrote the shadow's
+    // reads (or vice versa), running wrong while still compiling.
+    name: "shadowed declarations narrow independently: flattened block, callback parameter",
+    src: `
+export function shadowInBlock(a: number | null, b: number | null): number {
+  let q: number | null = a;
+  let n = 0;
+  {
+    const q = b;
+    n += 1;
+    if (q === null) return -2;
+    n += q;
+  }
+  if (q === null) return -1;
+  return q + n;
+}
+export function shadowInCallback(a: number | null, xs: readonly number[]): number {
+  const q = a;
+  let n = 0;
+  n += 1;
+  if (q === null) return -1;
+  const found = xs.filter((q) => q > 2);
+  let m = 0;
+  for (const g of found) m += g;
+  return q + m + n;
+}
+`,
+    calls: [
+      { fn: "shadowInBlock", args: [{ t: "null" }, i(10)] },
+      { fn: "shadowInBlock", args: [i(5), { t: "null" }] },
+      { fn: "shadowInBlock", args: [i(5), i(10)] },
+      { fn: "shadowInCallback", args: [{ t: "null" }, { t: "nums", v: [1, 5, 9] }] },
+      { fn: "shadowInCallback", args: [i(1), { t: "nums", v: [1, 5, 9] }] },
+      { fn: "shadowInCallback", args: [i(9), { t: "nums", v: [1, 2] }] },
+      { fn: "shadowInCallback", args: [i(9), { t: "nums", v: [] }] },
     ],
   },
   {
@@ -4239,6 +5276,41 @@ export function run(start: number, d: number): number {
     ],
   },
   {
+    // A kill in a try body followed by a throwing call: the exception lands
+    // in the swallowing catch and falls through to the re-check, which must
+    // observe the killed narrow (p IS null there) exactly as node does.
+    name: "exceptions: a try-body kill before a throwing call reaches the post-catch re-check",
+    src: `
+export interface P { readonly v: number; }
+export type Boom = { readonly kind: "boom" } | { readonly kind: "never" };
+function mk(v0: number): P | null {
+  if (v0 < 0) return null;
+  return { v: v0 };
+}
+function g(flag: boolean): void {
+  if (flag) throw { kind: "boom" } as Boom;
+}
+export function f(v0: number, flag: boolean): number {
+  let p: P | null = mk(v0);
+  if (p === null) return -1;
+  try {
+    p = null;
+    g(flag);
+    return -2;
+  } catch {
+  }
+  if (p === null) return 0;
+  return p.v;
+}
+`,
+    calls: [
+      { fn: "f", args: [i(5), { t: "b", v: true }] },
+      { fn: "f", args: [i(5), { t: "b", v: false }] },
+      { fn: "f", args: [i(-1), { t: "b", v: true }] },
+      { fn: "f", args: [i(0), { t: "b", v: true }] },
+    ],
+  },
+  {
     name: "exceptions: number-shaped throws ride the f64 payload slot",
     src: `
 export function g(x: number): number {
@@ -4684,6 +5756,530 @@ export function atMiss(s: Uint8Array, i: number): boolean { return s.at(i) === u
       { fn: "at", args: [{ t: "bytes", v: [65, 66, 67] }, i(3)] },
       { fn: "atMiss", args: [{ t: "bytes", v: [65] }, i(2)] },
       { fn: "atMiss", args: [{ t: "bytes", v: [65] }, i(0)] },
+    ],
+  },
+  {
+    // Ternaries whose arms are spread literals lower to per-branch statement
+    // blocks; both arms of every conditional are driven here so the reducer's
+    // values pin that exactly the taken arm's copy runs (the model after a
+    // kept-`q` arm must be the untouched quote, never a fresh copy with a
+    // stale overwrite).
+    name: "spread-arm ternaries: nested and single-level reducer arms match node on both branches",
+    src: `
+export type QuoteState = "idle" | "ok" | "failed";
+export interface Quote { readonly id: number; readonly state: QuoteState; readonly price: number; }
+export interface Model { readonly quote: Quote; }
+export type Msg = { readonly kind: "got"; readonly parsed: number | null } | { readonly kind: "noop" };
+export function initialModel(): Model {
+  return { quote: { id: 1, state: "idle", price: 0.5 } };
+}
+export function update(model: Model, msg: Msg): Model {
+  switch (msg.kind) {
+    case "got": {
+      const parsed = msg.parsed;
+      const q = model.quote;
+      const updated: Quote = parsed === null
+        ? (q.state === "ok" ? q : { ...q, state: "failed" })
+        : { ...q, state: "ok", price: parsed };
+      return { ...model, quote: updated };
+    }
+    case "noop": {
+      const q = model.quote;
+      const updated: Quote = q.state === "ok" ? q : { ...q, state: "failed" };
+      return { ...model, quote: updated };
+    }
+  }
+}
+export function pick(q: Quote | null, fallback: Quote): Quote {
+  return q === null ? { ...fallback, state: "idle" } : q;
+}
+`,
+    node: `
+{
+  let model = mod.initialModel();
+  // noop on a non-ok quote: single-level ternary takes the spread arm.
+  model = mod.update(model, { kind: "noop" });
+  line("s0", model.quote.state);
+  line("s1", model.quote.price);
+  // got with a value: nested ternary's narrowed arm (spread + capture read).
+  model = mod.update(model, { kind: "got", parsed: 42.5 });
+  line("s2", model.quote.state);
+  line("s3", model.quote.price);
+  // noop on an ok quote: single-level ternary keeps q untouched.
+  model = mod.update(model, { kind: "noop" });
+  line("s4", model.quote.state);
+  line("s5", model.quote.price);
+  // got(null) on an ok quote: inner ternary keeps q untouched.
+  model = mod.update(model, { kind: "got", parsed: null });
+  line("s6", model.quote.state);
+  line("s7", model.quote.price);
+  // got(null) after a failure path: inner ternary takes its spread arm.
+  const failed = mod.update(mod.initialModel(), { kind: "got", parsed: null });
+  line("s8", failed.quote.state);
+  line("s9", failed.quote.price);
+  // orelse-fusion shape with a spread miss arm, both branches.
+  const chosen = mod.pick(model.quote, failed.quote);
+  line("s10", chosen.state);
+  const fallen = mod.pick(null, failed.quote);
+  line("s11", fallen.state);
+  line("s12", fallen.id);
+}
+`,
+    zig: `
+    {
+        var model = m.initialModel();
+        model = m.update(model, .noop);
+        row("s0", model.quote.state);
+        row("s1", model.quote.price);
+        model = m.update(model, .{ .got = 42.5 });
+        row("s2", model.quote.state);
+        row("s3", model.quote.price);
+        model = m.update(model, .noop);
+        row("s4", model.quote.state);
+        row("s5", model.quote.price);
+        model = m.update(model, .{ .got = null });
+        row("s6", model.quote.state);
+        row("s7", model.quote.price);
+        const failed = m.update(m.initialModel(), .{ .got = null });
+        row("s8", failed.quote.state);
+        row("s9", failed.quote.price);
+        const chosen = m.pick(model.quote, failed.quote);
+        row("s10", chosen.state);
+        const fallen = m.pick(null, failed.quote);
+        row("s11", fallen.state);
+        row("s12", fallen.id);
+    }
+`,
+  },
+  {
+    // The INFERRED-local spelling of the spread-arm ternary (no `: Quote`
+    // annotation, so the local's type comes from the ternary itself). Both
+    // polarities and both branches are driven: the hit branch must hand back
+    // the quote untouched, the miss branch must build the fallback copy with
+    // its overwrite applied.
+    name: "inferred-local spread-arm ternaries: both polarities and both branches match node",
+    src: `
+export type QuoteState = "idle" | "ok" | "failed";
+export interface Quote { readonly id: number; readonly state: QuoteState; readonly price: number; }
+export function pickMiss(q: Quote | null, fallback: Quote): Quote {
+  const picked = q === null ? { ...fallback, price: 0 } : q;
+  return picked;
+}
+export function pickHit(q: Quote | null, fallback: Quote): Quote {
+  const picked = q !== null ? q : { ...fallback, price: 0 };
+  return picked;
+}
+`,
+    node: `
+{
+  const base = { id: 7, state: "ok", price: 12 };
+  const fallback = { id: 9, state: "failed", price: 3 };
+  const a = mod.pickMiss(base, fallback);
+  line("p0", a.id);
+  line("p1", a.state);
+  line("p2", a.price);
+  const b = mod.pickMiss(null, fallback);
+  line("p3", b.id);
+  line("p4", b.state);
+  line("p5", b.price);
+  const c = mod.pickHit(base, fallback);
+  line("p6", c.id);
+  line("p7", c.state);
+  line("p8", c.price);
+  const d = mod.pickHit(null, fallback);
+  line("p9", d.id);
+  line("p10", d.state);
+  line("p11", d.price);
+}
+`,
+    zig: `
+    {
+        const base = m.Quote{ .id = 7, .state = .ok, .price = 12 };
+        const fallback = m.Quote{ .id = 9, .state = .failed, .price = 3 };
+        const a = m.pickMiss(base, fallback);
+        row("p0", a.id);
+        row("p1", a.state);
+        row("p2", a.price);
+        const b = m.pickMiss(null, fallback);
+        row("p3", b.id);
+        row("p4", b.state);
+        row("p5", b.price);
+        const c = m.pickHit(base, fallback);
+        row("p6", c.id);
+        row("p7", c.state);
+        row("p8", c.price);
+        const d = m.pickHit(null, fallback);
+        row("p9", d.id);
+        row("p10", d.state);
+        row("p11", d.price);
+    }
+`,
+  },
+  {
+    // The wrapper spellings of the spread-arm ternary: emission erases
+    // `q!` and `as`, so the arm-identity match must see through them —
+    // the hit rows hand the quote back untouched, the miss rows build the
+    // fallback copy, byte-identically to node (a mis-typed `?Quote` temp
+    // would not even compile).
+    name: "wrapped spread-arm ternaries (non-null assertion, as-cast) match node",
+    src: `
+export type QuoteState = "idle" | "ok" | "failed";
+export interface Quote { readonly id: number; readonly state: QuoteState; readonly price: number; }
+export function pickBang(q: Quote | null, fallback: Quote): Quote {
+  const picked = q !== null ? q! : { ...fallback, price: 0 };
+  return picked;
+}
+export function pickAs(q: Quote | null, fallback: Quote): Quote {
+  const picked = q !== null ? (q as Quote) : { ...fallback, price: 0 };
+  return picked;
+}
+`,
+    node: `
+{
+  const base = { id: 7, state: "ok", price: 12 };
+  const fallback = { id: 9, state: "failed", price: 3 };
+  const a = mod.pickBang(base, fallback);
+  line("p0", a.id);
+  line("p1", a.state);
+  line("p2", a.price);
+  const b = mod.pickBang(null, fallback);
+  line("p3", b.id);
+  line("p4", b.state);
+  line("p5", b.price);
+  const c = mod.pickAs(base, fallback);
+  line("p6", c.id);
+  line("p7", c.state);
+  line("p8", c.price);
+  const d = mod.pickAs(null, fallback);
+  line("p9", d.id);
+  line("p10", d.state);
+  line("p11", d.price);
+}
+`,
+    zig: `
+    {
+        const base = m.Quote{ .id = 7, .state = .ok, .price = 12 };
+        const fallback = m.Quote{ .id = 9, .state = .failed, .price = 3 };
+        const a = m.pickBang(base, fallback);
+        row("p0", a.id);
+        row("p1", a.state);
+        row("p2", a.price);
+        const b = m.pickBang(null, fallback);
+        row("p3", b.id);
+        row("p4", b.state);
+        row("p5", b.price);
+        const c = m.pickAs(base, fallback);
+        row("p6", c.id);
+        row("p7", c.state);
+        row("p8", c.price);
+        const d = m.pickAs(null, fallback);
+        row("p9", d.id);
+        row("p10", d.state);
+        row("p11", d.price);
+    }
+`,
+  },
+  {
+    // The `undefined` arm spelling of the guarded ternary local: the arm
+    // is an EMPTY (never a void value), so the local stays optional and
+    // the `=== undefined` guard unwraps — both polarities, both branches,
+    // byte-identical to node (a non-optional mis-typing would not even
+    // compile).
+    name: "undefined-arm ternary locals guard and unwrap byte-identically to node",
+    src: `
+export interface P { readonly v: number; }
+export function pickMiss(q: P | null): number {
+  const picked = q === null ? undefined : q;
+  if (picked === undefined) return 0;
+  return picked.v;
+}
+export function pickHit(q: P | null): number {
+  const picked = q !== null ? q : undefined;
+  if (picked === undefined) return 0;
+  return picked.v;
+}
+`,
+    node: `
+{
+  const base = { v: 7 };
+  line("p0", mod.pickMiss(base));
+  line("p1", mod.pickMiss(null));
+  line("p2", mod.pickHit(base));
+  line("p3", mod.pickHit(null));
+}
+`,
+    zig: `
+    {
+        const base = m.P{ .v = 7 };
+        row("p0", m.pickMiss(base));
+        row("p1", m.pickMiss(null));
+        row("p2", m.pickHit(base));
+        row("p3", m.pickHit(null));
+    }
+`,
+  },
+  {
+    // Sibling-arm flow isolation at runtime: the map arm assigns the outer
+    // narrowed local, the else arm reads it through the narrow — both
+    // runtime branches must match node exactly (a probe-poisoned sibling
+    // would not even compile; a mis-joined kill would read wrong values).
+    name: "ternary arms with a callback assignment run isolated, byte-identically to node",
+    src: `
+export interface P { readonly v: number; }
+export function f(xs: number[], flag: boolean, seed: P | null): number {
+  let q: P | null = seed;
+  if (q === null) return 0;
+  const r = flag ? xs.map((x) => { q = null; return x * 2; }).length : q.v;
+  return r;
+}
+`,
+    node: `
+{
+  const seed = { v: 41 };
+  line("p0", mod.f([1, 2, 3], true, seed));
+  line("p1", mod.f([1, 2, 3], false, seed));
+  line("p2", mod.f([], true, seed));
+  line("p3", mod.f([1, 2, 3], true, null));
+  line("p4", mod.f([1, 2, 3], false, null));
+}
+`,
+    zig: `
+    {
+        const seed = m.P{ .v = 41 };
+        row("p0", m.f(&[_]f64{ 1, 2, 3 }, true, seed));
+        row("p1", m.f(&[_]f64{ 1, 2, 3 }, false, seed));
+        row("p2", m.f(&[_]f64{}, true, seed));
+        row("p3", m.f(&[_]f64{ 1, 2, 3 }, true, null));
+        row("p4", m.f(&[_]f64{ 1, 2, 3 }, false, null));
+    }
+`,
+  },
+  {
+    // Shadowed property spellings under the capture gates: the callback's
+    // `box.q` is its own declaration, the outer read (when present) rides
+    // the capture — both must value exactly as node does on hit and miss.
+    name: "shadowed property reads under narrowing gates run byte-identically to node",
+    src: `
+export interface B { readonly q: number | null; }
+export function shadowOnly(box: B, xs: readonly B[]): number {
+  return box.q === null ? 0 : xs.map((box) => box.q === null ? 0 : 1).length;
+}
+export function outerAndShadow(box: B, xs: readonly B[]): number {
+  return box.q === null ? 0 : box.q + xs.map((box) => box.q === null ? 0 : 1).length;
+}
+`,
+    node: `
+{
+  const hit = { q: 40 };
+  const miss = { q: null };
+  const xs = [{ q: 1 }, { q: null }, { q: 3 }];
+  line("p0", mod.shadowOnly(hit, xs));
+  line("p1", mod.shadowOnly(miss, xs));
+  line("p2", mod.shadowOnly(hit, []));
+  line("p3", mod.outerAndShadow(hit, xs));
+  line("p4", mod.outerAndShadow(miss, xs));
+  line("p5", mod.outerAndShadow(hit, []));
+}
+`,
+    zig: `
+    {
+        const hit = m.B{ .q = 40 };
+        const miss = m.B{ .q = null };
+        const xs = [_]m.B{ .{ .q = 1 }, .{ .q = null }, .{ .q = 3 } };
+        row("p0", m.shadowOnly(hit, &xs));
+        row("p1", m.shadowOnly(miss, &xs));
+        row("p2", m.shadowOnly(hit, &.{}));
+        row("p3", m.outerAndShadow(hit, &xs));
+        row("p4", m.outerAndShadow(miss, &xs));
+        row("p5", m.outerAndShadow(hit, &.{}));
+    }
+`,
+  },
+  {
+    name: "flow-exit guard narrowing in loops runs byte-identically (break, continue, kind guard, post-loop reads)",
+    src: `
+export interface NumResult { readonly value: number; readonly next: number; }
+export function parseNumber(body: Uint8Array, i: number): NumResult | null {
+  if (i >= body.length) return null;
+  return { value: body[i], next: i + 1 };
+}
+export function collect(body: Uint8Array): readonly number[] {
+  const out: number[] = [];
+  let i = 0;
+  while (i < body.length) {
+    const r = parseNumber(body, i);
+    if (r === null) break;
+    out.push(r.value);
+    i = r.next;
+  }
+  return out;
+}
+export interface Hit { readonly value: number; }
+export function lookup(i: number): Hit | null {
+  if (i % 2 === 0) return null;
+  return { value: i * 3 };
+}
+export function oddTotal(n: number): number {
+  let sum = 0;
+  for (let i = 0; i < n; i += 1) {
+    const r = lookup(i);
+    if (r === null) continue;
+    sum += r.value;
+  }
+  return sum;
+}
+export type Msg = { readonly kind: "num"; readonly value: number } | { readonly kind: "stop" };
+export function prefixTotal(raw: readonly number[]): number {
+  let sum = 0;
+  for (const x of raw) {
+    const msg: Msg = x < 0 ? { kind: "stop" } : { kind: "num", value: x };
+    if (msg.kind !== "num") break;
+    sum += msg.value;
+  }
+  return sum;
+}
+export interface Sel { readonly value: number; }
+export interface Model { readonly sel: Sel | null; readonly count: number; }
+export function drain(count: number, selVal: number, hasSel: boolean): number {
+  const model: Model = { sel: hasSel ? { value: selVal } : null, count: count };
+  let total = 0;
+  let i = 0;
+  while (i < model.count) {
+    if (model.sel === null) break;
+    total += model.sel.value;
+    i += 1;
+  }
+  return model.sel === null ? total - 1 : total + model.sel.value;
+}
+`,
+    calls: [
+      { fn: "collect", args: [{ t: "bytes", v: [3, 7, 9] }] },
+      { fn: "collect", args: [{ t: "bytes", v: [] }] },
+      { fn: "oddTotal", args: [i(6)] },
+      { fn: "oddTotal", args: [i(0)] },
+      { fn: "prefixTotal", args: [{ t: "nums", v: [4, 5, -1, 9] }] },
+      { fn: "prefixTotal", args: [{ t: "nums", v: [-2, 8] }] },
+      { fn: "prefixTotal", args: [{ t: "nums", v: [] }] },
+      { fn: "drain", args: [i(3), i(5), { t: "b", v: true }] },
+      { fn: "drain", args: [i(3), i(5), { t: "b", v: false }] },
+      { fn: "drain", args: [i(0), i(5), { t: "b", v: true }] },
+    ],
+  },
+  {
+    name: "a reassigned let behind a continue guard lands its spread reassignment",
+    src: `
+export interface P { readonly v: number; readonly tag: number; }
+export function next(i: number): P | null {
+  if (i % 2 === 0) return null;
+  return { v: i, tag: i * 7 };
+}
+export function total(n: number): number {
+  let sum = 0;
+  for (let i = 0; i < n; i += 1) {
+    let p = next(i);
+    if (p === null) continue;
+    p = { ...p, v: 10 };
+    sum += p.v + p.tag;
+  }
+  return sum;
+}
+`,
+    calls: [
+      { fn: "total", args: [i(6)] },
+      { fn: "total", args: [i(1)] },
+      { fn: "total", args: [i(0)] },
+    ],
+  },
+  {
+    // A kill sealed behind an infinite loop never reaches the merge, so the
+    // post-merge read keeps the pre-branch narrow. The loop terminates by
+    // returning (a bare `while (true) {}` cannot execute under either
+    // driver), so both the sealed branch and the surviving flow run.
+    name: "a kill inside an infinite loop that leaves by return stays off the surviving read",
+    src: `
+export function f(q: number | null, flag: boolean, n: number): number {
+  let p: number | null = q;
+  if (p === null) { return -1; }
+  let i: number = n;
+  if (flag) {
+    p = null;
+    while (true) {
+      if (i > 0) { return i * 10; }
+      i = i + 1;
+    }
+  }
+  return p + 2;
+}
+`,
+    calls: [
+      { fn: "f", args: [{ t: "null" }, { t: "b", v: false }, i(0)] },
+      { fn: "f", args: [f(3), { t: "b", v: true }, i(5)] },
+      { fn: "f", args: [f(3), { t: "b", v: true }, i(-2)] },
+      { fn: "f", args: [f(3), { t: "b", v: false }, i(9)] },
+    ],
+  },
+  {
+    // The finally's kill runs AFTER the try body's return value is
+    // computed (JS evaluates the return expression, then the finally): the
+    // body's read must see the narrowed value, and a finally read of a key
+    // the try body killed re-checks the live variable on both paths.
+    name: "finally kills apply in flow order: after the body's reads, live in its own",
+    src: `
+export function ret(q: number | null): number {
+  let p: number | null = q;
+  if (p === null) { return -1; }
+  try {
+    return p + 10;
+  } finally {
+    p = null;
+  }
+}
+export function readsKilled(q: number | null, drop: boolean): number {
+  let p: number | null = q;
+  if (p === null) { return -1; }
+  let seen: number = 0;
+  try {
+    if (drop) { p = null; }
+  } finally {
+    if (p !== null) { seen = p + 1; }
+  }
+  if (p === null) { return seen + 100; }
+  return seen;
+}
+`,
+    calls: [
+      { fn: "ret", args: [{ t: "null" }] },
+      { fn: "ret", args: [i(5)] },
+      { fn: "readsKilled", args: [{ t: "null" }, { t: "b", v: false }] },
+      { fn: "readsKilled", args: [i(4), { t: "b", v: true }] },
+      { fn: "readsKilled", args: [i(4), { t: "b", v: false }] },
+    ],
+  },
+  {
+    // An exception kill rides the catch's break out of the loop: the clean
+    // path's read after the try keeps its narrow, and the killed path
+    // resumes post-loop. Both paths execute deterministically.
+    name: "an exception kill exits through the catch's break, clean path reads narrowed",
+    src: `
+export interface Boom { readonly kind: "boom"; }
+export function f(q: number | null, fail: boolean): number {
+  let p: number | null = q;
+  if (p === null) { return -1; }
+  while (true) {
+    try {
+      if (fail) { p = null; throw { kind: "boom" } as Boom; }
+    } catch {
+      break;
+    }
+    return p + 20;
+  }
+  return -2;
+}
+`,
+    calls: [
+      { fn: "f", args: [{ t: "null" }, { t: "b", v: false }] },
+      { fn: "f", args: [i(3), { t: "b", v: false }] },
+      { fn: "f", args: [i(3), { t: "b", v: true }] },
     ],
   },
 ];

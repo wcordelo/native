@@ -3,7 +3,8 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { emit, transpile } from "./helpers.ts";
+import { buildEmitter, emit, transpile } from "./helpers.ts";
+import { ts } from "../src/typed_ast.ts";
 
 test("R1 exported const number folds to pub const i64", () => {
   const zig = emit(`export const MAX_TASKS = 64;\nexport function f(n: number): number { return n & MAX_TASKS; }`);
@@ -209,6 +210,22 @@ export function findOrZero(xs: Uint8Array, want: number): number {
   assert.match(zig, /const hit = find\(xs, want\) orelse return 0;/);
 });
 
+test("R7 narrowed ternaries with pure arms keep the tight if-expression and orelse forms", () => {
+  const zig = emit(`
+export function bump(parsed: number | null): number {
+  return parsed === null ? 0 : parsed + 1;
+}
+export function orZero(parsed: number | null): number {
+  return parsed === null ? 0 : parsed;
+}
+`);
+  // Statement-free arms must NOT take the R17b temp lowering — the common
+  // case (numbers, tags, field reads) keeps its expression emission.
+  assert.match(zig, /return if \(parsed\) \|parsed_2\| parsed_2 \+ 1 else 0;/);
+  assert.match(zig, /return parsed orelse 0;/);
+  assert.doesNotMatch(zig, /: f64 = undefined;/);
+});
+
 test("R7 an early-exit guard whose narrowed value goes unread stays a plain null test", () => {
   const zig = emit(`
 export interface Model { readonly now: number | null; readonly nowLen: number; }
@@ -221,6 +238,106 @@ export function label(model: Model): number {
   // read test must not match \`model.nowLen\` inside \`model.now...\`.
   assert.match(zig, /if \(model\.now == null\) return -1;/);
   assert.doesNotMatch(zig, /const now = model\.now orelse/);
+});
+
+test("R7 a reassigned let never fuses to a const; the guard keeps the live variable", () => {
+  const zig = emit(`
+export interface P { readonly v: number; readonly tag: number; }
+export function next(i: number): P | null {
+  if (i % 2 === 0) return null;
+  return { v: i, tag: i };
+}
+export function total(n: number): number {
+  let sum = 0;
+  for (let i = 0; i < n; i += 1) {
+    let p = next(i);
+    if (p === null) continue;
+    p = { ...p, v: 10 };
+    sum += p.v;
+  }
+  return sum;
+}
+`);
+  // Fusing would emit \`const p = next(i) orelse continue;\` and the later
+  // \`p = ...\` would be an assignment to a Zig const. The reassigned binding
+  // stays a var; the guard keeps the plain null test and reads unwrap the
+  // live variable.
+  assert.match(zig, /var p = next\(i\);/);
+  assert.match(zig, /if \(p == null\) continue;/);
+  assert.match(zig, /sum \+= p\.\?\.v;/);
+  assert.doesNotMatch(zig, /const p = next\(i\) orelse/);
+});
+
+test("R13 a redundant nested switch on the same subject hands back the outer capture", () => {
+  const zig = emit(`
+export type Ev =
+  | { readonly kind: "hit"; readonly value: number }
+  | { readonly kind: "miss" };
+export function score(e: Ev): number {
+  switch (e.kind) {
+    case "hit": {
+      let bonus = 0;
+      switch (e.kind) {
+        case "hit": {
+          bonus = e.value * 2;
+          break;
+        }
+        default:
+          break;
+      }
+      return e.value + bonus;
+    }
+    case "miss":
+      return 0;
+  }
+}
+`);
+  // The inner arm's capture (value_2) overwrites the outer arm's map entry;
+  // the arm cleanup must repopulate from its snapshot, or the continuation
+  // reads the inner capture after its block closed (undeclared identifier).
+  assert.match(zig, /bonus = value_2 \* 2;/);
+  assert.match(zig, /return value \+ bonus;/);
+});
+
+test("R7 an exiting null guard heading an else-if chain still narrows the fall-through reads", () => {
+  const zig = emit(`
+export interface P { readonly v: number; }
+export function pick(x: P | null, flag: boolean): number {
+  let n = 1;
+  if (x === null) {
+    return -1;
+  } else if (flag) {
+    n = 2;
+  }
+  return x.v + n;
+}
+`);
+  // The else-if exit path from the if emission must apply the same post-if
+  // narrowing as the common tail; without it the read after the chain
+  // lands on the still-optional value (Zig: optional does not support
+  // field access).
+  assert.match(zig, /return x\.\?\.v \+ n;/);
+});
+
+test("R7 a non-reassigned declaration adjacent to its exit guard still fuses to a const orelse", () => {
+  const zig = emit(`
+export interface P { readonly v: number; }
+export function next(i: number): P | null {
+  if (i % 2 === 0) return null;
+  return { v: i };
+}
+export function total(n: number): number {
+  let sum = 0;
+  for (let i = 0; i < n; i += 1) {
+    const p = next(i);
+    if (p === null) continue;
+    sum += p.v;
+  }
+  return sum;
+}
+`);
+  assert.match(zig, /const p = next\(i\) orelse continue;/);
+  assert.match(zig, /sum \+= p\.v;/);
 });
 
 test("R7c the global undefined VALUE emits the optional empty, never Zig undefined", () => {
@@ -887,6 +1004,88 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
   assert.ok(result.typeErrors.some((e) => e.includes("tick")), result.typeErrors.join("\n"));
 });
 
+test("the loop-entry model is tsc's: a back-edge kill widens the entry state (tsc-level)", () => {
+  // A continue-edge kill reaches the next iteration through the back
+  // edge, so tsc widens the loop-entry state and rejects an unguarded
+  // read relying on the pre-loop narrow (TS18047). The emitter leans on
+  // exactly this: continue-staged kills only need the loop's EXIT join —
+  // in-body next-iteration reads that would need the back-edge state
+  // never get past the checker.
+  const result = transpile(`
+export function f(vals: readonly number[], limit: number): number {
+  let p: number | null = 10;
+  if (p === null) return -1;
+  let sum: number = 0;
+  for (const v of vals) {
+    if (v > limit) { p = null; continue; }
+    sum += p;
+  }
+  return sum;
+}
+`);
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.typeErrors.some((e) => e.includes("TS18047")),
+    result.typeErrors.join("\n") || "expected a possibly-null error",
+  );
+});
+
+test("a do-while continue edge carries its kill into the trailing test (tsc-level)", () => {
+  // `continue` in a do-while jumps TO the condition, so the test's state
+  // is the join of the fall-through and every continue edge: a kill on
+  // one continue path widens the target there, and tsc rejects the bare
+  // condition read (TS18047). The emitter leans on this — the hoisted
+  // first-pass head reads the live optional, and any bare-read shape
+  // never gets past the checker.
+  const result = transpile(`
+export interface P { readonly v: number; }
+export function g(q: P | null, r: P | null): number {
+  let p: P | null = q;
+  let n = 0;
+  do {
+    if (p === null) return -1;
+    n += p.v;
+    if (n < 3) {
+      p = r;
+      continue;
+    }
+    n += 1;
+  } while (p.v > 0 && n < 10);
+  return n;
+}
+`);
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.typeErrors.some((e) => e.includes("TS18047")),
+    result.typeErrors.join("\n") || "expected a possibly-null error",
+  );
+});
+
+test("a do-while body narrow does not survive the back edge into the body top (tsc-level)", () => {
+  // The body-top state is the join of the pre-loop entry and the back
+  // edge: with a widened pre-loop state, a narrow established later in
+  // the body never reaches the top read of the next iteration — tsc
+  // rejects it on iteration one, and the trailing-test scope must not
+  // leak it into iteration entry either.
+  const result = transpile(`
+export interface P { readonly v: number; }
+export function g(q: P | null): number {
+  const p: P | null = q;
+  let n = 0;
+  do {
+    n += p.v;
+    if (p === null) return -1;
+  } while (p.v > 0 && n < 10);
+  return n;
+}
+`);
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.typeErrors.some((e) => e.includes("TS18047")),
+    result.typeErrors.join("\n") || "expected a possibly-null error",
+  );
+});
+
 test("emit-time verification: unsupported constructs stop the build as NS9001", () => {
   const result = transpile(`
 export function f(xs: readonly number[]): readonly number[] {
@@ -1416,6 +1615,521 @@ export function partial(f: Filter): number {
   assert.match(zig, /else => return 0,/);
   // A partial value switch skips uncovered members exactly like JS.
   assert.match(zig, /else => \{\},/);
+});
+
+test("R13d a callback-mutated scrutinee gets a completing else, never unreachable", () => {
+  // tsc keeps k's flow type at "a" across the callback (it never widens
+  // locals for nested-function assignments), but execution reaches the
+  // switch with k === "b" whenever xs is non-empty: an `else =>
+  // unreachable` armed off that flow claim is a safety panic in Debug and
+  // UB in ReleaseFast. Coverage judged by the declared union declines
+  // here, so the fallthrough must complete.
+  const zig = emit(`
+export type AB = "a" | "b";
+export function f(xs: readonly number[]): number {
+  let k: AB = "a";
+  const ys = xs.map((x) => { k = "b"; return x; });
+  switch (k) {
+    case "a":
+      return 1;
+  }
+  return 2 + ys.length;
+}
+`);
+  assert.doesNotMatch(zig, /else => unreachable/);
+  assert.match(zig, /else => \{\},/);
+});
+
+test("R13d declared-union coverage still closes the numeric else with unreachable", () => {
+  // The sound case is untouched: every declared member armed and exiting
+  // proves the integer scrutinee's required else arm never runs.
+  const zig = emit(`
+export type Level = 0 | 1 | 2;
+export function f(lvl: Level): number {
+  switch (lvl) {
+    case 0:
+      return 1;
+    case 1:
+    case 2:
+      return 2;
+  }
+}
+`);
+  assert.match(zig, /else => unreachable,/);
+});
+
+test("R13d flow-narrowed coverage still claims for a local no nested function assigns", () => {
+  // The precise middle, pinned: with no capture-site assignment the
+  // straight-line CFA is exact for an unaliased local, so the guard's
+  // exclusion holds on every real path and the flow type may judge.
+  const zig = emit(`
+export type Mode = "a" | "b" | "c";
+export function f(mode: Mode): number {
+  if (mode === "c") return 30;
+  switch (mode) {
+    case "a":
+      return 1;
+    case "b":
+      return 2;
+  }
+}
+`);
+  assert.match(zig, /else => unreachable,/);
+});
+
+test("finally reads keep their narrow across tsc-unreachable and callback assignments", () => {
+  // finallyEntryKills counts what tsc's CFA counts: `if (false) p = null`
+  // sits in a branch tsc excludes, and a callback body's assignment never
+  // widens the finally (both probed), so the substituted read survives.
+  const zig = emit(`
+export interface P { readonly v: number; }
+export function f(q: P | null, xs: readonly number[]): number {
+  let p: P | null = q;
+  if (p === null) return -1;
+  let n = 0;
+  try {
+    if (false) p = null;
+    const ys = xs.map((x) => { p = null; return x; });
+    n += ys.length;
+  } finally {
+    n += p.v;
+  }
+  return n;
+}
+`);
+  assert.match(zig, /n \+= p\.\?\.v;/);
+});
+
+test("a write-only ternary arm takes the plain comparison, a reading arm the capture", () => {
+  // A guarded capture serves READS: the bare target of a plain `=` inside
+  // the hit arm's callback never consumes it, so the arm declines the
+  // capture form (a bound-but-unused Zig capture is a compile error) and
+  // keeps `!= null`; the reading arm still binds and consumes its capture.
+  const zig = emit(`
+export interface P { readonly v: number; }
+export function writes(q: P | null, xs: readonly number[]): number {
+  let p: P | null = q;
+  return p !== null ? xs.map((x) => { p = null; return x; }).length : 0;
+}
+export function reads(q: P | null): number {
+  return q !== null ? q.v : 0;
+}
+`);
+  assert.match(zig, /if \(p != null\) \{/);
+  assert.doesNotMatch(zig, /if \(p\) \|/);
+  assert.match(zig, /if \(q\) \|q_2\| q_2\.v else 0/);
+});
+
+test("kills under a keyword-literal false condition never reach the branch join", () => {
+  // tscExcludedArm at the join layer: `if (false) p = null` emits (Zig
+  // compiles it fine) but contributes no kill, so the fall-through read
+  // keeps the unwrap tsc typed it with. The genuinely conditional kill in
+  // g still joins and the re-guard re-narrows.
+  const zig = emit(`
+export interface P { readonly v: number; }
+function make(a: number): P | null {
+  if (a < 0) return null;
+  return { v: a };
+}
+export function f(a: number): number {
+  let p: P | null = make(a);
+  if (p === null) return -1;
+  if (false) p = null;
+  while (false) {
+    p = null;
+  }
+  return p.v;
+}
+export function g(a: number, flag: boolean): number {
+  let p: P | null = make(a);
+  if (p === null) return -1;
+  if (flag) p = null;
+  if (p === null) return -2;
+  return p.v;
+}
+`);
+  assert.match(zig, /if \(false\) \{/);
+  assert.match(zig, /while \(false\) p = null;/);
+  assert.match(zig, /return p\.\?\.v;\n\}\n\npub fn g/);
+  assert.match(zig, /const p_2 = p orelse return -2;/);
+});
+
+test("tscExcludedArm: bare keyword-literal arms only; a do-while(false) body counts", () => {
+  // The one shared judgment both the finally scan and the branch joins
+  // consult, pinned direction by direction — including the distinction
+  // that a do-while(false) body RUNS once (the test follows the body), so
+  // it is never excluded, and that a `const NEVER = false` alias condition
+  // widens under tsc, so a reference never excludes.
+  const { emitter, file } = buildEmitter(`
+const NEVER = false;
+export function f(): number {
+  let n = 0;
+  if (false) n += 1;
+  if (true) {
+    n += 2;
+  } else {
+    n += 3;
+  }
+  while (false) {
+    n += 4;
+  }
+  do {
+    n += 5;
+  } while (false);
+  if (NEVER) n += 6;
+  return n;
+}
+`);
+  const excluded = (construct: import("../src/typed_ast.ts").Node, arm: import("../src/typed_ast.ts").Node | undefined): boolean =>
+    (emitter as unknown as { tscExcludedArm(c: unknown, a: unknown): boolean }).tscExcludedArm(construct, arm);
+  const stmts: any[] = [];
+  const fn = (file.statements as readonly any[]).find((s) => s.name?.text === "f");
+  for (const s of fn.body.statements) stmts.push(s);
+  const [, ifFalse, ifTrue, whileFalse, doWhile, ifAlias] = stmts;
+  assert.equal(excluded(ifFalse, ifFalse.thenStatement), true);
+  assert.equal(excluded(ifFalse, ifFalse.elseStatement), false);
+  assert.equal(excluded(ifTrue, ifTrue.elseStatement), true);
+  assert.equal(excluded(ifTrue, ifTrue.thenStatement), false);
+  assert.equal(excluded(whileFalse, whileFalse.statement), true);
+  assert.equal(excluded(doWhile, doWhile.statement), false);
+  assert.equal(excluded(ifAlias, ifAlias.thenStatement), false);
+});
+
+test("tscExcludedArm: for(;false;) excludes body and incrementor; omitted or real conditions never do", () => {
+  // The classic-for leg of the same judgment: tsc's CFA never enters a
+  // `for (; false;)` body, and the incrementor runs only after a body
+  // iteration that never happens. An OMITTED condition is the opposite
+  // judgment — an infinite loop (alwaysExits) — so the two must not
+  // collide: literal false ≠ omitted.
+  const { emitter, file } = buildEmitter(`
+export function f(n: number): number {
+  let t = 0;
+  for (let i = 0; false; i += 1) t += 1;
+  for (let i = 0; i < n; i += 1) t += 2;
+  return t;
+}
+export function g(): number {
+  for (;;) {
+    // never completes
+  }
+}
+`);
+  const em = emitter as unknown as {
+    tscExcludedArm(c: unknown, a: unknown): boolean;
+    alwaysExits(s: unknown): boolean;
+  };
+  const fnBody = (name: string): readonly any[] =>
+    (file.statements as readonly any[]).find((s) => s.name?.text === name).body.statements;
+  const [, forFalse, forReal] = fnBody("f");
+  assert.equal(em.tscExcludedArm(forFalse, forFalse.statement), true);
+  assert.equal(em.tscExcludedArm(forFalse, forFalse.incrementor), true);
+  assert.equal(em.tscExcludedArm(forFalse, forFalse.initializer), false);
+  assert.equal(em.tscExcludedArm(forReal, forReal.statement), false);
+  assert.equal(em.tscExcludedArm(forReal, forReal.incrementor), false);
+  const [forever] = fnBody("g");
+  // `for (;;)` keeps round 10's terminality and is never "excluded".
+  assert.equal(em.tscExcludedArm(forever, forever.statement), false);
+  assert.equal(em.alwaysExits(forever), true);
+});
+
+test("route walks give tsc-excluded arms no routes: a dead break/continue never stages a loop-exit kill", () => {
+  // tsc keeps p narrowed at the post-loop read: the killing branch always
+  // returns, and the `if (false) break` inside it sits outside tsc's CFA.
+  // The route walks (allRoutesLeaveFunction, escapingEdgesOf) must read
+  // the branch the same way — an excluded arm contributes NO routes — or
+  // the dead break turns the always-leaving branch into a loop-escaping
+  // one and stages a kill at the loop exit that only paths tsc has ruled
+  // out could carry: the emitted read drops its `.?` and returns a raw
+  // optional, invalid Zig. A REAL break in the same shape still stages
+  // the kill, and the post-loop read re-guards.
+  const zig = emit(`
+export function deadBreak(es: number[], q: number | null): number {
+  let p: number | null = q;
+  if (p === null) return -1;
+  for (const e of es) {
+    if (e > 0) { p = null; if (false) break; return 1; }
+  }
+  return p;
+}
+export function deadContinue(es: number[], q: number | null): number {
+  let p: number | null = q;
+  if (p === null) return -1;
+  for (const e of es) {
+    if (e > 0) { p = null; if (false) continue; return 1; }
+  }
+  return p;
+}
+export function realBreak(es: number[], q: number | null): number {
+  let p: number | null = q;
+  if (p === null) return -1;
+  for (const e of es) {
+    if (e > 0) { p = null; if (e > 1) break; return 1; }
+  }
+  return p === null ? -2 : p;
+}
+`);
+  const narrowedReturns = zig.match(/return p\.\?;/g) ?? [];
+  assert.equal(narrowedReturns.length, 2, `deadBreak and deadContinue keep the narrow:\n${zig}`);
+  assert.match(zig, /return p orelse -2;/);
+});
+
+test("a for(;false;) body's kills are excluded at the join and the finally scan like while(false)", () => {
+  // The ForStatement leg of tscExcludedArm, consumer by consumer: the
+  // loop-dispatch join drops the body's staged kills, and the finally
+  // entry scan skips the body — while a REAL classic for's kills still
+  // count at both.
+  const zig = emit(`
+export function joined(q: number | null): number {
+  let p: number | null = q;
+  if (p === null) return -1;
+  for (let i = 0; false; i += 1) p = null;
+  return p;
+}
+export function inFinally(q: number | null): number {
+  let p: number | null = q;
+  if (p === null) return -1;
+  let t = 0;
+  try {
+    t = t + 1;
+    for (let i = 0; false; i += 1) p = null;
+  } finally {
+    t = t + p;
+  }
+  return t;
+}
+export function realFor(n: number, q: number | null): number {
+  let p: number | null = q;
+  if (p === null) return -1;
+  for (let i = 0; i < n; i += 1) p = null;
+  return p === null ? -2 : p;
+}
+`);
+  assert.match(zig, /return p\.\?;/);
+  assert.match(zig, /t = t \+ p\.\?;/);
+  assert.match(zig, /return p orelse -2;/);
+});
+
+test("R13f a claimed-terminal inferred-union plain switch closes its chain with unreachable", () => {
+  // The AGREEMENT invariant, plain-switch leg: an INFERRED literal union
+  // (`const k = x > 0 ? 1 : 2` types as 1 | 2) passes the sound coverage
+  // judgment, so alwaysExits claims the switch terminal — but the
+  // emitter-level type is plain number, and the lowering is the if/else
+  // chain. The claim suppresses the trailing completion a value block or
+  // a returning function needs, so the chain itself must close the
+  // never-reached fallthrough.
+  const zig = emit(`
+export function m(xs: number[]): number[] {
+  return xs.map((x) => {
+    const k = x > 0 ? 1 : 2;
+    switch (k) {
+      case 1: return 10;
+      case 2: return 20;
+    }
+  });
+}
+export function s(x: number): number {
+  const k = x > 0 ? 1 : 2;
+  switch (k) {
+    case 1: return 10;
+    case 2: return 20;
+  }
+}
+`);
+  const closers = zig.match(/\} else \{\s*\n\s*unreachable;/g) ?? [];
+  assert.equal(closers.length, 2, `both positions close the chain:\n${zig}`);
+});
+
+test("R13f a non-exhaustive inferred-union plain switch still completes normally", () => {
+  const zig = emit(`
+export function t(x: number): number {
+  const k = x > 0 ? 1 : 2;
+  switch (k) {
+    case 1: return 10;
+  }
+  return 5;
+}
+`);
+  assert.doesNotMatch(zig, /unreachable/);
+  assert.match(zig, /return 5;/);
+});
+
+test("terminality/lowering agreement across all three switch lowerings", () => {
+  // No switch construct may be CLAIMED terminal (alwaysExits) while its
+  // lowering emits a completable fallthrough. Each lowering either closes
+  // or declines: emitSwitch (kind) is Zig-exhaustive by construction,
+  // emitValueSwitch closes with `else => unreachable`, emitPlainSwitch
+  // closes its chain with an `unreachable` else.
+  const shapes: { name: string; src: string; closed: RegExp }[] = [
+    {
+      name: "kind switch",
+      src: `
+export type Msg = { readonly kind: "a"; readonly n: number } | { readonly kind: "b" };
+export function f(m: Msg): number {
+  switch (m.kind) {
+    case "a": return m.n;
+    case "b": return 2;
+  }
+}
+`,
+      closed: /switch \(m\) \{/,
+    },
+    {
+      name: "value switch",
+      src: `
+export type Level = 0 | 1;
+export function f(lvl: Level): number {
+  switch (lvl) {
+    case 0: return 1;
+    case 1: return 2;
+  }
+}
+`,
+      closed: /else => unreachable,/,
+    },
+    {
+      name: "plain switch",
+      src: `
+export function f(x: number): number {
+  const k = x > 0 ? 1 : 2;
+  switch (k) {
+    case 1: return 10;
+    case 2: return 20;
+  }
+}
+`,
+      closed: /\} else \{\s*\n\s*unreachable;/,
+    },
+  ];
+  for (const shape of shapes) {
+    const { emitter, file } = buildEmitter(shape.src);
+    let sw: unknown = null;
+    const find = (n: any): void => {
+      if (ts.isSwitchStatement(n)) sw = n;
+      ts.forEachChild(n, find);
+    };
+    ts.forEachChild(file as any, find);
+    assert.notEqual(sw, null, `${shape.name}: switch found`);
+    const claims = (emitter as unknown as { alwaysExits(s: unknown): boolean }).alwaysExits(sw);
+    assert.equal(claims, true, `${shape.name}: terminality claimed`);
+    const zig = emit(shape.src);
+    assert.match(zig, shape.closed, `${shape.name}: the claimed-terminal lowering closes`);
+    assert.doesNotMatch(zig, /else => \{\},/, `${shape.name}: no completable fallthrough arm`);
+  }
+});
+
+test("R13d flow trust is position-aware over nested functions", () => {
+  // scrutineeFlowTrustable, all four directions of the reach-before-use
+  // rule. The declining directions use shapes the subset checker gates out
+  // of end-to-end fixtures (a nested function declaration is NS1046), so
+  // they pin here against the raw judgment.
+  const trustAt = (src: string): boolean => {
+    const { emitter, file } = buildEmitter(src);
+    let id: unknown = null;
+    const visit = (n: any): void => {
+      if (ts.isSwitchStatement(n)) id = n.expression;
+      ts.forEachChild(n, visit);
+    };
+    ts.forEachChild(file as any, visit);
+    assert.notEqual(id, null);
+    return (emitter as unknown as { scrutineeFlowTrustable(n: unknown): boolean }).scrutineeFlowTrustable(id);
+  };
+  const wrap = (tail: string): string => `
+type Mode = "a" | "b" | "c";
+export function f(flag: boolean, xs: readonly number[]): number {
+  let k: Mode = flag ? "a" : "b";
+  switch (k) {
+    case "a": return 1;
+    case "b": return 2;
+  }
+  ${tail}
+}
+`;
+  // An arrow defined AFTER the switch does not exist as a value before it:
+  // trust holds.
+  assert.equal(trustAt(wrap(`
+  const bump = (): void => { k = "c"; };
+  bump();
+  return 0;`)), true);
+  // An arrow defined BEFORE the switch counts (whether anything calls it
+  // is not asked): trust declines.
+  assert.equal(trustAt(`
+type Mode = "a" | "b" | "c";
+export function f(flag: boolean): number {
+  let k: Mode = flag ? "a" : "b";
+  const bump = (): void => { k = "c"; };
+  switch (k) {
+    case "a": return 1;
+    case "b": return 2;
+  }
+  return 0;
+}
+`), false);
+  // A function DECLARATION hoists — an earlier call can run it — so it
+  // counts regardless of sitting after the switch: trust declines.
+  assert.equal(trustAt(wrap(`
+  function bump(): void { k = "c"; }
+  return 0;`)), false);
+  // A loop enclosing both lets the later arrow run before a re-entered
+  // switch (the back edge): trust declines.
+  assert.equal(trustAt(`
+type Mode = "a" | "b" | "c";
+export function f(xs: readonly number[]): number {
+  let total = 0;
+  let k: Mode = "a";
+  for (const x of xs) {
+    switch (k) {
+      case "a":
+        total += 1;
+        break;
+    }
+    const ys = [x].map((y) => {
+      k = "c";
+      return y;
+    });
+    total += ys.length;
+  }
+  return total;
+}
+`), false);
+});
+
+test("a nested helper's label reuse neither binds the enclosing loop nor keeps its label", () => {
+  // Labels are function-scoped: the helper's `break outer` binds the
+  // HELPER's own label, so the enclosing constant-true loop stays terminal
+  // (the branch kill drops; the fall-through read keeps its unwrap) and
+  // the enclosing `outer:` drops (Zig rejects an unused loop label). The
+  // hoisted helper keeps its own, consumed label.
+  const zig = emit(`
+export interface P { readonly v: number; }
+function make(a: number): P | null {
+  if (a < 0) return null;
+  return { v: a };
+}
+export function f(a: number, flag: boolean): number {
+  let p: P | null = make(a);
+  if (p === null) return -1;
+  if (flag) {
+    outer: while (true) {
+      const helper = (): number => {
+        outer: while (true) {
+          break outer;
+        }
+        return 1;
+      };
+      p = null;
+      return helper();
+    }
+  }
+  return p.v;
+}
+`);
+  const enclosing = zig.split("pub fn f")[1].split("\n}")[0];
+  assert.match(enclosing, /\n        while \(true\) \{/);
+  assert.doesNotMatch(enclosing, /outer:/);
+  assert.match(enclosing, /return p\.\?\.v;/);
+  const helper = zig.split("\nfn helper")[1].split("\n}")[0];
+  assert.match(helper, /outer: while \(true\) \{/);
+  assert.match(helper, /break :outer;/);
 });
 
 test("kernel capacities: default header uses the shared default kernel", () => {

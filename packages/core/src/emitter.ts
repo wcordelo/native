@@ -55,6 +55,26 @@ class EmitError extends Error {
   }
 }
 
+/// One enclosing edge-target construct (see Ctx.edgeKills). `label` is the
+/// SOURCE label naming the construct (loopLabel mangling happens at
+/// emission), null for unlabeled ones. An unlabeled `break` binds the
+/// innermost loop-or-switch stage, an unlabeled `continue` the innermost
+/// loop, labeled exits the innermost stage carrying their label, and a
+/// lifted callback's lowered `return` the innermost callback stage.
+interface EdgeKillStage {
+  readonly kind: "loop" | "switch" | "block" | "callback";
+  readonly label: string | null;
+  readonly kills: Set<string>;
+}
+
+/// Where a closing scope's recorded kills go — kills travel the same edges
+/// control does. `merge` applies them to the surviving fall-through flow;
+/// `drop` discards them (every route leaves the emitted function); an array
+/// of destination sets carries them along the scope's non-local edges (the
+/// enclosing try's pending catch set, break/continue target stages, the
+/// lifted callback's stage), each applied where its edge lands.
+type KillRouting = "merge" | "drop" | readonly Set<string>[];
+
 interface Ctx {
   readonly lines: string[];
   indent: number;
@@ -70,14 +90,71 @@ interface Ctx {
   /// `throw` (or a throwing call) breaks to it; null means the throw
   /// propagates (`return error.Thrown`) to the caller.
   tryLabel?: string | null;
+  /// R20: true while emitting inside a try body whose local catch has some
+  /// route back into the function. There ANY statement containing a
+  /// throwing call is a resuming route — it lands in the catch, and the
+  /// catch's fall-back carries the region's narrowing kills to a merge
+  /// point — so kill dropping (allRoutesLeaveFunction) treats each one as
+  /// a route that does not leave. A catch whose every route leaves the
+  /// function (including its own throws, judged against ITS enclosing
+  /// handler) closes that path, and the flag stays off for its body.
+  catchResumes?: boolean;
+  /// R20: the ENCLOSING try's pending exception kills — kills travel the
+  /// same edges control does (allRoutesLeaveFunction's route destinations).
+  /// A scope whose only in-function routes are throws caught by that try's
+  /// catch never falls through into the try body's remaining statements,
+  /// so its kills must not merge into intra-try flow; they wait here and
+  /// emitTryCore hands them to the catch as its ENTRY state (the catch
+  /// body's reads see them), where they ride the catch's own kill-frame
+  /// routing out — post-try on fall-through, the edge stage on a
+  /// break/continue, dropped when every catch route leaves the function
+  /// (see popNarrowKillFrame's route form). The throw edge is one instance
+  /// of the general rule; break/continue/lowered-return edges stage the
+  /// same way on edgeKills below.
+  pendingCatchKills?: Set<string> | null;
+  /// The enclosing edge-target constructs of the emitted function,
+  /// innermost last: loops, switches, labeled blocks, and lifted-callback
+  /// value blocks. A scope that exits ONLY along break/continue/lowered-
+  /// return edges stages its kills on the target construct's set
+  /// (popNarrowKillFrame's route form, the sibling of pendingCatchKills),
+  /// and the construct's emitter applies them where those edges land — the
+  /// post-construct state for breaks and callback returns, and for
+  /// continue edges the back-edge join, which the emitter also realizes as
+  /// the post-loop state: the loop-entry model delegates in-body
+  /// next-iteration reads to tsc (the checker rejects a read relying on a
+  /// narrow the back edge kills), so the only emission the kill must still
+  /// reach is the normal-completion exit. Applying a stage records into
+  /// the then-innermost kill frame, so staged kills keep propagating
+  /// outward exactly like merge-class kills.
+  readonly edgeKills: EdgeKillStage[];
   /// decl node -> zig identifier
   readonly names: Map<ts.Node, string>;
   readonly used: Set<string>;
   /// normalized source text of an expression -> replacement zig expr
   /// (optional-narrowing captures, union payload captures)
   readonly memberSubst: Map<string, string>;
+  /// The subset of memberSubst entries that RENAME without narrowing: a
+  /// union payload capture of an optional-typed field holds the payload
+  /// as-is (`.got => |parsed|` with `got: ?f64` binds `parsed: ?f64`), so
+  /// type queries must keep the optional. Maps key -> that replacement;
+  /// zTypeOfExpr only unwraps when the ACTIVE replacement differs (a
+  /// null-guard capture overwriting the key installs a fresh name, so the
+  /// identity check stays correct through save/restore cycles).
+  readonly stillOptionalSubst: Map<string, string>;
   /// source text of a union-typed expr -> active arm tag (kind guards)
   readonly narrowedUnion: Map<string, string>;
+  /// Invalidation frames, innermost last: every scope that snapshots and
+  /// restores the narrowing maps pushes a Set here, and the assignment path
+  /// records into the innermost frame each memberSubst key whose narrowing
+  /// it permanently deleted (the assigned value may be null again). The
+  /// snapshot restore at scope exit gives CONTAINMENT — narrowings added
+  /// inside the scope die there — but restoring alone would also resurrect
+  /// narrowings an assignment inside the scope killed; re-applying the
+  /// frame's deletions after the restore keeps those dead. Frames merge
+  /// outward on pop so an inner branch's kill reaches every enclosing exit
+  /// it can fall through to; a scope that always leaves the function drops
+  /// its kills instead (see popNarrowKillFrame).
+  readonly narrowKilled: Set<string>[];
   /// declared/inferred types of locals
   readonly localTypes: Map<ts.Node, ZType>;
   /// Locally-owned arrays with length-changing mutations (the push-builder
@@ -235,6 +312,10 @@ export class Emitter {
   private readonly genericNames = new Set<string>();
   private readonly sourceName: string;
   private readonly capacities: KernelCapacities;
+  /// Per-switch memo for the defaultless value-switch exhaustiveness
+  /// consult (alwaysExits re-asks along every kill-routing scan).
+  private switchCoversTypeMemo = new WeakMap<ts.SwitchStatement, boolean>();
+
   /// Computed once at the top of emitModule (before any type emission).
   private helpers: ModelHelper[] = [];
   private unbound: { model: string[]; msg: string[] } = { model: [], msg: [] };
@@ -982,7 +1063,10 @@ export class Emitter {
       names: new Map(),
       used: this.moduleScopeNames(),
       memberSubst: new Map(),
+      stillOptionalSubst: new Map(),
       narrowedUnion: new Map(),
+      narrowKilled: [],
+      edgeKills: [],
       localTypes: new Map(),
       builders: new Map(),
       retLabel: null,
@@ -1359,7 +1443,10 @@ export class Emitter {
       names: new Map(),
       used: new Set(),
       memberSubst: new Map(),
+      stillOptionalSubst: new Map(),
       narrowedUnion: new Map(),
+      narrowKilled: [],
+      edgeKills: [],
       localTypes: new Map(),
       builders: new Map(),
       retLabel: null,
@@ -1615,7 +1702,10 @@ export class Emitter {
       names: new Map(),
       used: this.moduleScopeNames(),
       memberSubst: new Map(),
+      stillOptionalSubst: new Map(),
       narrowedUnion: new Map(),
+      narrowKilled: [],
+      edgeKills: [],
       localTypes: new Map(),
       builders: new Map(),
       retLabel: null,
@@ -1839,7 +1929,10 @@ export class Emitter {
       names: new Map(),
       used: this.moduleScopeNames(),
       memberSubst: new Map(),
+      stillOptionalSubst: new Map(),
       narrowedUnion: new Map(),
+      narrowKilled: [],
+      edgeKills: [],
       localTypes: new Map(),
       builders: new Map(),
       retLabel: null,
@@ -3100,6 +3193,115 @@ export class Emitter {
     return this.table.zigTypeRef(t);
   }
 
+  /// Per-declaration ids for narrowing keys (see narrowKey). A WeakMap
+  /// identity id rather than the declaration's source position: positions
+  /// can collide across files, and imported consts narrow too.
+  private readonly narrowKeyIds = new WeakMap<ts.Declaration, number>();
+  private narrowKeyNextId = 1;
+
+  /// Explicit node-scoped keys: a lowering that re-emits one specific
+  /// expression NODE under a capture (the optional-call receiver) can
+  /// register a key for it even when the expression has no canonical
+  /// narrowing key. The key is unique to the node, so it can never match
+  /// a different occurrence — it carries a single node's rewrite, not a
+  /// narrowing fact.
+  private readonly nodeNarrowKeys = new WeakMap<ts.Node, string>();
+
+  /// The key an expression narrows/substitutes under: normalized source
+  /// text with the base identifier DECLARATION-qualified (`q#3`, member
+  /// chains `q#3.v`). Emission FLATTENS plain lexical blocks and callback
+  /// bodies share the enclosing maps, so raw text would let two
+  /// same-named declarations collide — a block-local `const q` shadow
+  /// leaves its entries live for the OUTER q after the block, and an
+  /// outer capture rewrites a callback parameter's reads. Symbol identity
+  /// makes the collision impossible; the maps' values and mechanics are
+  /// unchanged. Wrapper spellings collide by design: parentheses,
+  /// non-null assertions, `as`, and `satisfies` all erase at emission
+  /// (`(q)`, `q!`, and `q as Quote` are the tested `q`), so every
+  /// consumer comparing or looking up keys sees through them — an arm
+  /// spelled `q!` matches its guard's `q`, and a narrow installed for `q`
+  /// rewrites the `q!` read. A base the checker cannot resolve keys by
+  /// plain text — same behavior as before, and such bases are never
+  /// locals.
+  ///
+  /// Element accesses qualify recursively, like property chains — the
+  /// grammar is `base[index]` where the base is this same key and the
+  /// index is a canonical argument form: a literal index canonicalizes by
+  /// VALUE (`xs#3[0]`, so `xs[0]`, `xs[0x0]`, and `xs["0"]` are one key,
+  /// exactly the one element JS reads), and an identifier index qualifies
+  /// by the index's own declaration (`xs#3[i#7]` — a shadowed `i` is a
+  /// different element). Anything non-canonical — a computed index, a
+  /// call — has NO narrowing key: two spellings of `xs[f()]` need not
+  /// read the same element, so nothing may narrow, substitute, or match
+  /// through one. Returning null here is the decline answer every
+  /// consumer honors: no substitution installs, capture gates see no
+  /// read, and the expression's reads stay live optionals. Raw source
+  /// text is never a key — emission flattens lexical blocks, so text
+  /// would let a shadowed declaration's narrow leak onto the outer name.
+  private narrowKey(expr: ts.Node): string | null {
+    const override = this.nodeNarrowKeys.get(expr);
+    if (override !== undefined) return override;
+    let e: ts.Node = expr;
+    while (
+      ts.isParenthesizedExpression(e) ||
+      ts.isNonNullExpression(e) ||
+      ts.isAsExpression(e) ||
+      ts.isSatisfiesExpression(e)
+    ) {
+      e = e.expression;
+    }
+    if (ts.isPropertyAccessExpression(e)) {
+      const base = this.narrowKey(e.expression);
+      return base === null ? null : `${base}${e.questionDotToken ? "?." : "."}${e.name.text}`;
+    }
+    if (ts.isElementAccessExpression(e)) {
+      const base = this.narrowKey(e.expression);
+      if (base === null) return null;
+      const index = this.canonicalIndexKey(e.argumentExpression);
+      if (index === null) return null;
+      return `${base}${e.questionDotToken ? "?." : ""}[${index}]`;
+    }
+    if (ts.isIdentifier(e)) {
+      const decl = this.tast.declarationOf(e);
+      if (decl) {
+        let id = this.narrowKeyIds.get(decl);
+        if (id === undefined) {
+          id = this.narrowKeyNextId++;
+          this.narrowKeyIds.set(decl, id);
+        }
+        return `${e.text}#${id}`;
+      }
+      return e.text;
+    }
+    // `this` is one object per member body (arrows keep it), never
+    // shadowable — the keyword is its own key.
+    if (e.kind === ts.SyntaxKind.ThisKeyword) return "this";
+    return null;
+  }
+
+  /// The canonical form of an element-access index, or null when the
+  /// index is not a stable reference to one element (see narrowKey).
+  /// Literals canonicalize by the VALUE JS coerces to a property key —
+  /// a numeric string index is the numeric index (`xs["0"]` is `xs[0]`).
+  private canonicalIndexKey(arg: ts.Expression): string | null {
+    let a: ts.Expression = arg;
+    while (
+      ts.isParenthesizedExpression(a) ||
+      ts.isNonNullExpression(a) ||
+      ts.isAsExpression(a) ||
+      ts.isSatisfiesExpression(a)
+    ) {
+      a = a.expression;
+    }
+    if (ts.isNumericLiteral(a)) return String(Number(a.text));
+    if (ts.isStringLiteral(a) || ts.isNoSubstitutionTemplateLiteral(a)) {
+      const n = Number(a.text);
+      return String(n) === a.text ? String(n) : JSON.stringify(a.text);
+    }
+    if (ts.isIdentifier(a)) return this.narrowKey(a);
+    return null;
+  }
+
   private identifierUsed(body: ts.Node, decl: ts.Node): boolean {
     let used = false;
     const visit = (n: ts.Node): void => {
@@ -3161,7 +3363,326 @@ export class Emitter {
     return this.uniqueName(ctx, hint);
   }
 
-  private emitBlockStatements(stmts: readonly ts.Statement[], ctx: Ctx): void {
+  /// Open an invalidation frame: every scope that snapshots/restores the
+  /// narrowing maps brackets its emission with this pair, so assignment
+  /// kills recorded during the scope survive the restore (see Ctx.narrowKilled).
+  private pushNarrowKillFrame(ctx: Ctx): void {
+    ctx.narrowKilled.push(new Set());
+  }
+
+  /// Close the innermost invalidation frame: re-apply its recorded kills to
+  /// the just-restored narrowing maps and merge them one frame outward (an
+  /// inner branch's kill must reach every enclosing exit it can fall
+  /// through to). A kill on ANY fall-through path inside the scope deletes
+  /// the narrow at the merge point, so a path that kept the value non-null
+  /// pays a re-check — never wrong code. Only memberSubst is touched,
+  /// mirroring the assignment-invalidation path (a stillOptionalSubst entry
+  /// is inert once its memberSubst entry is gone, and narrowedUnion is not
+  /// what `.?` substitutions live in).
+  ///
+  /// `drop` discards the frame's kills instead: the caller has proven the
+  /// scope always leaves the emitted function, so no path carrying those
+  /// kills reaches the merge point — merging them would delete narrowings
+  /// tsc keeps on the surviving flow, and a read there relies on the
+  /// substitution's unwrap spelling (losing it emits a field access on an
+  /// optional, not a re-check).
+  ///
+  /// A destination array routes the kills along the scope's non-local
+  /// edges instead: the scope's only in-function routes are caught throws
+  /// and/or escaping break/continue/lowered-return edges, so no path
+  /// carrying the kills reaches THIS merge point either — but each edge
+  /// resumes somewhere in the function, and the kills must be live there.
+  /// Kills travel the same edges control does: they wait in the
+  /// destination sets (the enclosing try's pendingCatchKills, the target
+  /// constructs' edgeKills stages) and the owning emitters apply them
+  /// where the edges land — never mid-flight, where tsc keeps the
+  /// surviving paths' narrows.
+  private popNarrowKillFrame(ctx: Ctx, routing: KillRouting = "merge"): Set<string> {
+    const killed = ctx.narrowKilled.pop() ?? new Set<string>();
+    if (routing === "drop") return killed;
+    if (routing !== "merge") {
+      for (const dest of routing) for (const key of killed) dest.add(key);
+      return killed;
+    }
+    for (const key of killed) ctx.memberSubst.delete(key);
+    const parent = ctx.narrowKilled[ctx.narrowKilled.length - 1];
+    if (parent) for (const key of killed) parent.add(key);
+    return killed;
+  }
+
+  /// Bracket `emit` in one narrowing flow scope: on exit, restore the three
+  /// narrowing maps to their entry snapshot (containment), then re-apply and
+  /// merge — or drop, or route to the enclosing try's pending set — the
+  /// kills recorded inside (see popNarrowKillFrame).
+  ///
+  /// `joinInto` defers merge-class kills for a JOIN instead of applying
+  /// them here: a multi-alternative construct (if/else arms, an else-if
+  /// chain, switch clauses) must emit every alternative from the shared
+  /// ENTRY state — tsc types the arms as alternatives, not a sequence, so
+  /// one arm's kill applied mid-construct would strip a sibling of a
+  /// narrowing tsc keeps there. The caller collects each arm's kills and
+  /// applies the union once via applyJoinedNarrowKills, after the last
+  /// alternative. Only merge-class kills defer: an always-leaving arm
+  /// still drops its kills, and an arm whose only in-function routes are
+  /// non-local edges still routes them to those edges' destination sets —
+  /// those edges never reach a sibling.
+  private withNarrowScope<T>(
+    ctx: Ctx,
+    mode: KillRouting,
+    emit: () => T,
+    joinInto?: Set<string>,
+  ): T {
+    const savedSubst = new Map(ctx.memberSubst);
+    const savedStillOptional = new Map(ctx.stillOptionalSubst);
+    const savedNarrowed = new Map(ctx.narrowedUnion);
+    this.pushNarrowKillFrame(ctx);
+    try {
+      return emit();
+    } finally {
+      ctx.memberSubst.clear();
+      for (const [k, v] of savedSubst) ctx.memberSubst.set(k, v);
+      ctx.stillOptionalSubst.clear();
+      for (const [k, v] of savedStillOptional) ctx.stillOptionalSubst.set(k, v);
+      ctx.narrowedUnion.clear();
+      for (const [k, v] of savedNarrowed) ctx.narrowedUnion.set(k, v);
+      if (mode === "merge" && joinInto) {
+        for (const key of this.popNarrowKillFrame(ctx, "drop")) joinInto.add(key);
+      } else {
+        this.popNarrowKillFrame(ctx, mode);
+      }
+    }
+  }
+
+  /// The JOIN of a multi-alternative construct: apply the union of the
+  /// alternatives' merge-class kills to the surviving flow, once, after
+  /// every alternative has emitted from the shared entry state (see
+  /// withNarrowScope's `joinInto`). Same application as a plain merge —
+  /// delete the narrow, propagate the kill one frame outward so enclosing
+  /// exits keep it dead past their restores.
+  private applyJoinedNarrowKills(ctx: Ctx, join: ReadonlySet<string>): void {
+    for (const key of join) {
+      ctx.memberSubst.delete(key);
+      ctx.narrowKilled[ctx.narrowKilled.length - 1]?.add(key);
+    }
+  }
+
+  /// Bracket a construct's emission with an edge-kill stage (Ctx.edgeKills):
+  /// scopes inside that exit only along edges bound to this construct stage
+  /// their kills here, and the returned set is what the caller applies at
+  /// the point those edges land — applyJoinedNarrowKills after the closing
+  /// brace for loops, labeled blocks, and callback value blocks; folded
+  /// through the clause join for switches (the two mechanisms share one
+  /// application point, so a kill is neither applied twice mid-construct
+  /// nor dropped between them). The application records into the
+  /// then-innermost kill frame, so a staged kill keeps propagating outward
+  /// — through enclosing joins and post-narrow subtractions — exactly like
+  /// a merge-class kill applied at the same spot.
+  private stagedEdgeKills(
+    ctx: Ctx,
+    kind: EdgeKillStage["kind"],
+    label: string | null,
+    emit: () => void,
+  ): Set<string> {
+    const stage: EdgeKillStage = { kind, label, kills: new Set() };
+    ctx.edgeKills.push(stage);
+    try {
+      emit();
+    } finally {
+      ctx.edgeKills.pop();
+    }
+    return stage.kills;
+  }
+
+  private emitBlockStatements(
+    stmts: readonly ts.Statement[],
+    ctx: Ctx,
+    joinInto?: Set<string>,
+    entryKills?: ReadonlySet<string>,
+    trailing?: () => void,
+  ): void {
+    // Narrowing is flow-scoped the way tsc scopes it: an early-exit guard
+    // narrows the statements after it in ITS list, and whatever those
+    // statements nest — never code beyond the list. The narrowing maps ride
+    // the shared ctx, so the scope's entry/exit snapshot is what bounds
+    // them: a `break`/`continue`/`return` guard inside a loop body or a
+    // branch cannot leak its captures into code after the construct (where
+    // the capture is out of scope in Zig and the narrowing wrong in TS).
+    //
+    // Invalidation survives the restore — an assignment inside the block
+    // that killed a narrowing (assigned a possibly-null value) must stay
+    // dead past the merge — UNLESS every route out of the list leaves the
+    // emitted function (allRoutesLeaveFunction): then no path carrying the
+    // kills reaches the merge, tsc keeps the narrow on the surviving flow,
+    // and reads there depend on it.
+    const env = {
+      returnLeaves: ctx.retLabel === null,
+      throwResumes: ctx.catchResumes === true,
+    };
+    const leavesFn = this.allRoutesLeaveFunction(stmts, env);
+    // Edge-kills channel: when the list's only in-function routes are
+    // non-local edges — throws the enclosing catch hands back, escaping
+    // break/continue edges, lowered callback returns — no path carrying
+    // the kills falls through into the statements after this list, so
+    // merging them here would poison flow tsc keeps narrowed (the killing
+    // paths cannot reach it). Kills travel the same edges control does:
+    // each class stages at its destination — the try's pending set for
+    // caught throws, the target construct's stage for break/continue, the
+    // callback stage for lowered returns — and the owning emitter applies
+    // it where the edge lands. Re-asking the route question with every
+    // edge class treated as leaving isolates exactly this case: any true
+    // fall-through still forces the plain merge (which is a conservative
+    // superset — its kills persist into all downstream states, the edge
+    // destinations included).
+    // `entryKills` are kills that arrived WITH control (a catch entered on
+    // throw edges that carried them): they widen the list's entry state —
+    // its reads see them — and then ride this frame's routing out, exactly
+    // like a kill the first statement made. Routing is what makes them
+    // land where flow says: a fall-through carries them to the code after
+    // the construct, an escaping break/continue stages them at that edge's
+    // destination, and a list whose every route leaves the function drops
+    // them (no surviving path carries them anywhere).
+    // `trailing` is emission that tsc types under the list's END state — a
+    // do-while's trailing exit test evaluates after the body, so a terminal
+    // guard in the body narrows it. It runs inside this same scope: a scope
+    // closed between the list and the test would restore the maps before
+    // the read they guard (the callback trailing-return fix, applied to the
+    // loop lowering).
+    this.withNarrowScope(
+      ctx,
+      leavesFn ? "drop" : this.edgeKillRouting(stmts, env, ctx),
+      () => {
+        if (entryKills) {
+          for (const key of entryKills) {
+            ctx.memberSubst.delete(key);
+            ctx.narrowKilled[ctx.narrowKilled.length - 1]?.add(key);
+          }
+        }
+        this.emitStatementList(stmts, ctx);
+        trailing?.();
+      },
+      joinInto,
+    );
+  }
+
+  /// The routing for a list that does NOT always leave the function: the
+  /// non-local-edges-only route form when it applies, else "merge". A
+  /// destination that fails to resolve (a caught throw without a pending
+  /// set, an edge whose target construct has no stage) falls back to the
+  /// plain merge — over-merging costs a re-check, never wrong code.
+  private edgeKillRouting(
+    stmts: readonly ts.Statement[],
+    env: { returnLeaves: boolean; throwResumes: boolean },
+    ctx: Ctx,
+  ): KillRouting {
+    if (!this.allRoutesLeaveFunction(stmts, { ...env, edgesLeave: true, throwResumes: false })) {
+      return "merge";
+    }
+    const targets: Set<string>[] = [];
+    if (env.throwResumes && !this.allRoutesLeaveFunction(stmts, { ...env, edgesLeave: true })) {
+      // With edges leaving but caught throws resuming, any remaining
+      // resuming route is a caught throw: this list exits along the
+      // throw edge into the enclosing catch.
+      if (ctx.pendingCatchKills == null) return "merge";
+      targets.push(ctx.pendingCatchKills);
+    }
+    const edges = this.escapingEdgesOf(stmts, env.returnLeaves);
+    const innermost = (pred: (s: EdgeKillStage) => boolean): EdgeKillStage | null => {
+      for (let i = ctx.edgeKills.length - 1; i >= 0; i--) {
+        if (pred(ctx.edgeKills[i])) return ctx.edgeKills[i];
+      }
+      return null;
+    };
+    for (const label of edges.breaks) {
+      const stage = innermost((s) =>
+        label === null ? s.kind === "loop" || s.kind === "switch" : s.label === label,
+      );
+      if (stage === null) return "merge";
+      targets.push(stage.kills);
+    }
+    for (const label of edges.continues) {
+      const stage = innermost((s) => s.kind === "loop" && (label === null || s.label === label));
+      if (stage === null) return "merge";
+      targets.push(stage.kills);
+    }
+    if (edges.callbackReturn) {
+      const stage = innermost((s) => s.kind === "callback");
+      if (stage === null) return "merge";
+      targets.push(stage.kills);
+    }
+    // No resolvable destination at all would leave resuming routes with
+    // nowhere to carry the kills — that only happens when the two route
+    // analyses disagree, so keep the conservative merge.
+    return targets.length > 0 ? targets : "merge";
+  }
+
+  /// The escaping non-local edges out of a statement list: the labels (null
+  /// = unlabeled) of break/continue statements whose target sits at or
+  /// outside the list, and whether any lowered `return` exits it (lifted
+  /// callbacks: returnLeaves is false). Binding mirrors
+  /// allRoutesLeaveFunction's target tracking — a loop binds unlabeled
+  /// break and continue for its subtree, a switch binds unlabeled break, a
+  /// labeled statement binds its label — and callback bodies are theirs
+  /// alone (tsc rejects a break/continue crossing a function boundary;
+  /// their returns are analyzed at their own emission).
+  private escapingEdgesOf(
+    stmts: readonly ts.Statement[],
+    returnLeaves: boolean,
+  ): { breaks: Set<string | null>; continues: Set<string | null>; callbackReturn: boolean } {
+    const breaks = new Set<string | null>();
+    const continues = new Set<string | null>();
+    let callbackReturn = false;
+    interface Bound {
+      readonly labels: ReadonlySet<string>;
+      readonly breakBound: boolean;
+      readonly continueBound: boolean;
+    }
+    const visit = (n: ts.Node, st: Bound): void => {
+      if (ts.isBreakStatement(n)) {
+        if (n.label ? !st.labels.has(n.label.text) : !st.breakBound) breaks.add(n.label?.text ?? null);
+        return;
+      }
+      if (ts.isContinueStatement(n)) {
+        if (n.label ? !st.labels.has(n.label.text) : !st.continueBound) continues.add(n.label?.text ?? null);
+        return;
+      }
+      if (ts.isReturnStatement(n)) {
+        if (!returnLeaves) callbackReturn = true;
+        return;
+      }
+      if (ts.isFunctionDeclaration(n) || ts.isArrowFunction(n) || ts.isFunctionExpression(n)) return;
+      if (ts.isLabeledStatement(n)) {
+        visit(n.statement, { ...st, labels: new Set(st.labels).add(n.label.text) });
+        return;
+      }
+      if (
+        ts.isWhileStatement(n) ||
+        ts.isDoStatement(n) ||
+        ts.isForStatement(n) ||
+        ts.isForOfStatement(n) ||
+        ts.isForInStatement(n)
+      ) {
+        ts.forEachChild(n, (c) => {
+          if (!this.tscExcludedArm(n, c)) visit(c, { ...st, breakBound: true, continueBound: true });
+        });
+        return;
+      }
+      if (ts.isSwitchStatement(n)) {
+        ts.forEachChild(n, (c) => visit(c, { ...st, breakBound: true }));
+        return;
+      }
+      // tsc-excluded arms carry no escaping edges: an edge the CFA cannot
+      // take must not stage kills at its would-be destination
+      // (tscExcludedArm — mirrors allRoutesLeaveFunction's route walk).
+      ts.forEachChild(n, (c) => {
+        if (!this.tscExcludedArm(n, c)) visit(c, st);
+      });
+    };
+    const start: Bound = { labels: new Set(), breakBound: false, continueBound: false };
+    for (const s of stmts) visit(s, start);
+    return { breaks, continues, callbackReturn };
+  }
+
+  private emitStatementList(stmts: readonly ts.Statement[], ctx: Ctx): void {
     for (let i = 0; i < stmts.length; i++) {
       const stmt = stmts[i];
       for (const c of this.leadingComments(stmt)) this.push(ctx, c);
@@ -3179,8 +3700,16 @@ export class Emitter {
           !next.elseStatement &&
           test !== null &&
           ts.isIdentifier(test.target) &&
-          test.target.text === decl.name.text &&
-          this.alwaysExits(next.thenStatement)
+          // Declaration identity, not name text: the guard must test THIS
+          // declaration for the fusion's const to stand in for it (a
+          // same-named outer local tested here narrows the wrong slot).
+          this.tast.declarationOf(test.target) === decl &&
+          this.alwaysExits(next.thenStatement) &&
+          // A reassigned `let` cannot fuse: the fusion emits `const` typed by
+          // the non-optional payload, so a later `p = ...` (or a legal
+          // `p = null`) has no binding to land in. The plain path already
+          // types it `var p: ?T` and guards with a real `if`.
+          !this.isReassigned(decl, ctx)
         ) {
           const initType = this.zTypeOfExpr(decl.initializer, ctx);
           if (initType.k === "optional") {
@@ -3202,10 +3731,19 @@ export class Emitter {
     cond: ts.Expression,
     op: ts.SyntaxKind = ts.SyntaxKind.EqualsEqualsEqualsToken,
   ): { target: ts.Expression; flavor: "null" | "undefined" } | null {
-    if (!ts.isBinaryExpression(cond) || cond.operatorToken.kind !== op) return null;
+    // Wrapper spellings must not change what the test matches: the
+    // condition, either operand, and the returned target all strip
+    // parentheses, non-null assertions, `as`, and `satisfies` — emission
+    // erases every one of them, and tsc's own narrowing sees through them
+    // too (`(q) === null` and `q! !== null` both test `q`), so downstream
+    // shape checks and key derivations see the identifier itself.
+    const c = unwrapExpr(cond);
+    if (!ts.isBinaryExpression(c) || c.operatorToken.kind !== op) return null;
+    const left = unwrapExpr(c.left);
+    const right = unwrapExpr(c.right);
     const sides: Array<[ts.Expression, ts.Expression]> = [
-      [cond.left, cond.right],
-      [cond.right, cond.left],
+      [left, right],
+      [right, left],
     ];
     for (const [target, emptySide] of sides) {
       const flavor = this.emptyFlavorOf(emptySide);
@@ -3224,6 +3762,17 @@ export class Emitter {
       if (!decl || !this.fileSet.has(decl.getSourceFile())) return "undefined";
     }
     return null;
+  }
+
+  /// A literal JS empty in VALUE position, through the value-preserving
+  /// wrappers emission erases (parens, `as`, `satisfies`, non-null
+  /// assertions): the `null` keyword or the global `undefined` identifier.
+  /// Every ternary-arm and nullish EMPTINESS decision must use this, never
+  /// a ZType check — `undefined`'s internal type is void, so a type check
+  /// reads an `undefined` arm as a non-empty value and drops the
+  /// optionality it carries, skipping the later guard's unwrap.
+  private isEmptyLiteral(e: ts.Expression): boolean {
+    return this.emptyFlavorOf(unwrapExpr(e)) !== null;
   }
 
   /// R7c: JS keeps null and undefined distinct; the native optional folds
@@ -3248,8 +3797,20 @@ export class Emitter {
     }
   }
 
+  /// Whether a statement NEVER falls through to the statement after it.
+  /// tsc's control-flow analysis narrows after any such statement — return,
+  /// throw, break, and continue all qualify (a break/continue jumps to an
+  /// enclosing construct's boundary, never to the next statement in
+  /// sequence), so an early-exit guard narrows the remainder of its block
+  /// no matter which exit the guard takes. A constant-true loop that no
+  /// break binds qualifies too: it never completes normally, so tsc treats
+  /// the statement after it as unreachable (and Zig types such a loop
+  /// noreturn — the two terminality judgments must stay aligned).
+  /// Kill-frame drops need the stronger whole-function question; that is
+  /// allRoutesLeaveFunction.
   private alwaysExits(stmt: ts.Statement): boolean {
     if (ts.isReturnStatement(stmt)) return true;
+    if (ts.isBreakStatement(stmt) || ts.isContinueStatement(stmt)) return true;
     // R20: a throw never falls through (it unwinds to a catch or out of
     // the function), and a try/catch exits when both arms do — any throw
     // mid-try lands in the catch, which exits. NS1058 keeps `finally`
@@ -3257,7 +3818,8 @@ export class Emitter {
     if (ts.isThrowStatement(stmt)) return true;
     if (ts.isTryStatement(stmt)) {
       const tryExits = this.alwaysExits(stmt.tryBlock);
-      const catchExits = stmt.catchClause === undefined || this.alwaysExits(stmt.catchClause.block);
+      const catchExits =
+        stmt.catchClause === undefined || this.alwaysExits(stmt.catchClause.block);
       return tryExits && catchExits;
     }
     if (ts.isBlock(stmt)) {
@@ -3271,23 +3833,472 @@ export class Emitter {
         this.alwaysExits(stmt.elseStatement)
       );
     }
+    // A constant-true loop with no break bound to it never completes
+    // normally, so the statement after it is unreachable — tsc's CFA types
+    // post-loop code off the paths that never get there. The recognition
+    // mirrors tsc's scope for our subset: the literal `true` keyword (and
+    // the omitted / literal-true `for` condition) only, never arbitrary
+    // constant-foldable expressions. Returns and throws inside the loop
+    // leave the function without completing the loop, so they don't make
+    // its end reachable (allRoutesLeaveFunction classifies them as routes
+    // of their own); `continue` stays inside. Only a break bound to the
+    // loop resumes right after it.
+    if (ts.isWhileStatement(stmt) || ts.isDoStatement(stmt)) {
+      return stmt.expression.kind === ts.SyntaxKind.TrueKeyword && !this.bindsBreak(stmt);
+    }
+    if (ts.isForStatement(stmt)) {
+      return (
+        (stmt.condition === undefined || stmt.condition.kind === ts.SyntaxKind.TrueKeyword) &&
+        !this.bindsBreak(stmt)
+      );
+    }
     if (ts.isSwitchStatement(stmt)) {
-      // A value switch (R13d) without a default may skip every clause, so
-      // only kind switches (exhaustive by NS1015) and defaulted switches
-      // count as exiting. Exhaustiveness itself is enforced at emission;
-      // here the question is only whether every written clause exits.
+      // A break bound to THIS switch resumes right after it, so the switch
+      // completes normally even when every clause body ends in an exit
+      // statement (the ubiquitous clause-terminating `break;` is exactly
+      // such a break).
+      if (this.bindsBreak(stmt)) return false;
+      // A value switch (R13d) without a default may skip every clause —
+      // unless its case labels cover the scrutinee's literal-union type,
+      // in which case tsc's CFA (which is what this predicate mirrors)
+      // treats the switch as always entering a clause. Kind switches are
+      // exhaustive by NS1015; defaulted switches always enter a clause;
+      // everything else consults the type (conservative false when the
+      // scrutinee is not an enumerable literal union).
       const kindSwitch =
         ts.isPropertyAccessExpression(stmt.expression) && stmt.expression.name.text === "kind";
       const hasDefault = stmt.caseBlock.clauses.some((c) => ts.isDefaultClause(c));
-      if (!kindSwitch && !hasDefault) return false;
-      return stmt.caseBlock.clauses.every((c) => {
+      if (!kindSwitch && !hasDefault && !this.valueSwitchCoversScrutineeType(stmt)) return false;
+      // Stacked case labels (`case "a": case "b": body`) share one body:
+      // JS falls through an empty clause onto the next clause's statements
+      // (the switch emitters coalesce the labels into one arm the same
+      // way), so an empty clause's terminality is its group's tail's — the
+      // next statement-bearing clause at or after it. A trailing run of
+      // empty clauses has no body at all: control falls out of the switch,
+      // so the switch completes normally.
+      const clauses = stmt.caseBlock.clauses;
+      return clauses.every((c, i) => {
         let stmts: readonly ts.Statement[] = c.statements;
+        for (let j = i + 1; stmts.length === 0 && j < clauses.length; j++) {
+          stmts = clauses[j].statements;
+        }
         if (stmts.length === 1 && ts.isBlock(stmts[0])) stmts = (stmts[0] as ts.Block).statements;
         const last = stmts[stmts.length - 1];
         return last !== undefined && this.alwaysExits(last);
       });
     }
+    if (ts.isLabeledStatement(stmt)) {
+      // A label adds exactly one edge: `break label` resumes right AFTER
+      // the labeled statement, making its end reachable. So the statement
+      // is terminal iff the wrapped statement is terminal AND nothing
+      // inside breaks to the label. The check is additive: a wrapped
+      // loop's unlabeled breaks are already the loop's own concern
+      // (bindsBreak, which also sees wrapping labels), and a labeled
+      // BLOCK's inner terminality comes from the block rule above.
+      return (
+        this.alwaysExits(stmt.statement) &&
+        !this.breaksToLabel(stmt.statement, stmt.label.text)
+      );
+    }
     return false;
+  }
+
+  /// Whether a defaultless VALUE switch's case labels cover every member of
+  /// the scrutinee's literal-union type. Enumerable scrutinees are
+  /// string/number/boolean literal unions ONLY: any wider type, any
+  /// non-literal member, or any case label that is not a literal after
+  /// wrapper-stripping answers false — the conservative side (a false merely
+  /// merges a kill tsc kept and completes the lowered fallthrough; a wrong
+  /// true emits an `else => unreachable` real execution can REACH). The type
+  /// consulted is scrutineeCoverageType's SOUND type, never the checker's
+  /// raw flow type: tsc keeps a local's narrowing across callback bodies
+  /// that assign it, so its flow-exhaustiveness can be false at runtime.
+  /// alwaysExits stays syntax-only on every other construct, and every
+  /// caller is an emission path where `this.tast` is live, so the capability
+  /// is unconditional. THE AGREEMENT INVARIANT: the terminality claim and
+  /// the emitted shape must never disagree — no switch construct may be
+  /// claimed terminal while its lowering emits a completable fallthrough.
+  /// Each lowering either closes or declines:
+  ///   - emitSwitch (kind): a Zig enum switch is exhaustive by construction
+  ///     (NS1015 gates uncovered arms), and a terminal claim requires every
+  ///     arm group to exit, so the shape closes by construction;
+  ///   - emitValueSwitch: a covered-by-type defaultless switch whose arms
+  ///     all exit closes its never-reached fallthrough with
+  ///     `else => unreachable` (numeric) or emits no else at all (string
+  ///     enums, already Zig-exhaustive), and asserts the agreement;
+  ///   - emitPlainSwitch: the lowered if/else chain closes a
+  ///     claimed-terminal defaultless switch with an `unreachable` else
+  ///     (its `claimsTerminal`), and asserts the agreement.
+  /// All consumers read this one memoized judgment and demote together.
+  private valueSwitchCoversScrutineeType(stmt: ts.SwitchStatement): boolean {
+    const memo = this.switchCoversTypeMemo.get(stmt);
+    if (memo !== undefined) return memo;
+    const answer = this.computeValueSwitchCoversScrutineeType(stmt);
+    this.switchCoversTypeMemo.set(stmt, answer);
+    return answer;
+  }
+
+  /// The type a defaultless switch's exhaustiveness may be judged against —
+  /// null when no sound basis exists (the caller then answers false). tsc's
+  /// flow type at the scrutinee is NOT such a basis on its own: tsc never
+  /// widens a local's narrowing for assignments inside callbacks (it types
+  /// `let k: "a" | "b" = "a"; xs.map(() => { k = "b"; }); switch (k)` with
+  /// k still "a"), so a flow-exhaustive switch can be skipped by real
+  /// execution. Sound bases, in order:
+  ///   - an identifier local/param never assigned inside any nested
+  ///     function of the switch's own enclosing function keeps the flow
+  ///     type: locals cannot alias, so a scan over nested-function scopes
+  ///     for assignments is exact, and without a capture-site assignment
+  ///     the straight-line CFA is;
+  ///   - any other narrowable reference (identifier, property read) is
+  ///     judged by its DECLARED type — a symbol can hold any member of its
+  ///     declared union at runtime whatever the flow claims;
+  ///   - a non-reference scrutinee (call result, arithmetic, literal) has
+  ///     no flow claims to distrust: its own resolved type stands.
+  private scrutineeCoverageType(expr: ts.Expression): ts.Type | null {
+    const e = unwrapExpr(expr);
+    if (ts.isIdentifier(e)) {
+      if (this.scrutineeFlowTrustable(e)) return this.tast.typeOf(e);
+      return this.declaredTypeOfReference(e);
+    }
+    if (ts.isPropertyAccessExpression(e)) return this.declaredTypeOfReference(e.name);
+    if (ts.isElementAccessExpression(e)) return null;
+    return this.tast.typeOf(e);
+  }
+
+  /// The declared (declaration-site) type of a reference: the annotation
+  /// when the declaration carries one, else the checker's type AT the
+  /// declaration name — the symbol's initial type, which no flow narrowing
+  /// has touched. Null when the declaration shape is not one whose declared
+  /// type is recoverable; callers treat null as "cannot judge".
+  private declaredTypeOfReference(name: ts.Node): ts.Type | null {
+    const decl = this.tast.declarationOf(name);
+    if (!decl) return null;
+    if (
+      (ts.isVariableDeclaration(decl) ||
+        ts.isParameter(decl) ||
+        ts.isPropertySignature(decl) ||
+        ts.isPropertyDeclaration(decl)) &&
+      decl.type
+    ) {
+      return this.tast.typeFromTypeNode(decl.type);
+    }
+    if (ts.isVariableDeclaration(decl) && ts.isIdentifier(decl.name)) {
+      return this.tast.typeOf(decl.name);
+    }
+    return null;
+  }
+
+  /// Whether the flow type of this identifier may be trusted for an
+  /// exhaustiveness claim: it names a local/param declared in the SAME
+  /// enclosing function, and no nested function/callback in that function's
+  /// body assigns it BEFORE the read can execute. Locals cannot alias in
+  /// TypeScript, so the only escape hatch from the straight-line CFA is a
+  /// capture-site assignment — the exact hole tsc's optimistic callback
+  /// model leaves open. Declines when the declaration lives in an outer
+  /// scope (the local IS a capture there) or when any nested function that
+  /// can have RUN before the read (nestedFnRunsBeforeUse: position for
+  /// arrows/function expressions, always for hoisted declarations and
+  /// class members, back edges for shared loops) assigns or ++/--s it.
+  private scrutineeFlowTrustable(id: ts.Identifier): boolean {
+    const decl = this.tast.declarationOf(id);
+    if (!decl || (!ts.isVariableDeclaration(decl) && !ts.isParameter(decl))) return false;
+    const isFnScope = (n: ts.Node): boolean =>
+      ts.isArrowFunction(n) ||
+      ts.isFunctionExpression(n) ||
+      ts.isFunctionDeclaration(n) ||
+      ts.isMethodDeclaration(n) ||
+      ts.isConstructorDeclaration(n) ||
+      ts.isGetAccessorDeclaration(n) ||
+      ts.isSetAccessorDeclaration(n);
+    const enclosing = (n: ts.Node): ts.Node => {
+      let cur: ts.Node | undefined = n.parent;
+      while (cur && !isFnScope(cur)) cur = cur.parent;
+      return cur ?? n.getSourceFile();
+    };
+    const scope = enclosing(id);
+    if (scope !== enclosing(decl)) return false;
+    let assignedInNested = false;
+    // `root` is the OUTERMOST nested function of the current subtree: the
+    // reach-before-use judgment belongs to it (an arrow inside a hoisted
+    // declaration runs whenever the declaration does, so the inner arrow's
+    // own position proves nothing).
+    const visit = (n: ts.Node, root: ts.Node | null): void => {
+      if (assignedInNested) return;
+      const enter = root ?? (n !== scope && isFnScope(n) ? n : null);
+      if (enter) {
+        if (
+          ts.isBinaryExpression(n) &&
+          n.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+          n.operatorToken.kind <= ts.SyntaxKind.LastAssignment
+        ) {
+          const target = unwrapExpr(n.left);
+          if (
+            ts.isIdentifier(target) &&
+            this.tast.declarationOf(target) === decl &&
+            this.nestedFnRunsBeforeUse(enter, id)
+          ) {
+            assignedInNested = true;
+            return;
+          }
+        }
+        if (
+          (ts.isPrefixUnaryExpression(n) || ts.isPostfixUnaryExpression(n)) &&
+          (n.operator === ts.SyntaxKind.PlusPlusToken || n.operator === ts.SyntaxKind.MinusMinusToken)
+        ) {
+          const target = unwrapExpr(n.operand as ts.Expression);
+          if (
+            ts.isIdentifier(target) &&
+            this.tast.declarationOf(target) === decl &&
+            this.nestedFnRunsBeforeUse(enter, id)
+          ) {
+            assignedInNested = true;
+            return;
+          }
+        }
+      }
+      ts.forEachChild(n, (c) => visit(c, enter));
+    };
+    visit(scope, null);
+    return !assignedInNested;
+  }
+
+  /// Whether an assignment inside nested function `fn` can have EXECUTED
+  /// before the flow-trusted read at `use`. Labels the position rule with
+  /// JS evaluation semantics:
+  ///   - function DECLARATIONS hoist — they exist from scope start, so an
+  ///     earlier call can run them wherever they sit — and class-member
+  ///     bodies (methods, accessors, constructors) exist from their
+  ///     container's creation: all count regardless of position;
+  ///   - arrow functions and function EXPRESSIONS do not exist as values
+  ///     before their definition evaluates, so one whose definition sits
+  ///     textually after the read cannot have run before it — UNLESS a
+  ///     loop encloses both, whose back edge re-enters the read after the
+  ///     definition evaluated on an earlier iteration. An arrow defined
+  ///     before the read counts even when only a variable holds it
+  ///     (conservative-correct: whether anything calls it is not asked).
+  private nestedFnRunsBeforeUse(fn: ts.Node, use: ts.Identifier): boolean {
+    if (!ts.isArrowFunction(fn) && !ts.isFunctionExpression(fn)) return true;
+    if (fn.getStart() < use.getStart()) return true;
+    for (let cur: ts.Node | undefined = fn.parent; cur && !ts.isSourceFile(cur); cur = cur.parent) {
+      if (ts.isFunctionLike(cur)) break;
+      if (
+        ts.isIterationStatement(cur, false) &&
+        cur.getStart() <= use.getStart() &&
+        use.getEnd() <= cur.getEnd()
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private computeValueSwitchCoversScrutineeType(stmt: ts.SwitchStatement): boolean {
+    const type = this.scrutineeCoverageType(stmt.expression);
+    if (type === null) return false;
+    const members = type.isUnion() ? type.types : [type];
+    const wanted = new Set<string>();
+    for (const member of members) {
+      if (member.isStringLiteral()) wanted.add(`s:${member.value}`);
+      else if (member.isNumberLiteral()) wanted.add(`n:${member.value}`);
+      else if (member.flags & ts.TypeFlags.BooleanLiteral) {
+        wanted.add(`b:${this.tast.typeToString(member)}`);
+      } else return false;
+    }
+    for (const clause of stmt.caseBlock.clauses) {
+      if (ts.isDefaultClause(clause)) continue;
+      const label = unwrapExpr(clause.expression);
+      if (ts.isStringLiteral(label)) wanted.delete(`s:${label.text}`);
+      else if (label.kind === ts.SyntaxKind.TrueKeyword) wanted.delete("b:true");
+      else if (label.kind === ts.SyntaxKind.FalseKeyword) wanted.delete("b:false");
+      else {
+        const v = this.tast.constEvalNumber(label);
+        if (v === null) return false;
+        wanted.delete(`n:${v}`);
+      }
+    }
+    return wanted.size === 0;
+  }
+
+  /// Kill-frame drop eligibility: whether EVERY route out of this statement
+  /// list leaves the emitted function. Only then may the list's narrowing
+  /// kills drop (emitBlockStatements) or a catch arm close the exception
+  /// paths over its try body (emitTryCore) — the final statement alone
+  /// cannot answer this, because earlier statements open routes of their
+  /// own. The routes, and when each one resumes in-function instead of
+  /// leaving:
+  ///   - fallthrough off the end of the list — always resumes;
+  ///   - `return` — resumes where returns lower to labeled breaks (lifted
+  ///     callbacks: env.returnLeaves is false);
+  ///   - `break`/`continue` at any nesting depth whose target sits at or
+  ///     outside the list — always resumes (after the target construct,
+  ///     inside the function). One bound to a loop/switch/label WHOLLY
+  ///     inside the list stays inside it and is not a route out, so the
+  ///     walk tracks locally-bound targets, never spellings;
+  ///   - `throw`, or any statement containing a throwing call, whose
+  ///     handler can fall back into the function — the handler is the
+  ///     nearest catch inside the list, and the route's destination is
+  ///     that catch PLUS its continuation: a catch that falls through
+  ///     resumes at the statements following its try (transitively out
+  ///     through enclosing blocks), so the route leaves iff every route
+  ///     out of the catch leaves AND that continuation leaves. Outside
+  ///     any local try, whatever env.throwResumes says about the
+  ///     surroundings.
+  /// When a route resists classification the answer is false (merge): an
+  /// over-merge costs a narrow tsc would have kept, an under-merge
+  /// resurrects a dead one and emits an unwrap Zig rejects. The
+  /// continuation after a try is known positionally inside statement
+  /// lists (the top list and nested blocks); inside loop bodies, switch
+  /// clauses, and inline callbacks a catch's fallthrough re-enters the
+  /// construct, so the continuation is treated as resuming there.
+  /// `env.edgesLeave` re-asks the question with escaping break/continue
+  /// edges and lowered returns treated as LEAVING: emitBlockStatements uses
+  /// the difference to isolate lists whose only in-function routes are
+  /// non-local edges (their kills stage at the edges' destinations rather
+  /// than merging — see edgeKillRouting). A leaving return's expression
+  /// still walks: throwing calls inside it ride the throw edges, not the
+  /// return edge.
+  private allRoutesLeaveFunction(
+    stmts: readonly ts.Statement[],
+    env: { returnLeaves: boolean; throwResumes: boolean; edgesLeave?: boolean },
+  ): boolean {
+    // `labels` / `breaks` / `continues` carry the targets bound inside the
+    // list so far on this path; `throwResumes` is the handler visibility at
+    // this point (re-derived at every try/catch met on the way down);
+    // `inCallback` marks inline (unlifted) callback bodies, whose returns
+    // are their own but whose throwing calls act at this site.
+    interface State {
+      readonly labels: ReadonlySet<string>;
+      readonly breaks: number;
+      readonly continues: number;
+      readonly throwResumes: boolean;
+      readonly inCallback: boolean;
+    }
+    // `tailLeaves`: whether control falling through past the node (to the
+    // rest of its enclosing list, transitively outward) leaves the
+    // function on every route — the positional continuation a
+    // fallthrough catch hands a caught throw.
+    const resumes = (n: ts.Node, st: State, tailLeaves: boolean): boolean => {
+      const walk = (c: ts.Node): boolean => resumes(c, st, tailLeaves);
+      if (ts.isBreakStatement(n)) {
+        if (env.edgesLeave) return false;
+        return !st.inCallback && (n.label ? !st.labels.has(n.label.text) : st.breaks === 0);
+      }
+      if (ts.isContinueStatement(n)) {
+        if (env.edgesLeave) return false;
+        return !st.inCallback && (n.label ? !st.labels.has(n.label.text) : st.continues === 0);
+      }
+      if (ts.isReturnStatement(n)) {
+        if (!st.inCallback && !env.returnLeaves && !env.edgesLeave) return true;
+        return n.expression !== undefined && walk(n.expression);
+      }
+      if (ts.isThrowStatement(n)) {
+        return st.throwResumes || walk(n.expression);
+      }
+      if ((ts.isCallExpression(n) || ts.isNewExpression(n)) && st.throwResumes) {
+        const target = this.calleeOwnerOf(n);
+        if (target && this.leakingFns.has(target)) return true;
+      }
+      if (ts.isBlock(n)) {
+        // A block's own fallthrough continues wherever the block's does,
+        // so its statements scan positionally against the same tail.
+        return scanList(n.statements, st, tailLeaves).resumes;
+      }
+      if (ts.isTryStatement(n) && n.catchClause !== undefined) {
+        // Throws in the body land in this catch, whose destination is the
+        // catch block plus its continuation: a fallthrough catch resumes
+        // at the statements after this try, so the caught throw leaves
+        // iff the catch-then-rest continuation leaves. The catch itself
+        // runs against the handler visible OUTSIDE this try (its own
+        // throws escape to enclosing handlers, never back into it).
+        const catchScan = scanList(n.catchClause.block.statements, st, tailLeaves);
+        const bodyThrowResumes = !catchScan.leaves;
+        return (
+          resumes(n.tryBlock, { ...st, throwResumes: bodyThrowResumes }, tailLeaves) ||
+          catchScan.resumes ||
+          (n.finallyBlock !== undefined && walk(n.finallyBlock))
+        );
+      }
+      if (ts.isLabeledStatement(n)) {
+        const bound = new Set(st.labels);
+        bound.add(n.label.text);
+        return resumes(n.statement, { ...st, labels: bound }, tailLeaves);
+      }
+      if (
+        ts.isWhileStatement(n) ||
+        ts.isDoStatement(n) ||
+        ts.isForStatement(n) ||
+        ts.isForOfStatement(n) ||
+        ts.isForInStatement(n)
+      ) {
+        // The loop binds unlabeled break/continue for its whole subtree
+        // (heads hold no break/continue — tsc rejects them there). A
+        // fallthrough inside the body resumes at the back edge, in the
+        // function, so the body scans against a resuming tail. A
+        // tsc-excluded body (while (false), for (; false;)) contributes
+        // no routes at all — an edge tsc's CFA cannot take is not a route
+        // (tscExcludedArm; the joins already give such arms no kills).
+        return (
+          ts.forEachChild(n, (c) =>
+            (!this.tscExcludedArm(n, c) &&
+              resumes(c, { ...st, breaks: st.breaks + 1, continues: st.continues + 1 }, false)) ||
+            undefined,
+          ) === true
+        );
+      }
+      if (ts.isSwitchStatement(n)) {
+        // Clause fallthrough resumes at the next clause / after the
+        // switch — in the function — so clauses scan against a resuming
+        // tail too.
+        return (
+          walk(n.expression) ||
+          resumes(n.caseBlock, { ...st, breaks: st.breaks + 1 }, false)
+        );
+      }
+      // Declarations don't run here; lifted callbacks are analyzed at
+      // their own emission (their bodies get a retLabel of their own).
+      if (ts.isFunctionDeclaration(n)) return false;
+      if (ts.isArrowFunction(n) || ts.isFunctionExpression(n)) {
+        if ([...this.hoistedFns.values()].includes(n)) return false;
+        return resumes(n.body, { ...st, inCallback: true }, false);
+      }
+      // tsc-excluded arms (`if (false)` then, `if (true)` else) hold no
+      // routes tsc's CFA can take: a dead `break` must not read as a
+      // loop-escaping edge (tscExcludedArm).
+      return ts.forEachChild(n, (c) => (!this.tscExcludedArm(n, c) && walk(c)) || undefined) === true;
+    };
+    // One right-to-left pass over a statement list: `resumes` is whether
+    // any route out of any statement resumes in-function (each statement
+    // classified against the continuation after ITS position); `leaves`
+    // is whether control entering the list leaves the function on every
+    // route — no route resumes, and fallthrough (which stops at the first
+    // always-exiting statement) bottoms out in an exit or a leaving tail.
+    // The fallthrough chain deliberately ignores in-list resuming routes:
+    // any such route already forces `resumes`, and every consumer of
+    // `leaves` (the verdict below, a caught throw's continuation) sits
+    // under a scan whose `resumes` it feeds.
+    const scanList = (
+      list: readonly ts.Statement[],
+      st: State,
+      tailLeaves: boolean,
+    ): { leaves: boolean; resumes: boolean } => {
+      let cont = tailLeaves;
+      let any = false;
+      for (let i = list.length - 1; i >= 0; i--) {
+        if (resumes(list[i], st, cont)) any = true;
+        cont = this.alwaysExits(list[i]) || cont;
+      }
+      return { leaves: !any && cont, resumes: any };
+    };
+    const start: State = {
+      labels: new Set(),
+      breaks: 0,
+      continues: 0,
+      throwResumes: env.throwResumes,
+      inCallback: false,
+    };
+    // Fallthrough off the end of the whole list always resumes.
+    return scanList(stmts, start, false).leaves;
   }
 
   private emitOrelseFusion(decl: ts.VariableDeclaration, exit: ts.Statement, inner: ZType, ctx: Ctx): void {
@@ -3295,19 +4306,13 @@ export class Emitter {
     ctx.localTypes.set(decl, inner);
     const init = orelseOperand(this.emitExpr(decl.initializer!, ctx).code);
     const exitStmts = ts.isBlock(exit) ? exit.statements : [exit];
-    if (exitStmts.length === 1 && ts.isReturnStatement(exitStmts[0])) {
-      const r = exitStmts[0];
-      if (!r.expression) {
-        this.push(ctx, `const ${name} = ${init} orelse ${this.returnText(ctx, null, r)}`);
-        return;
-      }
-      // Simple return value -> inline orelse; value needing statements -> block.
-      const sub = this.childCtx(ctx);
-      const v = this.emitReturn(r.expression, sub);
-      if (sub.lines.length === 0) {
-        this.push(ctx, `const ${name} = ${init} orelse ${this.returnText(ctx, v, r)}`);
-        return;
-      }
+    // A one-statement exit inlines (`orelse return v` / `orelse break` /
+    // `orelse continue`); anything needing statements takes the block form
+    // below — the block never falls through, so Zig types it noreturn.
+    const inline = this.singleExitText(exit, ctx);
+    if (inline !== null) {
+      this.push(ctx, `const ${name} = ${init} orelse ${inline}`);
+      return;
     }
     this.push(ctx, `const ${name} = ${init} orelse {`);
     const sub = this.nestedCtx(ctx);
@@ -3316,6 +4321,23 @@ export class Emitter {
     this.push(ctx, `};`);
   }
 
+  /// Clone a ctx for a probe or a same-indent sub-emission. ISOLATION LAW:
+  /// the clone shares every mutable flow structure with its parent BY
+  /// REFERENCE — memberSubst, stillOptionalSubst, narrowedUnion, the
+  /// narrowKilled frame stack, the edgeKills stages, and pendingCatchKills
+  /// — it isolates only the output lines. A PROBE (an emission whose lines
+  /// may be discarded to pick a lowering shape) must therefore bracket
+  /// itself with withNarrowScope: a probe that processes an assignment to
+  /// an outer narrowed local (an inline map callback inside a ternary arm)
+  /// would otherwise delete the narrowing for everything emitted after it
+  /// — the SIBLING arm then reads the optional raw, invalid Zig. Sibling
+  /// arms of one expression construct follow the statement-level law: each
+  /// arm probes AND emits from the construct's entry state, and the arms'
+  /// real kills join once after the last arm (applyJoinedNarrowKills).
+  /// Kills a discarded probe stages on the shared edge sets (edgeKills,
+  /// pendingCatchKills) are re-staged identically when the arm re-emits,
+  /// so the sharing stays observationally clean — the narrowing maps and
+  /// kill frames are the state a probe MUST NOT touch.
   private childCtx(ctx: Ctx): Ctx {
     return { ...ctx, lines: [], indent: ctx.indent };
   }
@@ -3342,20 +4364,37 @@ export class Emitter {
       this.emitIf(stmt, ctx);
       return;
     }
+    // Loops (and below, labeled statements and switches) bracket their
+    // emission with an edge-kill stage: kills that ride a break edge bound
+    // here apply to the POST-construct state — the destination the break
+    // resumes at — and kills on a continue edge ride the back edge into
+    // the loop-entry join. The emitter realizes both as the post-loop
+    // application below: the loop-entry model delegates in-body
+    // next-iteration reads to tsc (a read relying on a narrow the back
+    // edge kills is a tsc error the checker already rejected), so the
+    // only remaining state a back-edge kill must reach is the loop's
+    // normal-completion exit — the same post-loop point.
     if (ts.isWhileStatement(stmt)) {
-      this.emitWhile(stmt, ctx, null);
+      const staged = this.stagedEdgeKills(ctx, "loop", null, () => this.emitWhile(stmt, ctx, null));
+      // A `while (false)` body is tsc-unreachable (tscExcludedArm): kills
+      // its break edges staged here never execute, so they don't apply.
+      this.applyJoinedNarrowKills(ctx, this.tscExcludedArm(stmt, stmt.statement) ? new Set() : staged);
       return;
     }
     if (ts.isDoStatement(stmt)) {
-      this.emitDoWhile(stmt, ctx, null);
+      this.applyJoinedNarrowKills(ctx, this.stagedEdgeKills(ctx, "loop", null, () => this.emitDoWhile(stmt, ctx, null)));
       return;
     }
     if (ts.isForStatement(stmt)) {
-      this.emitClassicFor(stmt, ctx, null);
+      const staged = this.stagedEdgeKills(ctx, "loop", null, () => this.emitClassicFor(stmt, ctx, null));
+      // A `for (; false;)` body is tsc-unreachable exactly like a
+      // `while (false)` body (tscExcludedArm): kills its break edges
+      // staged here never execute, so they don't apply.
+      this.applyJoinedNarrowKills(ctx, this.tscExcludedArm(stmt, stmt.statement) ? new Set() : staged);
       return;
     }
     if (ts.isForOfStatement(stmt)) {
-      this.emitForOf(stmt, ctx, null);
+      this.applyJoinedNarrowKills(ctx, this.stagedEdgeKills(ctx, "loop", null, () => this.emitForOf(stmt, ctx, null)));
       return;
     }
     if (ts.isLabeledStatement(stmt)) {
@@ -3368,28 +4407,49 @@ export class Emitter {
       const label = this.labelReferenced(stmt.statement, stmt.label.text)
         ? loopLabel(stmt.label.text)
         : null;
+      // The stage binds by the SOURCE label: a labeled break/continue's
+      // kills must land at this construct's post-state even from deep
+      // inside nested loops (edgeKillRouting resolves labels innermost-
+      // out, so an inner-targeted unlabeled break never binds here).
+      const jsLabel = stmt.label.text;
       const inner = stmt.statement;
       if (ts.isWhileStatement(inner)) {
-        this.emitWhile(inner, ctx, label);
+        const staged = this.stagedEdgeKills(ctx, "loop", jsLabel, () => this.emitWhile(inner, ctx, label));
+        // Same tsc-unreachable exclusion as the unlabeled while dispatch.
+        this.applyJoinedNarrowKills(ctx, this.tscExcludedArm(inner, inner.statement) ? new Set() : staged);
       } else if (ts.isDoStatement(inner)) {
-        this.emitDoWhile(inner, ctx, label);
+        this.applyJoinedNarrowKills(ctx, this.stagedEdgeKills(ctx, "loop", jsLabel, () => this.emitDoWhile(inner, ctx, label)));
       } else if (ts.isForStatement(inner)) {
-        this.emitClassicFor(inner, ctx, label);
+        const staged = this.stagedEdgeKills(ctx, "loop", jsLabel, () => this.emitClassicFor(inner, ctx, label));
+        // Same tsc-unreachable exclusion as the unlabeled for dispatch.
+        this.applyJoinedNarrowKills(ctx, this.tscExcludedArm(inner, inner.statement) ? new Set() : staged);
       } else if (ts.isForOfStatement(inner)) {
-        this.emitForOf(inner, ctx, label);
+        this.applyJoinedNarrowKills(ctx, this.stagedEdgeKills(ctx, "loop", jsLabel, () => this.emitForOf(inner, ctx, label)));
       } else if (label === null) {
         this.emitStatement(inner, ctx);
       } else {
-        this.push(ctx, `${label}: {`);
-        const sub = this.nestedCtx(ctx);
-        this.emitBlockStatements(ts.isBlock(inner) ? inner.statements : [inner], sub);
-        ctx.lines.push(...sub.lines);
-        this.push(ctx, `}`);
+        const kills = this.stagedEdgeKills(ctx, "block", jsLabel, () => {
+          this.push(ctx, `${label}: {`);
+          const sub = this.nestedCtx(ctx);
+          this.emitBlockStatements(ts.isBlock(inner) ? inner.statements : [inner], sub);
+          ctx.lines.push(...sub.lines);
+          this.push(ctx, `}`);
+        });
+        this.applyJoinedNarrowKills(ctx, kills);
       }
       return;
     }
     if (ts.isSwitchStatement(stmt)) {
-      this.emitSwitch(stmt, ctx);
+      // Clause-terminating breaks are stripped before their clause's route
+      // analysis, so their kills ride the sibling JOIN (the switch
+      // emitters' joinInto) to the same post-switch point this stage
+      // applies at — one application, nothing dropped between the two
+      // mechanisms. The stage itself keeps unlabeled-break RESOLUTION
+      // faithful (a break under a switch binds the switch, never a loop
+      // outside it; the mid-clause spellings that would stage here stop
+      // the build at their own emission). Labeled exits out of a labeled
+      // switch bind the wrapping labeled BLOCK's stage instead.
+      this.applyJoinedNarrowKills(ctx, this.stagedEdgeKills(ctx, "switch", null, () => this.emitSwitch(stmt, ctx)));
       return;
     }
     if (ts.isExpressionStatement(stmt)) {
@@ -3397,14 +4457,36 @@ export class Emitter {
       return;
     }
     if (ts.isBlock(stmt)) {
-      this.push(ctx, `{`);
-      const sub = this.nestedCtx(ctx);
-      this.emitBlockStatements(stmt.statements, sub);
-      ctx.lines.push(...sub.lines);
-      this.push(ctx, `}`);
+      // A plain lexical block is NOT a merge boundary: tsc's narrowing is
+      // flow-based, so a narrow (or kill) established inside a fall-through
+      // block survives into the statements after it. Emission FLATTENS the
+      // block's statements into the enclosing list instead of bracketing
+      // them (no withNarrowScope, no Zig braces): name uniquing is already
+      // function-wide (ctx.used and the decl-keyed ctx.names ride every
+      // nested ctx by reference), so Zig block scope is never load-bearing
+      // for shadowing — and flattening is what keeps a narrowing capture
+      // lowered inside the block (an orelse fusion's const, a `.?` subst's
+      // target) in the same Zig scope as the post-block reads that rely on
+      // it. Merge contexts (if/else arms, loop bodies, switch clauses,
+      // callback and try/catch bodies, labeled blocks) never reach this
+      // case — their emitters unwrap the block and bracket its statement
+      // LIST — so control only ever falls straight through here. Nested
+      // plain blocks flatten recursively.
+      this.emitStatementList(stmt.statements, ctx);
       return;
     }
     if (ts.isBreakStatement(stmt)) {
+      // An unlabeled JS break binds the nearest loop OR switch; Zig's
+      // `break` binds loops only. A break that reaches statement emission
+      // bound to a switch (the clause-terminating `break;` never gets
+      // here — the switch emitters strip it) would jump past the wrong
+      // construct, so it stops the build instead of miscompiling.
+      if (!stmt.label && this.breakBindsEnclosingSwitch(stmt)) {
+        this.fail(
+          stmt,
+          "a `break` that exits a `switch` from inside a clause body (only a clause-ending `break` has a mapping; restructure with an early `return`, or label the switch and `break <label>`)",
+        );
+      }
       this.push(ctx, stmt.label ? `break :${loopLabel(stmt.label.text)};` : `break;`);
       return;
     }
@@ -3486,26 +4568,186 @@ export class Emitter {
   private emitTry(stmt: ts.TryStatement, ctx: Ctx): void {
     const fin = stmt.finallyBlock && stmt.finallyBlock.statements.length > 0 ? stmt.finallyBlock : undefined;
     if (fin) {
+      // The defer's TEXT precedes the try body's, but its FLOW follows it:
+      // the finally runs at the construct's exits, after the body and catch.
+      // So the finally emits in a bracketed scope — its entry state is the
+      // pre-try narrows minus the keys tsc widens for a finally (see
+      // finallyEntryKills: any possibly-null assignment in the try or catch
+      // kills, path-insensitively), and its own kills stage in `finStage`
+      // rather than merging, so the body emitted after this text still
+      // holds every narrow tsc keeps at its program points (the finally
+      // has not run there). The staged kills apply once at the construct's
+      // exit below — the state every fall-through continuation resumes
+      // from — and propagate outward through the enclosing frames exactly
+      // like a merge-class kill applied at that spot.
       this.push(ctx, `{`);
       const wrap = this.nestedCtx(ctx);
       this.push(wrap, `// finally: a scoped defer runs it on every exit of this block.`);
       this.push(wrap, `defer {`);
       const finCtx = this.nestedCtx(wrap);
-      this.emitBlockStatements(fin.statements, finCtx);
+      const finStage = new Set<string>();
+      this.withNarrowScope(
+        finCtx,
+        "merge",
+        () => {
+          for (const key of this.finallyEntryKills(stmt, finCtx)) finCtx.memberSubst.delete(key);
+          this.emitBlockStatements(fin.statements, finCtx);
+        },
+        finStage,
+      );
       wrap.lines.push(...finCtx.lines);
       this.push(wrap, `}`);
       this.emitTryCore(stmt, wrap);
       ctx.lines.push(...wrap.lines);
       this.push(ctx, `}`);
+      this.applyJoinedNarrowKills(ctx, finStage);
       return;
     }
     this.emitTryCore(stmt, ctx);
   }
 
+  /// Whether tsc's CFA treats `arm` as statically unreachable inside
+  /// `construct` — the then-arm of `if (false)`, the else-arm of
+  /// `if (true)`, a `while (false)` body, a `for (; false;)` body (and its
+  /// incrementor, which runs only after a body iteration). Such an arm
+  /// contributes NOTHING to the flow bookkeeping: no kills at the branch
+  /// join, no widening of a finally's entry narrows, no ROUTES either —
+  /// a `break`/`continue`/`return`/`throw` under an excluded arm is not an
+  /// edge tsc's CFA can take, so the route walks (allRoutesLeaveFunction,
+  /// escapingEdgesOf) and the terminality binders (bindsBreak,
+  /// breaksToLabel) give it nothing. Zig's comptime-false folding makes the
+  /// same call on the emitted text, so the two terminality judgments stay
+  /// aligned. The arm still EMITS — Zig compiles `if (false)` fine — only
+  /// the flow accounting skips it.
+  ///
+  /// The split among the statement walkers is by QUESTION, not by walker:
+  ///   - FLOW-SEMANTICS walks (what can execute) exclude, per the above.
+  ///   - EMISSION-SHAPE walks keep counting excluded arms, because the
+  ///     arm's TEXT still emits: labelReferenced (a dead `break outer`
+  ///     still spells `break :outer` — Zig's unused-label check is
+  ///     syntactic, so the label must stay and stays used) and
+  ///     bindsContinue (the do-while first-pass-flag form must host any
+  ///     `continue` the body emits, dead or not — the plain trailing-test
+  ///     lowering has no valid spelling for that text).
+  ///
+  /// Only the bare `true`/`false` keywords qualify, pinned against the
+  /// checker provider: a `const NEVER = false` alias condition WIDENS
+  /// under tsc, so a reference never excludes. A do-while(false) body is
+  /// never excluded either — the test runs AFTER the body, so the body
+  /// executes once and tsc counts its assignments. A `for (;;)` with an
+  /// OMITTED condition is the opposite judgment — an infinite loop
+  /// (alwaysExits) — and never lands here: literal `false` ≠ omitted.
+  private tscExcludedArm(construct: ts.Node, arm: ts.Node | undefined): boolean {
+    if (arm === undefined) return false;
+    if (ts.isIfStatement(construct)) {
+      if (construct.expression.kind === ts.SyntaxKind.FalseKeyword) return arm === construct.thenStatement;
+      if (construct.expression.kind === ts.SyntaxKind.TrueKeyword) return arm === construct.elseStatement;
+      return false;
+    }
+    if (ts.isForStatement(construct)) {
+      return (
+        construct.condition !== undefined &&
+        construct.condition.kind === ts.SyntaxKind.FalseKeyword &&
+        (arm === construct.statement || arm === construct.incrementor)
+      );
+    }
+    return (
+      ts.isWhileStatement(construct) &&
+      construct.expression.kind === ts.SyntaxKind.FalseKeyword &&
+      arm === construct.statement
+    );
+  }
+
+  /// The narrows dead at a finally block's entry: tsc types a finally from
+  /// the pre-try state minus every key the try or catch body may assign
+  /// null/undefined to — path-insensitively, because an exception can hand
+  /// control to the finally from between any two statements, so a later
+  /// non-null re-assignment does not revive the narrow there. A provably
+  /// non-null assignment keeps a live-slot `.?` spelling (it reads the
+  /// variable, never a stale value; valid at every interruption point,
+  /// since the slot holds the guarded value before the write and the
+  /// non-null replacement after it). A capture spelling still drops —
+  /// defensively: every capture-binding construct declines the capture
+  /// form when its scope assigns the target (captureServesBranch and the
+  /// exit-guard's assignsTarget check), so a capture live here never has
+  /// an assignment to survive.
+  ///
+  /// The scan counts exactly the assignments tsc's CFA counts — killing a
+  /// key tsc keeps strips a substitution the finally's reads were typed
+  /// against and emits member access on a raw optional, invalid Zig. Two
+  /// exclusions, both pinned against the checker provider:
+  ///   - code under a KEYWORD-LITERAL constant condition tsc treats as
+  ///     unreachable never counts (tscExcludedArm — the same judgment the
+  ///     branch-join layer applies): `if (false) ...`, the else of
+  ///     `if (true) ...`, a `while (false)` body, and the right side of
+  ///     `false && ...` / `true || ...` all keep the finally narrowed
+  ///     (probed). Only the bare keywords qualify — a `const NEVER = false`
+  ///     alias condition WIDENS under tsc (probed), and it still walks here;
+  ///     the same keyword-only judgment alwaysExits applies to constant-true
+  ///     loops. Anything else (do-while, non-literal conditions) stays on
+  ///     the conservative path-insensitive walk.
+  ///   - nested function/callback bodies never count (the throwsWithin skip
+  ///     idiom): tsc keeps the finally narrowed even when a callback DEFINED
+  ///     in the try assigns the target — called there or not (probed) — so
+  ///     counting those assignments would kill a narrow tsc typed the
+  ///     finally's reads with.
+  /// Real conditional assignments (`if (flag) p = null`) still count: tsc
+  /// widens for any reachable may-assign, whatever the path condition.
+  private finallyEntryKills(stmt: ts.TryStatement, ctx: Ctx): Set<string> {
+    const kills = new Set<string>();
+    const visit = (n: ts.Node): void => {
+      if (ts.isArrowFunction(n) || ts.isFunctionExpression(n) || ts.isFunctionDeclaration(n)) return;
+      if (ts.isIfStatement(n)) {
+        if (this.tscExcludedArm(n, n.thenStatement)) {
+          if (n.elseStatement) visit(n.elseStatement);
+          return;
+        }
+        if (n.elseStatement && this.tscExcludedArm(n, n.elseStatement)) {
+          visit(n.thenStatement);
+          return;
+        }
+      }
+      if (ts.isWhileStatement(n) && this.tscExcludedArm(n, n.statement)) return;
+      if (ts.isForStatement(n) && this.tscExcludedArm(n, n.statement)) {
+        // `for (<init>; false; <inc>) <body>`: the initializer still runs
+        // once (tsc counts its assignments); the bare-false condition holds
+        // nothing to count; the body and the incrementor are excluded — the
+        // incrementor runs only after a body iteration that never happens.
+        if (n.initializer) visit(n.initializer);
+        return;
+      }
+      if (ts.isBinaryExpression(n)) {
+        const op = n.operatorToken.kind;
+        if (op === ts.SyntaxKind.AmpersandAmpersandToken && n.left.kind === ts.SyntaxKind.FalseKeyword) return;
+        if (op === ts.SyntaxKind.BarBarToken && n.left.kind === ts.SyntaxKind.TrueKeyword) return;
+      }
+      if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+        const key = this.narrowKey(n.left);
+        if (key !== null) {
+          const subst = ctx.memberSubst.get(key);
+          const empties = this.tast.emptiesOf(n.right);
+          const mayBeEmpty = empties.null || empties.undefined;
+          const survives = subst !== undefined && subst.endsWith(".?") && !mayBeEmpty;
+          if (!survives && (subst !== undefined || mayBeEmpty)) kills.add(key);
+        }
+      }
+      ts.forEachChild(n, visit);
+    };
+    visit(stmt.tryBlock);
+    if (stmt.catchClause) visit(stmt.catchClause.block);
+    return kills;
+  }
+
   private emitTryCore(stmt: ts.TryStatement, ctx: Ctx): void {
     const cc = stmt.catchClause;
     if (!cc) {
-      // try/finally: throws propagate past this construct (the defer runs).
+      // try/finally: throws propagate past this construct (the defer runs
+      // first) to ctx's handler — the caller when ctx.tryLabel is null, an
+      // enclosing catch otherwise. No catch fallthrough is added HERE, so
+      // kill dropping inherits ctx.tryLabel/ctx.catchResumes unchanged:
+      // the inherited flags already answer for whichever handler a throw
+      // reaches, and a body ending in `return` may still drop its kills
+      // when nothing up the chain can resume past a merge.
       this.push(ctx, `{`);
       const sub = this.nestedCtx(ctx);
       this.emitBlockStatements(stmt.tryBlock.statements, sub);
@@ -3532,10 +4774,46 @@ export class Emitter {
     this.push(outer, `${body}: {`);
     const inner = this.nestedCtx(outer);
     inner.tryLabel = body;
+    // The body's kills may only drop when no exception path can resume
+    // past this try: a catch that falls through re-enters the merge
+    // carrying whatever a mid-body throw killed. A catch closes every such
+    // path only when EVERY route out of it leaves the function — asked
+    // against ctx, not the body label, because the catch's own throws
+    // break to ctx's enclosing handler — and then it also closes paths
+    // from any try nested in this body, so the flag is overwritten rather
+    // than or-ed with the inherited value.
+    inner.catchResumes = !this.allRoutesLeaveFunction(cc.block.statements, {
+      returnLeaves: ctx.retLabel === null,
+      throwResumes: ctx.catchResumes === true,
+    });
+    // Fresh pending set for THIS try: kills routed here rode throw edges
+    // into this catch (popNarrowKillFrame's route form) and apply at
+    // the post-try merge below. A nested try's body re-derives its own set,
+    // so kills always land at the same destination the throw route resolves
+    // to; the catch block itself inherits the ENCLOSING set through ctx
+    // (its throws escape outward, never back into this try).
+    const pendingKills = new Set<string>();
+    inner.pendingCatchKills = pendingKills;
     this.emitBlockStatements(stmt.tryBlock.statements, inner);
     if (done !== null) this.push(inner, `break :${done};`);
     outer.lines.push(...inner.lines);
     this.push(outer, `}`);
+    // Exception-kills handoff: kills travel the same edges control does,
+    // and the routes that fed this set are throws that land in THIS catch
+    // — so they enter as the catch's INPUT state (tsc types the catch from
+    // the state at the throw points: a narrowing an always-throwing arm
+    // killed before throwing is dead inside the catch) and then follow the
+    // catch's own routes out, via the catch list's kill-frame routing. A
+    // catch that falls through carries them to the post-try continuation;
+    // a catch that breaks/continues stages them at that edge's landing
+    // point; a catch whose every route leaves the function drops them —
+    // the post-try continuation is then reached only by clean paths, where
+    // tsc keeps the narrow, so applying them there unconditionally would
+    // poison the normal fallthrough. The body's normal-exit kills already
+    // applied at the body's own merge just above, so the catch also sees
+    // those (tsc-correct too: a mid-body throw can follow any fall-through
+    // assignment). They never touch the intra-try flow already emitted
+    // above.
     const catchCtx: Ctx = { ...outer, lines: [] };
     if (cc.variableDeclaration && ts.isIdentifier(cc.variableDeclaration.name)) {
       if (this.identifierUsed(cc.block, cc.variableDeclaration)) {
@@ -3544,7 +4822,7 @@ export class Emitter {
         this.push(catchCtx, `const ${ename} = thrown_payload;`);
       }
     }
-    this.emitBlockStatements(cc.block.statements, catchCtx);
+    this.emitBlockStatements(cc.block.statements, catchCtx, undefined, pendingKills);
     outer.lines.push(...catchCtx.lines);
     ctx.lines.push(...outer.lines);
     this.push(ctx, `}`);
@@ -3591,18 +4869,32 @@ export class Emitter {
     const cond = this.emitExpr(stmt.expression, ctx, { k: "bool" }).code;
     if (ctx.lines.length !== before) this.fail(stmt, "while-condition requiring lowered statements");
     const body = ts.isBlock(stmt.statement) ? stmt.statement.statements : [stmt.statement];
+    // A `while (false)` body is statically unreachable to tsc's CFA
+    // (tscExcludedArm), so its kills never reach the post-loop state —
+    // merging them would strip a narrow tsc typed the fall-through reads
+    // with. The body still emits; only the flow bookkeeping skips.
+    const deadBody = this.tscExcludedArm(stmt, stmt.statement);
     if (label === null && body.length === 1 && this.isSimpleAssignment(body[0])) {
+      // Probe in a flow scope (see childCtx): taken, the assignment's
+      // kills apply below exactly as a merge would; discarded, the full
+      // body re-emission repeats them.
+      const bodyJoin = new Set<string>();
       const sub = this.childCtx(ctx);
       sub.indent = 0;
-      this.emitStatement(body[0], sub);
+      this.withNarrowScope(ctx, "merge", () => this.emitStatement(body[0], sub), bodyJoin);
       if (sub.lines.length === 1) {
         this.push(ctx, `while (${cond}) ${sub.lines[0].trim()}`);
+        this.applyJoinedNarrowKills(ctx, deadBody ? new Set() : bodyJoin);
         return;
       }
     }
     this.push(ctx, `${head} (${cond}) {`);
     const sub = this.nestedCtx(ctx);
-    this.emitBlockStatements(body, sub);
+    if (deadBody) {
+      this.withNarrowScope(ctx, "drop", () => this.emitBlockStatements(body, sub));
+    } else {
+      this.emitBlockStatements(body, sub);
+    }
     ctx.lines.push(...sub.lines);
     this.push(ctx, `}`);
   }
@@ -3619,15 +4911,26 @@ export class Emitter {
     if (!this.bindsContinue(stmt.statement, label)) {
       this.push(ctx, `${head} (true) {`);
       const sub = this.nestedCtx(ctx);
-      this.emitBlockStatements(body, sub);
+      // tsc evaluates the do-while condition AFTER the body and carries the
+      // body's flow state into it — a terminal guard in the body narrows
+      // the trailing test. The body and the lowered `if (!(cond)) break;`
+      // therefore emit inside ONE narrowing scope (the `trailing` hook),
+      // restored only at the loop boundary: a restore between them would
+      // strip the narrow before the read it covers. Iteration-entry state
+      // is not at risk — the test is the last text in the loop body, so
+      // nothing emits under its narrows past the back edge, and the
+      // restore still runs before the post-loop continuation.
       // A body that always exits never reaches the test in JS either; the
       // emitted trailing test would be Zig unreachable-code.
-      if (!this.alwaysExits(stmt.statement)) {
-        const before = sub.lines.length;
-        const cond = this.emitExpr(stmt.expression, sub, { k: "bool" }).code;
-        if (sub.lines.length !== before) this.fail(stmt, "do-while condition requiring lowered statements");
-        this.push(sub, `if (!(${cond})) break;`);
-      }
+      const trailing = this.alwaysExits(stmt.statement)
+        ? undefined
+        : (): void => {
+            const before = sub.lines.length;
+            const cond = this.emitExpr(stmt.expression, sub, { k: "bool" }).code;
+            if (sub.lines.length !== before) this.fail(stmt, "do-while condition requiring lowered statements");
+            this.push(sub, `if (!(${cond})) break;`);
+          };
+      this.emitBlockStatements(body, sub, undefined, undefined, trailing);
       ctx.lines.push(...sub.lines);
       this.push(ctx, `}`);
       return;
@@ -3647,7 +4950,17 @@ export class Emitter {
 
   /// Whether any `break`/`continue` under `body` names this label (JS
   /// allows an unreferenced label; Zig rejects one, so it must drop).
-  /// Duplicate nested labels cannot shadow — tsc rejects them.
+  /// Duplicate nested labels cannot shadow on one nesting path — tsc
+  /// rejects them — but labels are FUNCTION-scoped: a nested function may
+  /// legally reuse the name for a label of its own, and its `break`/
+  /// `continue` binds that inner label, never this one. The walk stops at
+  /// function boundaries (the breaksToLabel rule), or a reuse would keep a
+  /// Zig label emitted that nothing in THIS function consumes — an
+  /// unused-label error.
+  /// An EMISSION-SHAPE walk: tsc-excluded arms deliberately COUNT here
+  /// (contrast the flow walks — see tscExcludedArm). A dead `break outer`
+  /// still emits as `break :outer`, and Zig's unused-label check is
+  /// syntactic, so the label must stay emitted and stays used.
   private labelReferenced(body: ts.Node, name: string): boolean {
     let found = false;
     const visit = (n: ts.Node): void => {
@@ -3656,6 +4969,7 @@ export class Emitter {
         found = true;
         return;
       }
+      if (ts.isFunctionLike(n)) return;
       ts.forEachChild(n, visit);
     };
     visit(body);
@@ -3664,7 +4978,15 @@ export class Emitter {
 
   /// Whether a loop body contains a `continue` that binds to THIS loop: an
   /// unlabeled one outside any nested loop, or a labeled one naming this
-  /// loop's label.
+  /// loop's label. Labels are function-scoped, so the walk stops at
+  /// function boundaries (the breaksToLabel rule): a nested function may
+  /// legally reuse the label name for a labeled loop of its own, and its
+  /// `continue` binds that inner loop, never this one.
+  /// An EMISSION-SHAPE walk: tsc-excluded arms deliberately COUNT here
+  /// (contrast the flow walks — see tscExcludedArm). Both consumers pick
+  /// the do-while lowering form, and a dead `continue` still EMITS — only
+  /// the first-pass-flag form gives that text a spelling whose jump
+  /// semantics match JS.
   private bindsContinue(body: ts.Node, label: string | null): boolean {
     let found = false;
     const visit = (n: ts.Node, insideNested: boolean): void => {
@@ -3677,6 +4999,7 @@ export class Emitter {
         }
         return;
       }
+      if (ts.isFunctionLike(n)) return;
       const nested =
         insideNested ||
         ts.isWhileStatement(n) ||
@@ -3684,11 +5007,114 @@ export class Emitter {
         ts.isForStatement(n) ||
         ts.isForOfStatement(n) ||
         ts.isForInStatement(n);
-      // Callbacks cannot `continue` an outer loop (tsc rejects it), so
-      // function boundaries need no special casing here.
       ts.forEachChild(n, (c) => visit(c, nested));
     };
     visit(body, false);
+    return found;
+  }
+
+  /// Whether an unlabeled `break` statement binds a `switch` rather than a
+  /// loop: the nearest enclosing loop-or-switch, walking out of the break,
+  /// is a switch. (tsc already rejects a break with neither.)
+  private breakBindsEnclosingSwitch(stmt: ts.BreakStatement): boolean {
+    let cur: ts.Node | undefined = stmt.parent;
+    while (cur) {
+      if (
+        ts.isWhileStatement(cur) ||
+        ts.isDoStatement(cur) ||
+        ts.isForStatement(cur) ||
+        ts.isForOfStatement(cur) ||
+        ts.isForInStatement(cur) ||
+        ts.isFunctionLike(cur)
+      ) {
+        return false;
+      }
+      if (ts.isSwitchStatement(cur)) return true;
+      cur = cur.parent;
+    }
+    return false;
+  }
+
+  /// Whether a `break` inside this switch's clauses (or this loop's body)
+  /// binds the switch/loop itself: an unlabeled one outside any nested
+  /// loop or switch, or a labeled one naming a label wrapped directly
+  /// around this statement. Such a break resumes right AFTER the
+  /// statement — the switch/loop falls through.
+  /// Labels are function-scoped in JS, so the walk stops at function
+  /// boundaries (the breaksToLabel rule): a nested helper may legally
+  /// reuse a wrapping label's name for a label of its own, and its `break`
+  /// binds the helper's label, never this construct — counting it read a
+  /// constant-true loop as fallible and merged branch kills tsc keeps.
+  /// This is a FLOW-SEMANTICS walk (it feeds alwaysExits' terminality,
+  /// which mirrors tsc's CFA): a break under a tsc-excluded arm is not an
+  /// edge the CFA can take, so it never counts (tscExcludedArm — Zig's
+  /// comptime-false folding reads the emitted text the same way).
+  private bindsBreak(
+    stmt: ts.SwitchStatement | ts.WhileStatement | ts.DoStatement | ts.ForStatement,
+  ): boolean {
+    const wrappingLabels = new Set<string>();
+    let p: ts.Node | undefined = stmt.parent;
+    while (p && ts.isLabeledStatement(p)) {
+      wrappingLabels.add(p.label.text);
+      p = p.parent;
+    }
+    let found = false;
+    const visit = (n: ts.Node, insideNested: boolean): void => {
+      if (found) return;
+      if (ts.isBreakStatement(n)) {
+        if (n.label) {
+          if (wrappingLabels.has(n.label.text)) found = true;
+        } else if (!insideNested) {
+          found = true;
+        }
+        return;
+      }
+      if (ts.isFunctionLike(n)) return;
+      const nested =
+        insideNested ||
+        ts.isWhileStatement(n) ||
+        ts.isDoStatement(n) ||
+        ts.isForStatement(n) ||
+        ts.isForOfStatement(n) ||
+        ts.isForInStatement(n) ||
+        ts.isSwitchStatement(n);
+      ts.forEachChild(n, (c) => {
+        if (!this.tscExcludedArm(n, c)) visit(c, nested);
+      });
+    };
+    if (ts.isSwitchStatement(stmt)) {
+      ts.forEachChild(stmt.caseBlock, (c) => visit(c, false));
+    } else {
+      // Loop heads hold no break (tsc rejects one there); only the body
+      // can bind this loop.
+      visit(stmt.statement, false);
+    }
+    return found;
+  }
+
+  /// Whether any `break` naming `label` sits inside `node`. Function
+  /// boundaries stop the walk: a labeled break cannot cross one (tsc
+  /// rejects it), and a nested function may legally reuse the label name
+  /// for a labeled statement of its own. tsc rejects duplicate labels on
+  /// the same nesting path, so no inner rebinding can shadow `label`.
+  /// A FLOW-SEMANTICS walk like bindsBreak (it feeds alwaysExits' labeled
+  /// terminality): a labeled break under a tsc-excluded arm never counts
+  /// (tscExcludedArm). Contrast labelReferenced, the EMISSION-SHAPE twin
+  /// that must keep counting.
+  private breaksToLabel(node: ts.Node, label: string): boolean {
+    let found = false;
+    const visit = (n: ts.Node): void => {
+      if (found) return;
+      if (ts.isBreakStatement(n)) {
+        if (n.label !== undefined && n.label.text === label) found = true;
+        return;
+      }
+      if (ts.isFunctionLike(n)) return;
+      ts.forEachChild(n, (c) => {
+        if (!this.tscExcludedArm(n, c)) visit(c);
+      });
+    };
+    visit(node);
     return found;
   }
 
@@ -3793,8 +5219,11 @@ export class Emitter {
           this.push(ctx, `${varKw} ${name} = ${seed.code};`);
           this.push(ctx, `var ${lenVar}: usize = ${name}.len;`);
         }
-        ctx.memberSubst.set(decl.name.text, `${name}[0..${lenVar}]`);
-        ctx.memberSubst.set(`${decl.name.text}.length`, `@as(i64, @intCast(${lenVar}))`);
+        const declKey = this.narrowKey(decl.name);
+        if (declKey !== null) {
+          ctx.memberSubst.set(declKey, `${name}[0..${lenVar}]`);
+          ctx.memberSubst.set(`${declKey}.length`, `@as(i64, @intCast(${lenVar}))`);
+        }
         return;
       }
       if (sliceT.k === "slice" && ts.isArrayLiteralExpression(init) && init.elements.length === 0) {
@@ -3822,7 +5251,10 @@ export class Emitter {
     if (v.code === name) return; // lowered directly into a named temp
     const annotation = this.varAnnotation(decl, t, reassigned, ctx);
     this.push(ctx, `${kw} ${name}${annotation} = ${v.code};`);
-    if (v.filterLen) ctx.memberSubst.set(`${decl.name.text}.length`, `@as(i64, @intCast(${v.filterLen}))`);
+    if (v.filterLen) {
+      const declKey = this.narrowKey(decl.name);
+      if (declKey !== null) ctx.memberSubst.set(`${declKey}.length`, `@as(i64, @intCast(${v.filterLen}))`);
+    }
   }
 
   /// R6b: `const { total, done: doneCount } = stats;` — record-field
@@ -3962,10 +5394,19 @@ export class Emitter {
       const exit = this.singleExitText(stmt.thenStatement, ctx);
       if (exit !== null) {
         this.push(ctx, `if (${base} != .${zigId(tag)}) ${exit}`);
-        const t = this.zTypeOfExpr(cond.left.expression, ctx);
-        if (t.k === "union") this.narrowUnion(cond.left.expression, t.name, tag, ctx);
-        return;
+      } else {
+        // Multi-statement exits (a throw is always two emitted statements)
+        // keep the guard's narrowing through the block form.
+        this.push(ctx, `if (${base} != .${zigId(tag)}) {`);
+        const sub = this.nestedCtx(ctx);
+        const exitStmts = ts.isBlock(stmt.thenStatement) ? stmt.thenStatement.statements : [stmt.thenStatement];
+        this.emitBlockStatements(exitStmts, sub);
+        ctx.lines.push(...sub.lines);
+        this.push(ctx, `}`);
       }
+      const t = this.zTypeOfExpr(cond.left.expression, ctx);
+      if (t.k === "union") this.narrowUnion(cond.left.expression, t.name, tag, ctx);
+      return;
     }
 
     // R7: `if (x === null) <exit>` -> `const v = x orelse <exit>;` for
@@ -3981,19 +5422,56 @@ export class Emitter {
       const t = this.zTypeOfExpr(exitTest.target, ctx);
       if (t.k === "optional") {
         const exit = this.singleExitText(stmt.thenStatement, ctx);
-        if (exit !== null) {
-          this.requireFaithfulEmptyTest(exitTest.target, exitTest.flavor, cond);
-          const prop = this.emitExpr(exitTest.target, ctx).code;
-          // A guard whose narrowed value the rest of the scope never reads
-          // must not bind a capture — an unused Zig const is a compile
-          // error — so it stays a plain null test.
-          if (!this.followingReadsTarget(stmt, exitTest.target)) {
+        // A guard whose narrowed value the rest of the scope never reads
+        // must not bind a capture — an unused Zig const is a compile
+        // error — so it stays a plain null test (one-statement exits
+        // here; multi-statement unread exits ride the generic arm below).
+        if (!this.followingReadsTarget(stmt, exitTest.target)) {
+          if (exit !== null) {
+            this.requireFaithfulEmptyTest(exitTest.target, exitTest.flavor, cond);
+            const prop = this.emitExpr(exitTest.target, ctx).code;
             this.push(ctx, `if (${prop} == null) ${exit}`);
             return;
           }
+        } else {
+          this.requireFaithfulEmptyTest(exitTest.target, exitTest.flavor, cond);
+          const prop = this.emitExpr(exitTest.target, ctx).code;
+          // A reassigned target cannot narrow through a capture (the capture
+          // goes stale at the assignment): keep the plain null test and
+          // install the `.?` spelling, whose reads see the live variable and
+          // which the assignment path keeps alive across provably non-null
+          // writes.
+          if (this.assignsTarget([...this.followingStatementsOf(stmt)], exitTest.target)) {
+            if (exit !== null) {
+              this.push(ctx, `if (${prop} == null) ${exit}`);
+            } else {
+              this.push(ctx, `if (${prop} == null) {`);
+              const sub = this.nestedCtx(ctx);
+              const exitStmts = ts.isBlock(stmt.thenStatement) ? stmt.thenStatement.statements : [stmt.thenStatement];
+              this.emitBlockStatements(exitStmts, sub);
+              ctx.lines.push(...sub.lines);
+              this.push(ctx, `}`);
+            }
+            const exitKey = this.narrowKey(exitTest.target);
+            if (exitKey !== null) ctx.memberSubst.set(exitKey, `${prop}.?`);
+            return;
+          }
           const name = this.freshName(ctx, this.narrowHint(exitTest.target));
-          this.push(ctx, `const ${name} = ${prop} orelse ${exit}`);
-          ctx.memberSubst.set(normalize(exitTest.target), name);
+          if (exit !== null) {
+            this.push(ctx, `const ${name} = ${prop} orelse ${exit}`);
+          } else {
+            // Multi-statement exits (a throw is always two emitted
+            // statements) take the block form; the block never falls
+            // through, so Zig types it noreturn and the unwrap holds.
+            this.push(ctx, `const ${name} = ${prop} orelse {`);
+            const sub = this.nestedCtx(ctx);
+            const exitStmts = ts.isBlock(stmt.thenStatement) ? stmt.thenStatement.statements : [stmt.thenStatement];
+            this.emitBlockStatements(exitStmts, sub);
+            ctx.lines.push(...sub.lines);
+            this.push(ctx, `};`);
+          }
+          const exitKey = this.narrowKey(exitTest.target);
+          if (exitKey !== null) ctx.memberSubst.set(exitKey, name);
           return;
         }
       }
@@ -4010,30 +5488,59 @@ export class Emitter {
       this.branchReadsTarget(stmt.elseStatement, exitTest.target)
     ) {
       const t = this.zTypeOfExpr(exitTest.target, ctx);
-      if (t.k === "optional") {
+      const key = this.narrowKey(exitTest.target);
+      if (t.k === "optional" && key !== null) {
         this.requireFaithfulEmptyTest(exitTest.target, exitTest.flavor, cond);
-        const key = normalize(exitTest.target);
         const prop = this.emitExpr(exitTest.target, ctx).code;
-        const name = this.freshName(ctx, this.narrowHint(exitTest.target));
-        this.push(ctx, `if (${prop}) |${name}| {`);
-        const saved = ctx.memberSubst.get(key);
-        ctx.memberSubst.set(key, name);
-        const sub = this.nestedCtx(ctx);
+        const join = new Set<string>();
         const hitBody = ts.isBlock(stmt.elseStatement) ? stmt.elseStatement.statements : [stmt.elseStatement];
-        this.emitBlockStatements(hitBody, sub);
-        ctx.lines.push(...sub.lines);
-        ctx.memberSubst.delete(key);
-        if (saved !== undefined) ctx.memberSubst.set(key, saved);
-        this.push(ctx, `} else {`);
-        const esub = this.nestedCtx(ctx);
         const missBody = ts.isBlock(stmt.thenStatement) ? stmt.thenStatement.statements : [stmt.thenStatement];
-        this.emitBlockStatements(missBody, esub);
-        ctx.lines.push(...esub.lines);
-        this.push(ctx, `}`);
+        // A branch that reassigns the target before any read could
+        // consume a capture takes the plain-test `.?` spelling instead
+        // (see captureServesBranch) — a capture would bind unused or go
+        // stale behind a join.
+        if (this.captureServesBranch(stmt.elseStatement, exitTest.target)) {
+          const name = this.freshName(ctx, this.narrowHint(exitTest.target));
+          this.push(ctx, `if (${prop}) |${name}| {`);
+          const saved = ctx.memberSubst.get(key);
+          ctx.memberSubst.set(key, name);
+          const sub = this.nestedCtx(ctx);
+          this.emitBlockStatements(hitBody, sub, join);
+          ctx.lines.push(...sub.lines);
+          ctx.memberSubst.delete(key);
+          if (saved !== undefined) ctx.memberSubst.set(key, saved);
+          this.push(ctx, `} else {`);
+          const esub = this.nestedCtx(ctx);
+          this.emitBlockStatements(missBody, esub, join);
+          ctx.lines.push(...esub.lines);
+          this.push(ctx, `}`);
+        } else {
+          this.push(ctx, `if (${prop} == null) {`);
+          const esub = this.nestedCtx(ctx);
+          this.emitBlockStatements(missBody, esub, join);
+          ctx.lines.push(...esub.lines);
+          this.push(ctx, `} else {`);
+          const saved = ctx.memberSubst.get(key);
+          ctx.memberSubst.set(key, `${prop}.?`);
+          const sub = this.nestedCtx(ctx);
+          this.emitBlockStatements(hitBody, sub, join);
+          ctx.lines.push(...sub.lines);
+          ctx.memberSubst.delete(key);
+          if (saved !== undefined) ctx.memberSubst.set(key, saved);
+          this.push(ctx, `}`);
+        }
+        this.applyJoinedNarrowKills(ctx, join);
         // A miss branch that always exits narrows everything AFTER the if
         // too (TS's control-flow narrowing): reads there unwrap through the
         // safety-checked `.?` — provably non-null, the miss path returned.
-        if (this.alwaysExits(stmt.thenStatement) && this.followingReadsTarget(stmt, exitTest.target)) {
+        // UNLESS the surviving arm killed the target: tsc's post-if state
+        // is the guard-implied narrow MINUS the joined kills, so a killed
+        // key stays dead and the code after re-checks instead.
+        if (
+          !join.has(key) &&
+          this.alwaysExits(stmt.thenStatement) &&
+          this.followingReadsTarget(stmt, exitTest.target)
+        ) {
           ctx.memberSubst.set(key, `${prop}.?`);
         }
         return;
@@ -4050,17 +5557,27 @@ export class Emitter {
       this.branchReadsTarget(stmt.thenStatement, presentTest.target)
     ) {
       const t = this.zTypeOfExpr(presentTest.target, ctx);
-      if (t.k === "optional") {
+      const key = this.narrowKey(presentTest.target);
+      if (t.k === "optional" && key !== null) {
         this.requireFaithfulEmptyTest(presentTest.target, presentTest.flavor, cond);
-        const key = normalize(presentTest.target);
         const prop = this.emitExpr(presentTest.target, ctx).code;
-        const name = this.freshName(ctx, this.narrowHint(presentTest.target));
+        // A branch that reassigns the target before any read could
+        // consume a capture takes the plain-test `.?` spelling instead
+        // (see captureServesBranch) — a capture would bind unused or go
+        // stale behind a join; `.?` reads always see the live slot.
+        const liveCapture = this.captureServesBranch(stmt.thenStatement, presentTest.target);
+        const name = liveCapture ? this.freshName(ctx, this.narrowHint(presentTest.target)) : `${prop}.?`;
         const single = unwrapSingle(stmt.thenStatement);
-        if (!stmt.elseStatement && single && ts.isReturnStatement(single)) {
+        if (liveCapture && !stmt.elseStatement && single && ts.isReturnStatement(single)) {
           const saved = ctx.memberSubst.get(key);
           ctx.memberSubst.set(key, name);
+          // Probe in a flow scope (see childCtx). Its kills discard both
+          // ways: a lines-free probe processed no statements (nothing can
+          // kill without lowering lines), and the discarded case re-emits
+          // the branch below under the block path's own scope.
           const sub = this.childCtx(ctx);
-          const v = single.expression ? this.emitReturn(single.expression, sub) : null;
+          const v = this.withNarrowScope(ctx, "merge", () =>
+            single.expression ? this.emitReturn(single.expression, sub) : null, new Set());
           ctx.memberSubst.delete(key);
           if (saved !== undefined) ctx.memberSubst.set(key, saved);
           if (sub.lines.length === 0 && v) {
@@ -4068,12 +5585,13 @@ export class Emitter {
             return;
           }
         }
-        this.push(ctx, `if (${prop}) |${name}| {`);
+        const join = new Set<string>();
+        this.push(ctx, liveCapture ? `if (${prop}) |${name}| {` : `if (${prop} != null) {`);
         const saved = ctx.memberSubst.get(key);
         ctx.memberSubst.set(key, name);
         const sub = this.nestedCtx(ctx);
         const thenBody = ts.isBlock(stmt.thenStatement) ? stmt.thenStatement.statements : [stmt.thenStatement];
-        this.emitBlockStatements(thenBody, sub);
+        this.emitBlockStatements(thenBody, sub, join);
         ctx.lines.push(...sub.lines);
         ctx.memberSubst.delete(key);
         if (saved !== undefined) ctx.memberSubst.set(key, saved);
@@ -4081,10 +5599,24 @@ export class Emitter {
           this.push(ctx, `} else {`);
           const esub = this.nestedCtx(ctx);
           const elseBody = ts.isBlock(stmt.elseStatement) ? stmt.elseStatement.statements : [stmt.elseStatement];
-          this.emitBlockStatements(elseBody, esub);
+          this.emitBlockStatements(elseBody, esub, join);
           ctx.lines.push(...esub.lines);
         }
         this.push(ctx, `}`);
+        this.applyJoinedNarrowKills(ctx, join);
+        // An else branch that always exits narrows everything AFTER the if
+        // too (the mirror of the R7-dual rule above): only the hit path
+        // falls through, so reads there unwrap via the safety-checked `.?`
+        // — unless that hit path killed the target (post-if state is the
+        // narrow minus the joined kills; a killed key re-checks instead).
+        if (
+          !join.has(key) &&
+          stmt.elseStatement &&
+          this.alwaysExits(stmt.elseStatement) &&
+          this.followingReadsTarget(stmt, presentTest.target)
+        ) {
+          ctx.memberSubst.set(key, `${prop}.?`);
+        }
         return;
       }
     }
@@ -4106,20 +5638,31 @@ export class Emitter {
     const thenStmts = ts.isBlock(stmt.thenStatement) ? stmt.thenStatement.statements : [stmt.thenStatement];
     // Single-return then-branch without else stays on one line when short.
     if (!stmt.elseStatement && thenStmts.length === 1 && ts.isReturnStatement(thenStmts[0])) {
+      // Probe in a flow scope (see childCtx). Its kills discard both ways:
+      // a lines-free probe processed no statements, and the discarded case
+      // re-emits the branch below under the block path's own scope.
       const sub = this.childCtx(ctx);
       const r = thenStmts[0];
-      const v = this.withKindNarrow(posGuard, ctx, () =>
+      const v = this.withNarrowScope(ctx, "merge", () => this.withKindNarrow(posGuard, ctx, () =>
         r.expression ? this.emitReturn(r.expression, sub) : null,
-      );
+      ), new Set());
       const text = this.returnText(ctx, v, r);
       if (sub.lines.length === 0 && condText.length + text.length <= 80) {
         this.push(ctx, `if (${condText}) ${text}`);
         return;
       }
     }
+    const join = new Set<string>();
+    // A tsc-unreachable arm (bare keyword-literal condition — see
+    // tscExcludedArm) still emits, but contributes no kills to the join:
+    // tsc's CFA excludes the arm, so a kill from it would strip a narrow
+    // tsc typed the fall-through reads with (a raw optional read, invalid
+    // Zig). Its kills feed a discarded set instead of the join.
+    const discard = new Set<string>();
     this.push(ctx, `if (${condText}) {`);
     const sub = this.nestedCtx(ctx);
-    this.withKindNarrow(posGuard, ctx, () => this.emitBlockStatements(thenStmts, sub));
+    const thenJoin = this.tscExcludedArm(stmt, stmt.thenStatement) ? discard : join;
+    this.withKindNarrow(posGuard, ctx, () => this.emitBlockStatements(thenStmts, sub, thenJoin));
     ctx.lines.push(...sub.lines);
     if (stmt.elseStatement) {
       if (ts.isIfStatement(stmt.elseStatement)) {
@@ -4127,16 +5670,66 @@ export class Emitter {
         this.push(ctx, `} else ${""}`.trimEnd());
         // Rewrite: emit as `} else if (...) {` by recursing with a marker.
         ctx.lines.pop();
-        this.emitElseIf(stmt.elseStatement, ctx);
+        this.emitElseIf(stmt.elseStatement, ctx, join);
+        this.applyJoinedNarrowKills(ctx, join);
+        // This exit path narrows like the common tail below: an exiting
+        // empty-test arm at the HEAD of a chain still narrows everything
+        // after the whole statement (the else-if arms ride the non-empty
+        // path), and skipping it here left fall-through reads optional.
+        this.applyPostIfNarrow(stmt, exitTest, presentTest, ctx, join);
         return;
       }
       this.push(ctx, `} else {`);
       const esub = this.nestedCtx(ctx);
       const elseStmts = ts.isBlock(stmt.elseStatement) ? stmt.elseStatement.statements : [stmt.elseStatement];
-      this.withKindNarrow(negGuard, ctx, () => this.emitBlockStatements(elseStmts, esub));
+      const elseJoin = this.tscExcludedArm(stmt, stmt.elseStatement) ? discard : join;
+      this.withKindNarrow(negGuard, ctx, () => this.emitBlockStatements(elseStmts, esub, elseJoin));
       ctx.lines.push(...esub.lines);
     }
     this.push(ctx, `}`);
+    this.applyJoinedNarrowKills(ctx, join);
+    this.applyPostIfNarrow(stmt, exitTest, presentTest, ctx, join);
+  }
+
+  /// tsc narrows AFTER an if whose empty-testing arm always exits — only
+  /// the non-empty path falls through. The tailored R7 paths in emitIf
+  /// return for the shapes where an arm READS the target; these are the
+  /// generic leftovers (the miss arm has an else — possibly a whole
+  /// else-if chain — or no arm reads the target), so fall-through reads
+  /// unwrap via the safety-checked `.?`. Every exit path from emitIf that
+  /// finished emitting the statement must apply this — with the
+  /// statement's just-joined kill set: tsc's post-if state is the
+  /// guard-implied narrow MINUS the arms' kills, so a target a surviving
+  /// arm killed stays dead (installing it anyway would resurrect the
+  /// narrow the join buried, emitting a `.?` read or test against a slot
+  /// that can be null again).
+  private applyPostIfNarrow(
+    stmt: ts.IfStatement,
+    exitTest: { target: ts.Expression; flavor: "null" | "undefined" } | null,
+    presentTest: { target: ts.Expression; flavor: "null" | "undefined" } | null,
+    ctx: Ctx,
+    join: ReadonlySet<string>,
+  ): void {
+    const postNarrow =
+      (exitTest && this.alwaysExits(stmt.thenStatement) ? exitTest : null) ??
+      (presentTest && stmt.elseStatement && this.alwaysExits(stmt.elseStatement) ? presentTest : null);
+    if (
+      postNarrow &&
+      (ts.isPropertyAccessExpression(postNarrow.target) || ts.isIdentifier(postNarrow.target)) &&
+      this.followingReadsTarget(stmt, postNarrow.target)
+    ) {
+      const key = this.narrowKey(postNarrow.target);
+      if (key === null || join.has(key)) return;
+      const t = this.zTypeOfExpr(postNarrow.target, ctx);
+      const empties = this.tast.emptiesOf(postNarrow.target);
+      // The unfaithful-empty spellings keep their R7c teaching on the
+      // paths that emit tests; here the narrow just quietly declines.
+      const faithful = postNarrow.flavor === "null" ? !empties.undefined : !empties.null;
+      if (t.k === "optional" && faithful) {
+        const code = this.emitExpr(postNarrow.target, ctx).code;
+        ctx.memberSubst.set(key, `${code}.?`);
+      }
+    }
   }
 
   /// Capture-name hint for a narrowed optional target.
@@ -4146,50 +5739,143 @@ export class Emitter {
     return "opt";
   }
 
-  /// Whether a guarded branch reads its narrowed target — a Zig capture the
+  /// Whether a guarded branch READS its narrowed target — a Zig capture the
   /// branch never uses would be an unused-capture error, so unread guards
-  /// keep the plain `!= null` comparison instead.
+  /// keep the plain `!= null` comparison instead. A plain assignment's
+  /// TARGET is not a read: the write goes to the raw slot, never the
+  /// capture, so a write-only arm (a pure kill) must decline the capture
+  /// form or the capture binds unused.
   private branchReadsTarget(branch: ts.Statement, target: ts.Expression): boolean {
     if (ts.isIdentifier(target)) {
       const decl = this.tast.declarationOf(target);
-      if (decl) return this.identifierUsed(branch, decl);
+      if (decl) return this.identifierRead(branch, decl);
     }
-    return branch.getText().includes(target.getText());
+    // Property chains compare by declaration-qualified key, never text —
+    // a shadowed spelling in a nested callback is not a read (anyReadsKey).
+    return this.anyReadsKey([branch], this.narrowKey(target));
+  }
+
+  /// identifierUsed, minus references that are the bare TARGET of a plain
+  /// `=` assignment (compound assignments and `++`/`--` read the slot and
+  /// still count).
+  private identifierRead(body: ts.Node, decl: ts.Node): boolean {
+    let found = false;
+    const visit = (n: ts.Node): void => {
+      if (found) return;
+      if (
+        ts.isIdentifier(n) &&
+        this.tast.declarationOf(n) === decl &&
+        n.parent !== decl &&
+        !(
+          ts.isBinaryExpression(n.parent) &&
+          n.parent.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+          n.parent.left === n
+        )
+      ) {
+        found = true;
+        return;
+      }
+      ts.forEachChild(n, visit);
+    };
+    visit(body);
+    return found;
   }
 
   /// Whether any statement AFTER an early-exit guard reads the guarded
   /// target — the scope a `const v = x orelse <exit>;` capture serves. An
-  /// unread capture would be an unused Zig const, a compile error. The
-  /// text match is boundary-aware so `model.now` never matches inside
-  /// `model.nowDurationMs`.
+  /// unread capture would be an unused Zig const, a compile error.
+  /// Property chains compare by declaration-qualified key (anyReadsKey),
+  /// which is inherently boundary-aware — `model.now` is a different key
+  /// from `model.nowDurationMs`, and a shadowed spelling in a nested
+  /// callback is a different declaration.
   private followingReadsTarget(stmt: ts.IfStatement, target: ts.Expression): boolean {
-    const parent = stmt.parent;
-    let following: readonly ts.Statement[] = [];
-    if (ts.isBlock(parent) || ts.isSourceFile(parent) || ts.isCaseClause(parent) || ts.isDefaultClause(parent)) {
-      const statements = parent.statements;
-      const at = statements.indexOf(stmt);
-      if (at >= 0) following = statements.slice(at + 1);
-    }
+    const following: ts.Node[] = [...this.followingStatementsOf(stmt)];
+    // Flow off the end of a do-while body continues INTO the trailing
+    // test (tsc evaluates the condition after the body), and the lowered
+    // `if (!(cond)) break;` emits inside the body's narrowing scope — a
+    // condition read is a read the guard's capture serves.
+    const trailingTest = this.trailingDoWhileTestOf(stmt);
+    if (trailingTest !== null) following.push(trailingTest);
     if (following.length === 0) return false;
     if (ts.isIdentifier(target)) {
       const decl = this.tast.declarationOf(target);
       if (decl) return following.some((s) => this.identifierUsed(s, decl));
     }
-    const escaped = target.getText().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const read = new RegExp(`${escaped}(?![A-Za-z0-9_$])`);
-    return following.some((s) => read.test(s.getText()));
+    return this.anyReadsKey(following, this.narrowKey(target));
   }
 
-  private emitElseIf(stmt: ts.IfStatement, ctx: Ctx): void {
+  /// The statements after `stmt` in its own list — the scope an early-exit
+  /// guard's narrowing serves. A plain lexical block is no flow boundary
+  /// (emitStatement flattens it), so the walk continues past it: a guard at
+  /// the end of such a block narrows the statements after the BLOCK,
+  /// transitively out through enclosing plain blocks.
+  private followingStatementsOf(stmt: ts.Statement): readonly ts.Statement[] {
+    const parent = stmt.parent;
+    if (ts.isBlock(parent) || ts.isSourceFile(parent) || ts.isCaseClause(parent) || ts.isDefaultClause(parent)) {
+      const statements = parent.statements;
+      const at = statements.indexOf(stmt);
+      if (at >= 0) {
+        const rest = statements.slice(at + 1);
+        if (ts.isBlock(parent) && isPlainLexicalBlock(parent)) {
+          return [...rest, ...this.followingStatementsOf(parent)];
+        }
+        return rest;
+      }
+    }
+    return [];
+  }
+
+  /// The do-while trailing test the flow after `stmt` runs into, when that
+  /// test actually emits inside the body's narrowing scope — i.e. `stmt`
+  /// sits in the body list (transitively through plain lexical blocks) of
+  /// a do-while lowered to the `while (true)` + trailing-exit-test form.
+  /// The first-pass-flag form (a body binding `continue`) hoists the test
+  /// ahead of the body, where a body narrow's capture is out of scope, and
+  /// an always-exiting body emits no test at all — both return null, so a
+  /// guard read only by the condition binds no capture there (an unused
+  /// Zig const is a compile error).
+  private trailingDoWhileTestOf(stmt: ts.Statement): ts.Expression | null {
+    let cur: ts.Statement = stmt;
+    for (;;) {
+      const parent: ts.Node = cur.parent;
+      if (ts.isBlock(parent) && isPlainLexicalBlock(parent)) {
+        cur = parent;
+        continue;
+      }
+      const holder = ts.isBlock(parent) ? parent.parent : parent;
+      if (!ts.isDoStatement(holder)) return null;
+      // Mirror emitStatement's label derivation: the loop's Zig label
+      // exists only when a labeled break/continue references it.
+      const label =
+        ts.isLabeledStatement(holder.parent) && this.labelReferenced(holder, holder.parent.label.text)
+          ? loopLabel(holder.parent.label.text)
+          : null;
+      if (this.bindsContinue(holder.statement, label)) return null;
+      if (this.alwaysExits(holder.statement)) return null;
+      return holder.expression;
+    }
+  }
+
+  /// Every arm of the chain — each else-if body and the final else — is a
+  /// SIBLING of the head if's then arm: its merge-class kills collect into
+  /// the chain-wide `join` the head applies after the whole statement, so
+  /// no arm emits against a preceding arm's kills (they are alternatives,
+  /// not a sequence).
+  private emitElseIf(stmt: ts.IfStatement, ctx: Ctx, join: Set<string>): void {
     // A chained condition that needs lowered statements cannot sit between
     // `}` and `else if`; open a plain else block and start a fresh if inside.
-    // The probe works on a copied name set so it burns no real names.
+    // The probe works on a copied name set so it burns no real names, and
+    // brackets in a flow scope (see childCtx) — both routes below re-emit
+    // the condition for real.
     const probe: Ctx = { ...ctx, lines: [], used: new Set(ctx.used) };
-    this.emitExpr(stmt.expression, probe, { k: "bool" });
+    this.withNarrowScope(ctx, "merge", () => this.emitExpr(stmt.expression, probe, { k: "bool" }), new Set());
     if (probe.lines.length > 0) {
       this.push(ctx, `} else {`);
       const inner = this.nestedCtx(ctx);
-      this.emitIf(stmt, inner);
+      // The nested if is one arm of the enclosing chain: bracket it in a
+      // flow scope so its narrows stay contained and its kills join with
+      // its siblings' instead of applying mid-chain.
+      this.withNarrowScope(ctx, "merge", () => this.emitIf(stmt, inner), join);
       ctx.lines.push(...inner.lines);
       this.push(ctx, `}`);
       return;
@@ -4198,17 +5884,19 @@ export class Emitter {
     this.push(ctx, `} else if (${condText}) {`);
     const sub = this.nestedCtx(ctx);
     const thenStmts = ts.isBlock(stmt.thenStatement) ? stmt.thenStatement.statements : [stmt.thenStatement];
-    this.emitBlockStatements(thenStmts, sub);
+    // tsc-unreachable arms contribute no kills to the chain's join (see
+    // emitIf's discard note; tscExcludedArm).
+    this.emitBlockStatements(thenStmts, sub, this.tscExcludedArm(stmt, stmt.thenStatement) ? new Set() : join);
     ctx.lines.push(...sub.lines);
     if (stmt.elseStatement) {
       if (ts.isIfStatement(stmt.elseStatement)) {
-        this.emitElseIf(stmt.elseStatement, ctx);
+        this.emitElseIf(stmt.elseStatement, ctx, join);
         return;
       }
       this.push(ctx, `} else {`);
       const esub = this.nestedCtx(ctx);
       const elseStmts = ts.isBlock(stmt.elseStatement) ? stmt.elseStatement.statements : [stmt.elseStatement];
-      this.emitBlockStatements(elseStmts, esub);
+      this.emitBlockStatements(elseStmts, esub, this.tscExcludedArm(stmt, stmt.elseStatement) ? new Set() : join);
       ctx.lines.push(...esub.lines);
     }
     this.push(ctx, `}`);
@@ -4221,14 +5909,30 @@ export class Emitter {
     return text;
   }
 
+  /// A guard's exit branch as ONE Zig statement (`return v;`, `break;`,
+  /// `continue;`, labeled forms included), or null when it needs a block
+  /// (multi-statement bodies; a throw always emits two statements).
   private singleExitText(stmt: ts.Statement, ctx: Ctx): string | null {
     const single = unwrapSingle(stmt);
     if (single && ts.isReturnStatement(single)) {
       if (!single.expression) return this.returnText(ctx, null, single);
+      // Probe in a flow scope (see childCtx): a lines-free probe processed
+      // no statements, so the discarded kill set is empty; a lines-bearing
+      // probe is declined and the caller re-emits under its own scope.
       const sub = this.childCtx(ctx);
-      const v = this.emitReturn(single.expression, sub);
+      const v = this.withNarrowScope(ctx, "merge", () => this.emitReturn(single.expression!, sub), new Set());
       if (sub.lines.length === 0) return this.returnText(ctx, v, single);
       return null;
+    }
+    if (single && (ts.isBreakStatement(single) || ts.isContinueStatement(single))) {
+      // A break bound to a switch has no one-statement Zig spelling (Zig
+      // `break` binds loops); declining here routes it through statement
+      // emission, where it stops the build with its teaching.
+      if (ts.isBreakStatement(single) && !single.label && this.breakBindsEnclosingSwitch(single)) {
+        return null;
+      }
+      const kw = ts.isBreakStatement(single) ? "break" : "continue";
+      return single.label ? `${kw} :${loopLabel(single.label.text)};` : `${kw};`;
     }
     return null;
   }
@@ -4238,10 +5942,14 @@ export class Emitter {
     cond: ts.Expression,
     op: ts.SyntaxKind = ts.SyntaxKind.EqualsEqualsEqualsToken,
   ): { base: ts.Expression; tag: string } | null {
-    if (!ts.isBinaryExpression(cond) || cond.operatorToken.kind !== op) return null;
+    // Wrappers strip exactly as in emptyTestOf: a parenthesized, asserted,
+    // or `as`/`satisfies`-cast guard or operand must narrow the same arm
+    // the bare spelling does (emission erases every one of them).
+    const c = unwrapExpr(cond);
+    if (!ts.isBinaryExpression(c) || c.operatorToken.kind !== op) return null;
     const sides: Array<[ts.Expression, ts.Expression]> = [
-      [cond.left, cond.right],
-      [cond.right, cond.left],
+      [unwrapExpr(c.left), unwrapExpr(c.right)],
+      [unwrapExpr(c.right), unwrapExpr(c.left)],
     ];
     for (const [kindSide, litSide] of sides) {
       if (
@@ -4269,15 +5977,28 @@ export class Emitter {
     const t = unwrapOptional(this.zTypeOfExpr(guard.base, ctx));
     if (t.k !== "union") return emitBranch();
     const savedSubst = new Map(ctx.memberSubst);
+    // stillOptionalSubst rides along: narrowUnion overwrites an optional
+    // payload's marker with ITS access spelling, and a marker left out of
+    // sync with the restored memberSubst breaks the identity check
+    // zTypeOfExpr keys on — a redundant kind guard inside a payload
+    // capture would leave the capture looking non-null for the rest of
+    // the arm, routing reads around the null-narrowing lowerings.
+    const savedStillOptional = new Map(ctx.stillOptionalSubst);
     const savedNarrow = new Map(ctx.narrowedUnion);
+    this.pushNarrowKillFrame(ctx);
     this.narrowUnion(guard.base, t.name, guard.tag, ctx);
     try {
       return emitBranch();
     } finally {
       ctx.memberSubst.clear();
       for (const [k, v] of savedSubst) ctx.memberSubst.set(k, v);
+      ctx.stillOptionalSubst.clear();
+      for (const [k, v] of savedStillOptional) ctx.stillOptionalSubst.set(k, v);
       ctx.narrowedUnion.clear();
       for (const [k, v] of savedNarrow) ctx.narrowedUnion.set(k, v);
+      // Assignment kills inside the branch stay dead past this restore
+      // (the snapshot would resurrect them; see popNarrowKillFrame).
+      this.popNarrowKillFrame(ctx);
     }
   }
 
@@ -4287,12 +6008,16 @@ export class Emitter {
     const arm = info.arms.find((a) => a.tag === tag);
     if (!arm) return;
     const baseText = this.emitExpr(expr, ctx).code;
-    const key = normalize(expr);
+    const key = this.narrowKey(expr);
+    if (key === null) return;
     ctx.narrowedUnion.set(key, tag);
     for (const f of arm.fields) {
       const access =
         arm.fields.length === 1 ? `${baseText}.${zigId(tag)}` : `${baseText}.${zigId(tag)}.${fieldName(f)}`;
       ctx.memberSubst.set(`${key}.${f.tsName}`, access);
+      // Kind-narrowing selects the arm; it proves nothing about a field
+      // that is itself optional — the payload access keeps the optional.
+      if (this.fieldZType(f).k === "optional") ctx.stillOptionalSubst.set(`${key}.${f.tsName}`, access);
     }
   }
 
@@ -4336,16 +6061,53 @@ export class Emitter {
     return test;
   }
 
-  /// Whether any of the nodes reads the guarded target (decl identity for
-  /// identifiers, source text for property chains — same heuristic as
-  /// branchReadsTarget).
+  /// Whether any of the nodes READS the guarded target — declaration
+  /// identity for identifiers, declaration-QUALIFIED narrowKeys for
+  /// property chains (anyReadsKey). Never source text: a shadowed spelling
+  /// inside a nested callback (`xs.map((box) => box.q)`) is not a read of
+  /// the outer `box.q`, and matching it by text binds a capture the
+  /// declaration-keyed substitution (correctly) never rewrites — a Zig
+  /// unused-capture error.
+  ///
+  /// Reads, not uses (identifierRead, the same judgment branchReadsTarget
+  /// and captureServesBranch apply): the bare TARGET of a plain `=`
+  /// assignment writes the raw slot, never the capture, so a write-only
+  /// occurrence cannot consume a binding — gating a capture on it binds
+  /// the capture unused, a Zig error. Compound assignments and `++`/`--`
+  /// read the slot and still count. Property-chain targets are immutable
+  /// model data, so their key walk needs no write exclusion.
   private anyReadsTarget(nodes: readonly ts.Node[], target: ts.Expression): boolean {
     if (ts.isIdentifier(target)) {
       const decl = this.tast.declarationOf(target);
-      if (decl) return nodes.some((n) => this.identifierUsed(n, decl));
+      if (decl) return nodes.some((n) => this.identifierRead(n, decl));
     }
-    const text = target.getText();
-    return nodes.some((n) => n.getText().includes(text));
+    return this.anyReadsKey(nodes, this.narrowKey(target));
+  }
+
+  /// The property-chain read walk every capture/substitution GATE in the
+  /// narrowing machinery uses: visit the nodes' property accesses (and
+  /// identifiers, for the no-declaration corner), canonicalize each
+  /// through narrowKey, and compare against the target's key — the same
+  /// identity the installed substitutions are looked up by, so a gate that
+  /// fires here is a gate whose capture WILL be consumed. Wrapper
+  /// spellings (`(box.q)`, `box.q!`) match through the key's own
+  /// canonicalization; a longer chain (`box.q.name`) matches via its
+  /// inner access on the recursive walk.
+  private anyReadsKey(nodes: readonly ts.Node[], key: string | null): boolean {
+    // A keyless target (see narrowKey) has no reads to serve: nothing can
+    // be substituted for it, so every gate over it declines.
+    if (key === null) return false;
+    let found = false;
+    const visit = (n: ts.Node): void => {
+      if (found) return;
+      if ((ts.isPropertyAccessExpression(n) || ts.isIdentifier(n)) && this.narrowKey(n) === key) {
+        found = true;
+        return;
+      }
+      ts.forEachChild(n, visit);
+    };
+    for (const n of nodes) visit(n);
+    return found;
   }
 
   /// Whether the nodes ASSIGN the guarded local (only identifiers are
@@ -4383,6 +6145,49 @@ export class Emitter {
     return found;
   }
 
+  /// Whether a guarded branch can bind a Zig CAPTURE for its narrowed
+  /// target. tsc keeps the narrow through a provably non-null
+  /// reassignment, but a capture goes stale there — the assignment
+  /// emitter transitions the substitution to the live-slot `.?` spelling
+  /// — so the capture form only holds when every plain `=` assignment to
+  /// the target sits at the branch's top statement level (straight-line
+  /// flow the transition covers) AND some read precedes the first
+  /// assignment to consume the binding. An assignment inside a nested
+  /// construct (an if arm, a loop body — whose back edge reaches even
+  /// the reads spelled above it) hands the branch to the `.?` spelling
+  /// up front, which is valid for every read the guard dominates. A
+  /// branch that never assigns the target keeps the capture; property
+  /// targets are never assignable.
+  private captureServesBranch(branch: ts.Statement, target: ts.Expression): boolean {
+    if (!ts.isIdentifier(target)) return true;
+    const decl = this.tast.declarationOf(target);
+    if (!decl) return true;
+    const stmts = ts.isBlock(branch) ? branch.statements : [branch];
+    const plainAssignOf = (s: ts.Statement): ts.BinaryExpression | null =>
+      ts.isExpressionStatement(s) &&
+      ts.isBinaryExpression(s.expression) &&
+      s.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isIdentifier(s.expression.left) &&
+      this.tast.declarationOf(s.expression.left) === decl
+        ? s.expression
+        : null;
+    let anyAssign = false;
+    let readBeforeAssign = false;
+    for (const s of stmts) {
+      const assign = plainAssignOf(s);
+      if (assign) {
+        // The RHS evaluates before the write, so its reads still consume
+        // the capture.
+        if (!anyAssign && this.identifierRead(assign.right, decl)) readBeforeAssign = true;
+        anyAssign = true;
+        continue;
+      }
+      if (this.assignsTarget([s], target)) return false;
+      if (!anyAssign && this.identifierRead(s, decl)) readBeforeAssign = true;
+    }
+    return anyAssign ? readBeforeAssign : true;
+  }
+
   /// True when some conjunct null-guards a target a LATER conjunct reads —
   /// the chain needs one of the R7d lowerings to stay valid Zig.
   private chainHasNullGuard(conjuncts: readonly ts.Expression[], op: ts.SyntaxKind, ctx: Ctx): boolean {
@@ -4408,9 +6213,10 @@ export class Emitter {
     const rest = conjuncts.slice(1);
     if (rest.length === 0) return emitOne(c0);
     const guard = this.nullGuardOf(c0, op, ctx);
-    if (guard && this.anyReadsTarget(rest, guard.target)) {
+    const guardKey = guard === null ? null : this.narrowKey(guard.target);
+    if (guard && guardKey !== null && this.anyReadsTarget(rest, guard.target)) {
       this.requireFaithfulEmptyTest(guard.target, guard.flavor, c0);
-      const key = normalize(guard.target);
+      const key = guardKey;
       const prop = this.emitExpr(guard.target, ctx).code;
       const cap = this.freshName(ctx, this.narrowHint(guard.target));
       const saved = ctx.memberSubst.get(key);
@@ -4443,18 +6249,21 @@ export class Emitter {
     const isAnd = op === ts.SyntaxKind.AmpersandAmpersandToken;
     const zop = isAnd ? "and" : "or";
     const saved = new Map(ctx.memberSubst);
+    this.pushNarrowKillFrame(ctx);
     const emitChain = (conjs: readonly ts.Expression[]): string => {
       const c0 = conjs[0];
       const rest = conjs.slice(1);
       const guard = this.nullGuardOf(c0, op, ctx);
       if (guard) {
         this.requireFaithfulEmptyTest(guard.target, guard.flavor, c0);
-        const key = normalize(guard.target);
+        const key = this.narrowKey(guard.target);
         const prop = this.emitExpr(guard.target, ctx).code;
         const head = `${prop} ${isAnd ? "!=" : "=="} null`;
         if (rest.length === 0) return head;
-        ctx.memberSubst.set(key, `${prop}.?`);
-        guards.set(key, `${prop}.?`);
+        if (key !== null) {
+          ctx.memberSubst.set(key, `${prop}.?`);
+          guards.set(key, `${prop}.?`);
+        }
         return `${head} ${zop} ${emitChain(rest)}`;
       }
       const head = precedenceParen(c0, zop, this.emitExpr(c0, ctx, { k: "bool" }).code);
@@ -4468,6 +6277,10 @@ export class Emitter {
     const code = emitChain(conjuncts);
     ctx.memberSubst.clear();
     for (const [k, v] of saved) ctx.memberSubst.set(k, v);
+    // A conjunct can smuggle statements in (a block-bodied callback, an
+    // R10b value-position step); an assignment kill made there must stay
+    // dead past this restore (see popNarrowKillFrame).
+    this.popNarrowKillFrame(ctx);
     return code;
   }
 
@@ -4475,11 +6288,15 @@ export class Emitter {
   private withSubsts<T>(guards: ReadonlyMap<string, string>, ctx: Ctx, emit: () => T): T {
     const saved = new Map(ctx.memberSubst);
     for (const [k, v] of guards) ctx.memberSubst.set(k, v);
+    this.pushNarrowKillFrame(ctx);
     try {
       return emit();
     } finally {
       ctx.memberSubst.clear();
       for (const [k, v] of saved) ctx.memberSubst.set(k, v);
+      // Assignment kills inside the scope stay dead past this restore
+      // (the snapshot would resurrect them; see popNarrowKillFrame).
+      this.popNarrowKillFrame(ctx);
     }
   }
 
@@ -4548,8 +6365,9 @@ export class Emitter {
         // A reassigned local cannot narrow through a capture (the capture
         // goes stale); the unwrap spelling below reads the live variable.
         if (this.assignsTarget(readers, g.target)) break;
+        const key = this.narrowKey(g.target);
+        if (key === null) break;
         this.requireFaithfulEmptyTest(g.target, g.flavor, conjuncts[gi]);
-        const key = normalize(g.target);
         const prop = this.emitExpr(g.target, ctx).code;
         const cap = this.freshName(ctx, this.narrowHint(g.target));
         caps.push({ key, saved: ctx.memberSubst.get(key) });
@@ -4601,14 +6419,15 @@ export class Emitter {
     const condText = this.emitNullGuardChainUnwrap(conjuncts, op, ctx, guards);
     const kindGuards = this.chainKindGuards(conjuncts, op);
     const thenStmts = ts.isBlock(stmt.thenStatement) ? stmt.thenStatement.statements : [stmt.thenStatement];
+    const join = new Set<string>();
     this.push(ctx, `if (${condText}) {`);
     const tSub = this.nestedCtx(ctx);
     if (isAnd) {
       this.withSubsts(guards, ctx, () =>
-        this.withKindNarrows(kindGuards, ctx, () => this.emitBlockStatements(thenStmts, tSub)),
+        this.withKindNarrows(kindGuards, ctx, () => this.emitBlockStatements(thenStmts, tSub, join)),
       );
     } else {
-      this.emitBlockStatements(thenStmts, tSub);
+      this.emitBlockStatements(thenStmts, tSub, join);
     }
     ctx.lines.push(...tSub.lines);
     if (stmt.elseStatement) {
@@ -4617,18 +6436,23 @@ export class Emitter {
       const elseStmts = ts.isBlock(stmt.elseStatement) ? stmt.elseStatement.statements : [stmt.elseStatement];
       if (!isAnd) {
         this.withSubsts(guards, ctx, () =>
-          this.withKindNarrows(kindGuards, ctx, () => this.emitBlockStatements(elseStmts, eSub)),
+          this.withKindNarrows(kindGuards, ctx, () => this.emitBlockStatements(elseStmts, eSub, join)),
         );
       } else {
-        this.emitBlockStatements(elseStmts, eSub);
+        this.emitBlockStatements(elseStmts, eSub, join);
       }
       ctx.lines.push(...eSub.lines);
     }
     this.push(ctx, `}`);
+    this.applyJoinedNarrowKills(ctx, join);
     if (exitDual) {
       // `if (x === null || <bad>) return ...;` — the code below runs only
-      // with x present, so the unwrap substitutions stay active.
-      for (const [k, v] of guards) ctx.memberSubst.set(k, v);
+      // with x present, so the unwrap substitutions stay active — minus
+      // any target the arm killed on a non-leaving exit (a break/continue
+      // route merges its kills; the post-statement state subtracts them).
+      for (const [k, v] of guards) {
+        if (!join.has(k)) ctx.memberSubst.set(k, v);
+      }
     }
     return true;
   }
@@ -4660,7 +6484,15 @@ export class Emitter {
     this.push(ctx, `${head} (${cond}) : (${inc}) {`);
     const sub = this.nestedCtx(ctx);
     const body = ts.isBlock(stmt.statement) ? stmt.statement.statements : [stmt.statement];
-    this.emitBlockStatements(body, sub);
+    // A `for (; false;)` body is statically unreachable to tsc's CFA
+    // (tscExcludedArm), so its kills never reach the post-loop state —
+    // the same drop emitWhile applies to a `while (false)` body. The
+    // body still emits; only the flow bookkeeping skips.
+    if (this.tscExcludedArm(stmt, stmt.statement)) {
+      this.withNarrowScope(ctx, "drop", () => this.emitBlockStatements(body, sub));
+    } else {
+      this.emitBlockStatements(body, sub);
+    }
     ctx.lines.push(...sub.lines);
     this.push(ctx, `}`);
   }
@@ -4879,10 +6711,18 @@ export class Emitter {
     const info = this.table.unions.get(baseType.name);
     if (!info) this.fail(stmt, `unknown union ${baseType.name}`);
     const base = this.emitExpr(scrutinee.expression, ctx).code;
-    const baseKey = normalize(scrutinee.expression);
+    const baseKey = this.narrowKey(scrutinee.expression);
     this.push(ctx, `switch (${base}) {`);
     const armCtx = { ...ctx, indent: ctx.indent + 1 };
     const covered = new Set<string>();
+    // Clauses are pure siblings — alternatives from the switch's entry
+    // state, never a sequence: tsc's noFallthroughCasesInSwitch (on in the
+    // subset's program options) rejects a non-empty clause that falls into
+    // the next, and label stacking shares ONE body. So each clause's
+    // merge-class kills join here and apply only after every clause has
+    // emitted (see applyJoinedNarrowKills) — applying them per clause
+    // would strip a later clause of a narrowing tsc keeps there.
+    const join = new Set<string>();
     let sawDefault = false;
     // Label stacking (`case "a": case "b": body`): JS runs the next body
     // for every stacked label, so the labels coalesce into one Zig arm.
@@ -4914,7 +6754,7 @@ export class Emitter {
           continue;
         }
         const sub = this.nestedCtx(armCtx);
-        this.emitBlockStatements(stmts, sub);
+        this.emitBlockStatements(stmts, sub, join);
         const single = sub.lines.length === 1 ? sub.lines[0].trim() : null;
         if (single && (single.startsWith("return ") || single.startsWith("break :")) && single.endsWith(";")) {
           const armText = `else => ${single.slice(0, -1)},`;
@@ -4944,11 +6784,16 @@ export class Emitter {
       if (last && ts.isBreakStatement(last) && !last.label) stmts = stmts.slice(0, -1);
 
       const sub = this.nestedCtx(armCtx);
-      // Payload capture + member substitution for this arm's fields.
+      // Payload capture + member substitution for this arm's fields. Field
+      // use is judged by the declaration-qualified key the substitutions
+      // are installed under — a same-named field of some OTHER value in
+      // the body (`box.v` beside payload field `v`) is not a payload read,
+      // and binding the capture for it would leave it unused.
       const savedSubst = new Map(ctx.memberSubst);
+      const savedStillOptional = new Map(ctx.stillOptionalSubst);
       let capture = "";
-      const payloadUsed = arm.fields.some((f) =>
-        stmts.some((s) => s.getText().includes(`.${f.tsName}`)),
+      const payloadUsed = baseKey !== null && arm.fields.some((f) =>
+        this.anyReadsKey(stmts, `${baseKey}.${f.tsName}`),
       );
       if (pending.length > 0 && payloadUsed) {
         // The shared body would need one capture per differently-shaped
@@ -4959,14 +6804,37 @@ export class Emitter {
         const cap = this.freshName(sub, zigLocalName(arm.fields[0].tsName));
         capture = `|${cap}| `;
         sub.memberSubst.set(`${baseKey}.${arm.fields[0].tsName}`, cap);
+        // The capture holds the payload AS-IS: an optional field stays
+        // optional through it (this is a rename, not a null-narrowing).
+        if (this.fieldZType(arm.fields[0]).k === "optional") {
+          sub.stillOptionalSubst.set(`${baseKey}.${arm.fields[0].tsName}`, cap);
+        }
       } else if (arm.fields.length > 1 && payloadUsed) {
         const cap = this.freshName(sub, zigId(arm.tag));
         capture = `|${cap}| `;
-        for (const f of arm.fields) sub.memberSubst.set(`${baseKey}.${f.tsName}`, `${cap}.${fieldName(f)}`);
+        for (const f of arm.fields) {
+          sub.memberSubst.set(`${baseKey}.${f.tsName}`, `${cap}.${fieldName(f)}`);
+          if (this.fieldZType(f).k === "optional") {
+            sub.stillOptionalSubst.set(`${baseKey}.${f.tsName}`, `${cap}.${fieldName(f)}`);
+          }
+        }
       }
+      this.pushNarrowKillFrame(ctx);
       this.emitBlockStatements(stmts, sub);
-      // Restore: captures are arm-scoped.
-      for (const k of [...ctx.memberSubst.keys()]) if (!savedSubst.has(k)) ctx.memberSubst.delete(k);
+      // Restore: captures are arm-scoped, and the still-optional markers
+      // stay paired with the substitutions they annotate. Repopulate from
+      // the snapshot rather than deleting the arm's additions — a nested
+      // switch on the same subject OVERWRITES entries the snapshot already
+      // held (its capture shadows the outer one), and a delete-only sweep
+      // would leave the inner capture name active after its block closed.
+      ctx.memberSubst.clear();
+      for (const [k, v] of savedSubst) ctx.memberSubst.set(k, v);
+      ctx.stillOptionalSubst.clear();
+      for (const [k, v] of savedStillOptional) ctx.stillOptionalSubst.set(k, v);
+      // Assignment kills inside the arm join with the sibling clauses'
+      // and apply after the last clause (the snapshot above must not
+      // resurrect them; see applyJoinedNarrowKills).
+      for (const key of this.popNarrowKillFrame(ctx, "drop")) join.add(key);
 
       const labels = [...pending, tag].map((t) => `.${zigId(t)}`).join(", ");
       pending = [];
@@ -4992,6 +6860,7 @@ export class Emitter {
       }
     }
     this.push(ctx, `}`);
+    this.applyJoinedNarrowKills(ctx, join);
   }
 
   /// R13d: a switch over a literal-union VALUE. Member labels become enum or
@@ -5009,6 +6878,9 @@ export class Emitter {
     this.push(ctx, `switch (${base}) {`);
     const armCtx = { ...ctx, indent: ctx.indent + 1 };
     const covered = new Set<string>();
+    // Clauses are siblings (noFallthroughCasesInSwitch; stacked labels
+    // share one body): kills join and apply after the last clause.
+    const join = new Set<string>();
     let pending: string[] = [];
     let sawDefault = false;
     let allExit = true;
@@ -5057,7 +6929,7 @@ export class Emitter {
       const armLabel = label ? [...pending, label].join(", ") : "else";
       pending = [];
       const sub = this.nestedCtx(armCtx);
-      this.emitBlockStatements(stmts, sub);
+      this.emitBlockStatements(stmts, sub, join);
       const single = sub.lines.length === 1 ? sub.lines[0].trim() : null;
       if (single && (single.startsWith("return ") || single.startsWith("break :")) && single.endsWith(";")) {
         const armText = `${armLabel} => ${single.slice(0, -1)},`;
@@ -5073,17 +6945,37 @@ export class Emitter {
     if (pending.length > 0) this.push(armCtx, `${pending.join(", ")} => {},`);
     if (!sawDefault) {
       const total = t.k === "enum" ? t.members.length : t.values.length;
+      // Coverage of the declared members, or of the scrutinee's sound
+      // coverage type (valueSwitchCoversScrutineeType — declared-type based,
+      // never the raw flow type): either proves the fallthrough arm never
+      // runs, and alwaysExits claims terminality off the second, so the
+      // emitted shape must close exactly the path the claim closed. When
+      // the judgment declines, the else completes (`else => {}`) and the
+      // terminality claim declines with it — a reached `unreachable` is
+      // never acceptable.
+      const coveredByType = covered.size === total || this.valueSwitchCoversScrutineeType(stmt);
+      // AGREEMENT: alwaysExits claims terminality off this same coverage
+      // judgment, and a claimed-terminal switch must never lower to a
+      // completable shape (`else => {}`). The claim's conditions imply
+      // coveredByType && allExit, so the disagreement cannot arise; if a
+      // future edit splits the two judgments, stop the build rather than
+      // emit an arm that completes where the claim said it cannot.
+      if (!(coveredByType && allExit) && this.alwaysExits(stmt)) {
+        this.fail(stmt, "a switch claimed always-exiting whose lowering left a completable fallthrough arm (terminality/lowering disagreement)");
+      }
       if (t.k === "numAlias") {
         // The Zig scrutinee is an integer type, so an else arm is always
         // required. With every member covered by an exiting arm the else is
         // unreachable by the TypeScript types.
-        this.push(armCtx, covered.size === total && allExit ? `else => unreachable,` : `else => {},`);
+        this.push(armCtx, coveredByType && allExit ? `else => unreachable,` : `else => {},`);
       } else if (covered.size < total) {
-        // JS: an uncovered member skips the switch.
-        this.push(armCtx, `else => {},`);
+        // JS: an uncovered member skips the switch; one the TypeScript
+        // types rule out never reaches it.
+        this.push(armCtx, coveredByType && allExit ? `else => unreachable,` : `else => {},`);
       }
     }
     this.push(ctx, `}`);
+    this.applyJoinedNarrowKills(ctx, join);
   }
 
   /// R13f: a switch over a PLAIN number/string value lowers to an if/else
@@ -5161,30 +7053,61 @@ export class Emitter {
     }
     // Trailing label-only clauses (and a trailing empty default): JS no-ops.
     const defaultArm = arms.find((a) => a.alsoDefault) ?? null;
+    // AGREEMENT: alwaysExits may claim this switch terminal (defaultless,
+    // no bound break, case labels covering the scrutinee's SOUND coverage
+    // type, every clause group exiting — the same memoized
+    // valueSwitchCoversScrutineeType judgment emitValueSwitch closes its
+    // `else => unreachable` off). The lowered chain must then close too:
+    // left open, the claim suppresses the trailing completion a value
+    // block or a returning function needs, and the chain's end — which
+    // the claim just promised is unreachable — completes into invalid
+    // Zig. The coverage judgment is sound by construction (declared type,
+    // or a flow type no nested assigner can have run against), so the
+    // closing arm is an `else` real execution never reaches.
+    const claimsTerminal = this.alwaysExits(stmt);
+    // The lowered if/else chain's arms are the switch's clauses — siblings
+    // (noFallthroughCasesInSwitch): kills join and apply after the chain.
+    const join = new Set<string>();
     let opened = false;
     for (const arm of arms) {
       if (arm.conds.length === 0) continue; // a pure default arm emits as the else below
       const cond = arm.conds.join(" or ");
       this.push(ctx, `${opened ? "} else " : ""}if (${cond}) {`);
       const sub = this.nestedCtx(ctx);
-      this.emitBlockStatements(arm.stmts, sub);
+      this.emitBlockStatements(arm.stmts, sub, join);
       ctx.lines.push(...sub.lines);
       opened = true;
     }
     if (defaultArm && opened) {
       this.push(ctx, `} else {`);
       const sub = this.nestedCtx(ctx);
-      this.emitBlockStatements(defaultArm.stmts, sub);
+      this.emitBlockStatements(defaultArm.stmts, sub, join);
       ctx.lines.push(...sub.lines);
     } else if (defaultArm) {
       // Every case label was empty-trailing (or none existed): the default
-      // body runs unconditionally.
+      // body runs unconditionally — straight-line flow, so its kills merge
+      // as usual rather than joining with the (nonexistent) other arms.
       const sub = this.childCtx(ctx);
       this.emitBlockStatements(defaultArm.stmts, sub);
       ctx.lines.push(...sub.lines);
+      this.applyJoinedNarrowKills(ctx, join);
       return;
+    } else if (opened && claimsTerminal) {
+      // The claimed-terminal defaultless chain closes its never-reached
+      // fallthrough (see the AGREEMENT note above).
+      this.push(ctx, `} else {`);
+      const sub = this.nestedCtx(ctx);
+      this.push(sub, `unreachable;`);
+      ctx.lines.push(...sub.lines);
+    } else if (claimsTerminal) {
+      // Terminal without any emitted arm cannot happen (a terminality
+      // claim needs an exiting, statement-bearing clause); if a future
+      // edit breaks that, stop the build rather than emit a shape that
+      // completes where the claim said it cannot.
+      this.fail(stmt, "a switch claimed always-exiting whose lowering emitted no arms (terminality/lowering disagreement)");
     }
     if (opened) this.push(ctx, `}`);
+    this.applyJoinedNarrowKills(ctx, join);
     if (sawDefault && !defaultArm && clauses.length > 0) {
       // A trailing empty default is a JS no-op; nothing to emit.
     }
@@ -5212,6 +7135,9 @@ export class Emitter {
       ) {
         return; // breaks inside these target them, not the switch
       }
+      // A nested function's breaks bind inside the function (the
+      // breaksToLabel boundary rule), never this switch.
+      if (ts.isFunctionLike(n)) return;
       if (ts.isBreakStatement(n) && !n.label) {
         this.fail(n, "an early `break` inside a plain-value switch clause (end the clause with a single trailing `break` or a `return`)");
       }
@@ -5340,16 +7266,42 @@ export class Emitter {
         // narrowing dies with the assignment, exactly like TS.
         const t = this.zTypeOfExprClassed(expr.left, ctx);
         const v = this.emitExpr(expr.right, ctx, t, undefined);
-        const key = normalize(expr.left);
-        const hadSubst = ctx.memberSubst.get(key);
-        if (hadSubst !== undefined) ctx.memberSubst.delete(key);
+        const key = this.narrowKey(expr.left);
+        const hadSubst = key === null ? undefined : ctx.memberSubst.get(key);
+        if (key !== null && hadSubst !== undefined) ctx.memberSubst.delete(key);
         const target = this.emitExpr(expr.left, ctx).code;
-        if (hadSubst !== undefined && hadSubst.endsWith(".?")) {
+        const empties = this.tast.emptiesOf(expr.right);
+        const mayBeEmpty = empties.null || empties.undefined;
+        if (key !== null && hadSubst !== undefined && hadSubst.endsWith(".?") && !mayBeEmpty) {
           // `.?` substitutions read the live variable, so they survive an
-          // assignment of a provably non-null value. Capture substitutions
-          // would read the stale capture — those stay dropped.
-          const empties = this.tast.emptiesOf(expr.right);
-          if (!empties.null && !empties.undefined) ctx.memberSubst.set(key, hadSubst);
+          // assignment of a provably non-null value.
+          ctx.memberSubst.set(key, hadSubst);
+        } else if (
+          key !== null &&
+          hadSubst !== undefined &&
+          !mayBeEmpty &&
+          hadSubst !== ctx.stillOptionalSubst.get(key) &&
+          this.zTypeOfExpr(expr.left, ctx).k === "optional"
+        ) {
+          // A capture substitution would read the stale capture, but tsc
+          // keeps the target narrowed through a provably non-null
+          // assignment — so the substitution TRANSITIONS to the live-slot
+          // `.?` spelling from this point onward: still narrowed, reads go
+          // through the reassigned slot. (The still-optional renames are
+          // payload aliases, not null-narrows; they have no `.?` form.)
+          ctx.memberSubst.set(key, `${target}.?`);
+        }
+        if (key !== null && !ctx.memberSubst.has(key) && (hadSubst !== undefined || mayBeEmpty)) {
+          // The narrowing died with this assignment (the value may be null
+          // again, or the substitution has no live-slot form to transition
+          // to). Record the kill so scope
+          // exits, whose snapshot restores give containment, do not
+          // resurrect it past the merge — and record it even when NO
+          // substitution was live: a construct's post-exit narrow
+          // (applyPostIfNarrow and kin) subtracts the joined kills, and
+          // tsc buries the guard-implied narrow for every possibly-null
+          // assignment an arm makes, active substitution or not.
+          ctx.narrowKilled[ctx.narrowKilled.length - 1]?.add(key);
         }
         this.push(ctx, `${target} = ${this.byteStoreNarrowed(expr, v.code, ctx)};`);
         return;
@@ -6127,7 +8079,8 @@ export class Emitter {
   }
 
   private emitExprValue(expr: ts.Expression, ctx: Ctx, expected?: ZType, nameHint?: string): Emitted {
-    const subst = ctx.memberSubst.get(normalize(expr));
+    const substKey = this.narrowKey(expr);
+    const subst = substKey === null ? undefined : ctx.memberSubst.get(substKey);
     if (subst !== undefined) return { code: subst };
 
     if (ts.isParenthesizedExpression(expr)) {
@@ -6218,8 +8171,10 @@ export class Emitter {
         }
         const baseCode = this.emitExpr(expr.expression, ctx).code;
         const cap = this.freshName(ctx, nameHint ?? "elems");
+        // Probe in a flow scope (see childCtx): a lines-free index probe
+        // processed no statements, and a lines-bearing one stops the build.
         const idxCtx = this.childCtx(ctx);
-        const idx = this.emitIndex(expr.argumentExpression, idxCtx);
+        const idx = this.withNarrowScope(ctx, "merge", () => this.emitIndex(expr.argumentExpression, idxCtx), new Set());
         if (idxCtx.lines.length > 0) {
           // JS only evaluates the index when the base is non-null; an index
           // needing its own statements cannot ride the inline capture.
@@ -6256,8 +8211,8 @@ export class Emitter {
   }
 
   private emitPropertyAccess(expr: ts.PropertyAccessExpression, ctx: Ctx): Emitted {
-    const key = normalize(expr);
-    const subst = ctx.memberSubst.get(key);
+    const key = this.narrowKey(expr);
+    const subst = key === null ? undefined : ctx.memberSubst.get(key);
     if (subst !== undefined) return { code: subst };
     // Layer-3 re-derivation of NS1017 (`Cmd.none` outside the return slot)
     // and NS1025 (its Sub mirror).
@@ -6297,8 +8252,8 @@ export class Emitter {
     if (ts.isOptionalChain(expr)) return this.emitOptionalChain(expr, ctx);
     const prop = expr.name.text;
     if (prop === "length") {
-      const lenKey = `${expr.expression.getText()}.length`;
-      const lenSubst = ctx.memberSubst.get(lenKey.replace(/\s+/g, ""));
+      const baseLenKey = this.narrowKey(expr.expression);
+      const lenSubst = baseLenKey === null ? undefined : ctx.memberSubst.get(`${baseLenKey}.length`);
       if (lenSubst !== undefined) return { code: lenSubst };
       const baseT = this.zTypeOfExpr(expr.expression, ctx);
       const base = this.emitExpr(expr.expression, ctx);
@@ -6471,8 +8426,10 @@ export class Emitter {
     if (op === ts.SyntaxKind.QuestionQuestionToken) {
       // `x ?? null` folds JS undefined and null into one empty value — which
       // is exactly what the native optional already is, so the left side IS
-      // the result (this is also how a `?.` chain value normalizes).
-      if (expr.right.kind === ts.SyntaxKind.NullKeyword) {
+      // the result (this is also how a `?.` chain value normalizes). The
+      // wrapped spellings (`x ?? (null)`) and the `x ?? undefined` flavor
+      // fold identically.
+      if (this.isEmptyLiteral(expr.right)) {
         return this.emitExpr(expr.left, ctx, expected);
       }
       // Both sides see the expected type: either may need an enum re-tag.
@@ -6677,11 +8634,33 @@ export class Emitter {
     // `x === null ? A : x` -> `x orelse A` (the `=== undefined` spelling on
     // undefined-flavored values maps the same way, per R7c).
     const missTest = this.emptyTestOf(cond);
-    if (missTest && normalize(expr.whenFalse) === normalize(missTest.target)) {
+    const missArmKey = this.narrowKey(expr.whenFalse);
+    if (missTest && missArmKey !== null && missArmKey === this.narrowKey(missTest.target)) {
       this.requireFaithfulEmptyTest(missTest.target, missTest.flavor, cond);
-      const target = this.emitExpr(missTest.target, ctx).code;
-      const alt = this.emitExpr(expr.whenTrue, ctx).code;
-      return { code: `${target} orelse ${alt}` };
+      // Probe both sides in throwaway child ctxs: the fusion only holds
+      // when the miss arm is statement-free. An arm that lowers statements
+      // (a spread literal builds its copy line by line) must not ride the
+      // orelse — those lines would land ABOVE it and run even on the
+      // non-empty path — so it falls through to the narrowed-ternary
+      // lowering below, which scopes them to the branch that runs.
+      const tT = this.zTypeOfExpr(missTest.target, ctx);
+      const armWant =
+        expected ? unwrapOptional(expected) : tT.k === "optional" ? tT.inner : undefined;
+      // Both probes bracket in a flow scope (see childCtx): discarded, they
+      // must leave no trace; taken, the miss arm's real kills join onto the
+      // post-expression state below.
+      const fuseJoin = new Set<string>();
+      const targetSub = this.childCtx(ctx);
+      const target = this.withNarrowScope(ctx, "merge", () => this.emitExpr(missTest.target, targetSub).code, fuseJoin);
+      const altSub = this.childCtx(ctx);
+      const alt = this.withNarrowScope(ctx, "merge", () => this.emitExpr(expr.whenTrue, altSub, armWant).code, fuseJoin);
+      if (altSub.lines.length === 0) {
+        // The target is evaluated exactly once; its lowered lines (if any)
+        // ride ahead of the orelse like any condition's.
+        ctx.lines.push(...targetSub.lines);
+        this.applyJoinedNarrowKills(ctx, fuseJoin);
+        return { code: `${target} orelse ${alt}` };
+      }
     }
     // `x === null ? A : <uses x>` (and the `=== undefined` find-miss
     // spelling) — the narrowing dual of the `!==` case below: TS narrows
@@ -6692,22 +8671,14 @@ export class Emitter {
       missTest &&
       (ts.isPropertyAccessExpression(missTest.target) || ts.isIdentifier(missTest.target)) &&
       // An unread capture would be a Zig unused-capture error; unread
-      // guards keep the plain comparison.
-      expr.whenFalse.getText().includes(missTest.target.getText())
+      // guards keep the plain comparison. Declaration identity for
+      // identifier targets: a wrapped read (`q!`) is still a read of q.
+      this.anyReadsTarget([expr.whenFalse], missTest.target)
     ) {
       const t = this.zTypeOfExpr(missTest.target, ctx);
       if (t.k === "optional") {
         this.requireFaithfulEmptyTest(missTest.target, missTest.flavor, cond);
-        const key = normalize(missTest.target);
-        const target = this.emitExpr(missTest.target, ctx).code;
-        const cap = this.freshName(ctx, this.narrowHint(missTest.target));
-        const saved = ctx.memberSubst.get(key);
-        ctx.memberSubst.set(key, cap);
-        const hitV = this.emitExpr(expr.whenFalse, ctx, expected ? unwrapOptional(expected) : undefined).code;
-        ctx.memberSubst.delete(key);
-        if (saved !== undefined) ctx.memberSubst.set(key, saved);
-        const missV = this.emitExpr(expr.whenTrue, ctx, expected).code;
-        return { code: `if (${target}) |${cap}| ${hitV} else ${missV}` };
+        return this.emitNarrowedTernary(expr, missTest.target, expr.whenFalse, expr.whenTrue, ctx, expected, nameHint);
       }
     }
     // `x !== null ? <uses x> : B` -> `if (x) |v| ... else B`.
@@ -6716,22 +8687,14 @@ export class Emitter {
       hitTest &&
       (ts.isPropertyAccessExpression(hitTest.target) || ts.isIdentifier(hitTest.target)) &&
       // An unread capture would be a Zig unused-capture error; unread guards
-      // keep the plain comparison.
-      expr.whenTrue.getText().includes(hitTest.target.getText())
+      // keep the plain comparison. Declaration identity for identifier
+      // targets: a wrapped read (`q!`) is still a read of q.
+      this.anyReadsTarget([expr.whenTrue], hitTest.target)
     ) {
       const t = this.zTypeOfExpr(hitTest.target, ctx);
       if (t.k === "optional") {
         this.requireFaithfulEmptyTest(hitTest.target, hitTest.flavor, cond);
-        const key = normalize(hitTest.target);
-        const target = this.emitExpr(hitTest.target, ctx).code;
-        const cap = this.freshName(ctx, this.narrowHint(hitTest.target));
-        const saved = ctx.memberSubst.get(key);
-        ctx.memberSubst.set(key, cap);
-        const thenV = this.emitExpr(expr.whenTrue, ctx, expected ? unwrapOptional(expected) : undefined).code;
-        ctx.memberSubst.delete(key);
-        if (saved !== undefined) ctx.memberSubst.set(key, saved);
-        const elseV = this.emitExpr(expr.whenFalse, ctx, expected).code;
-        return { code: `if (${target}) |${cap}| ${thenV} else ${elseV}` };
+        return this.emitNarrowedTernary(expr, hitTest.target, expr.whenTrue, expr.whenFalse, ctx, expected, nameHint);
       }
     }
     // R7d: a null-guarded chain condition — `x !== null && x.a > 0 ? x.a :
@@ -6761,38 +8724,46 @@ export class Emitter {
             this.withSubsts(guards, ctx, () =>
               this.withKindNarrows(kindGuards, ctx, () => this.emitExpr(e, sub, want).code),
             );
+          // Each arm probes and emits from the ENTRY state, kills joining
+          // after the last arm (see childCtx's isolation law).
+          const probeJoin = new Set<string>();
           const thenSub2 = this.childCtx(ctx);
-          const thenCode = isAnd
+          const thenCode = this.withNarrowScope(ctx, "merge", () => isAnd
             ? emitNarrowed(thenSub2, expr.whenTrue, narrowedExpected)
-            : this.emitExpr(expr.whenTrue, thenSub2, expected ? unwrapOptional(expected) : expected).code;
+            : this.emitExpr(expr.whenTrue, thenSub2, expected ? unwrapOptional(expected) : expected).code, probeJoin);
           const elseSub2 = this.childCtx(ctx);
-          const elseCode = isAnd
+          const elseCode = this.withNarrowScope(ctx, "merge", () => isAnd
             ? this.emitExpr(expr.whenFalse, elseSub2, expected).code
-            : emitNarrowed(elseSub2, expr.whenFalse, expected);
+            : emitNarrowed(elseSub2, expr.whenFalse, expected), probeJoin);
           if (thenSub2.lines.length === 0 && elseSub2.lines.length === 0) {
+            // The probes ARE the emission here: their kills are the join.
+            this.applyJoinedNarrowKills(ctx, probeJoin);
             return { code: `if (${condText}) ${thenCode} else ${elseCode}` };
           }
           // A branch needing lowered statements: re-emit each into a nested
           // block assigning a named temp (the R17b lowering the plain
-          // conditional path uses).
+          // conditional path uses). probeJoin is discarded with the probe
+          // lines — the re-emissions below record the real kills.
+          const chainJoin = new Set<string>();
           const t2 = expected ?? this.zTypeOfExpr(expr, ctx);
           const name = this.freshName(ctx, nameHint ?? "value");
           this.push(ctx, `var ${name}: ${this.table.zigTypeRef(t2)} = undefined;`);
           this.push(ctx, `if (${condText}) {`);
           const nt = this.nestedCtx(ctx);
-          const ntCode = isAnd
+          const ntCode = this.withNarrowScope(ctx, "merge", () => isAnd
             ? emitNarrowed(nt, expr.whenTrue, narrowedExpected)
-            : this.emitExpr(expr.whenTrue, nt, expected ? unwrapOptional(expected) : expected).code;
+            : this.emitExpr(expr.whenTrue, nt, expected ? unwrapOptional(expected) : expected).code, chainJoin);
           nt.lines.push("    ".repeat(nt.indent) + `${name} = ${ntCode};`);
           ctx.lines.push(...nt.lines);
           this.push(ctx, `} else {`);
           const ne = this.nestedCtx(ctx);
-          const neCode = isAnd
+          const neCode = this.withNarrowScope(ctx, "merge", () => isAnd
             ? this.emitExpr(expr.whenFalse, ne, expected).code
-            : emitNarrowed(ne, expr.whenFalse, expected);
+            : emitNarrowed(ne, expr.whenFalse, expected), chainJoin);
           ne.lines.push("    ".repeat(ne.indent) + `${name} = ${neCode};`);
           ctx.lines.push(...ne.lines);
           this.push(ctx, `}`);
+          this.applyJoinedNarrowKills(ctx, chainJoin);
           return { code: name };
         }
       }
@@ -6801,36 +8772,115 @@ export class Emitter {
     // R13c: kind guards narrow the branch TS narrows, in ternaries too.
     const posGuard = this.kindGuardOf(cond);
     const negGuard = this.kindGuardOf(cond, ts.SyntaxKind.ExclamationEqualsEqualsToken);
-    // Branches that need lowered statements (spreads): lower via a named temp.
+    // Branches that need lowered statements (spreads): lower via a named
+    // temp. Each arm probes and emits from the ENTRY state, kills joining
+    // after the last arm (see childCtx's isolation law).
+    const probeJoin = new Set<string>();
     const thenSub = this.childCtx(ctx);
-    const thenV = this.withKindNarrow(posGuard, ctx, () =>
+    const thenV = this.withNarrowScope(ctx, "merge", () => this.withKindNarrow(posGuard, ctx, () =>
       this.emitExpr(expr.whenTrue, thenSub, expected ? unwrapOptional(expected) : expected),
-    );
+    ), probeJoin);
     const elseSub = this.childCtx(ctx);
-    const elseV = this.withKindNarrow(negGuard, ctx, () => this.emitExpr(expr.whenFalse, elseSub, expected));
+    const elseV = this.withNarrowScope(ctx, "merge", () =>
+      this.withKindNarrow(negGuard, ctx, () => this.emitExpr(expr.whenFalse, elseSub, expected)), probeJoin);
     // The condition is evaluated exactly once, so it may lower statements
     // (array-method scans) into the surrounding ctx ahead of the branch.
     const condText = this.emitExpr(cond, ctx, { k: "bool" }).code;
     if (thenSub.lines.length === 0 && elseSub.lines.length === 0) {
+      // The probes ARE the emission here: their kills are the join.
+      this.applyJoinedNarrowKills(ctx, probeJoin);
       return { code: `if (${condText}) ${thenV.code} else ${elseV.code}` };
     }
-    // R17b-style lowering into an assignment target.
+    // R17b-style lowering into an assignment target. probeJoin is discarded
+    // with the probe lines — the re-emissions record the real kills.
+    const join = new Set<string>();
     const t = expected ?? this.zTypeOfExpr(expr, ctx);
     const name = this.freshName(ctx, nameHint ?? "value");
     this.push(ctx, `var ${name}: ${this.table.zigTypeRef(t)} = undefined;`);
     this.push(ctx, `if (${condText}) {`);
     const ts1 = this.nestedCtx(ctx);
-    const v1 = this.withKindNarrow(posGuard, ctx, () =>
+    const v1 = this.withNarrowScope(ctx, "merge", () => this.withKindNarrow(posGuard, ctx, () =>
       this.emitExpr(expr.whenTrue, ts1, expected ? unwrapOptional(expected) : expected),
-    );
+    ), join);
     ts1.lines.push("    ".repeat(ts1.indent) + `${name} = ${v1.code};`);
     ctx.lines.push(...ts1.lines);
     this.push(ctx, `} else {`);
     const ts2 = this.nestedCtx(ctx);
-    const v2 = this.withKindNarrow(negGuard, ctx, () => this.emitExpr(expr.whenFalse, ts2, expected));
+    const v2 = this.withNarrowScope(ctx, "merge", () =>
+      this.withKindNarrow(negGuard, ctx, () => this.emitExpr(expr.whenFalse, ts2, expected)), join);
     ts2.lines.push("    ".repeat(ts2.indent) + `${name} = ${v2.code};`);
     ctx.lines.push(...ts2.lines);
     this.push(ctx, `}`);
+    this.applyJoinedNarrowKills(ctx, join);
+    return { code: name };
+  }
+
+  /// R7-narrowed ternary: `if (target) |cap| <narrowed> else <other>`, with
+  /// the capture substitution active over the arm TS narrows. Arms whose
+  /// emission lowers statements (a spread literal builds its arena copy
+  /// line by line; a nested lowered ternary needs its temp) cannot ride an
+  /// if-EXPRESSION arm — the pushed lines would land above the conditional,
+  /// running BOTH arms unconditionally and reading the capture before it
+  /// binds. Those take the R17b statement lowering instead: a typed temp
+  /// assigned under a statement if/else, so exactly the taken arm's
+  /// statements run, once.
+  private emitNarrowedTernary(
+    expr: ts.ConditionalExpression,
+    targetExpr: ts.Expression,
+    narrowedArm: ts.Expression,
+    otherArm: ts.Expression,
+    ctx: Ctx,
+    expected: ZType | undefined,
+    nameHint: string | undefined,
+  ): Emitted {
+    // The callers gate on a read of the target (anyReadsTarget), which a
+    // keyless target can never satisfy — the key is present here.
+    const key = this.narrowKey(targetExpr)!;
+    const target = this.emitExpr(targetExpr, ctx).code;
+    const cap = this.freshName(ctx, this.narrowHint(targetExpr));
+    const emitNarrowedArm = (sub: Ctx): string => {
+      const saved = ctx.memberSubst.get(key);
+      ctx.memberSubst.set(key, cap);
+      const code = this.emitExpr(narrowedArm, sub, expected ? unwrapOptional(expected) : undefined).code;
+      ctx.memberSubst.delete(key);
+      if (saved !== undefined) ctx.memberSubst.set(key, saved);
+      return code;
+    };
+    // Probe both arms in throwaway child ctxs: statement-free arms keep
+    // the tight expression form (the common case — numbers, tags, field
+    // reads — stays exactly as before). Each arm probes and emits from the
+    // ENTRY state, kills joining after the last arm (see childCtx's
+    // isolation law).
+    const probeJoin = new Set<string>();
+    const narrowedSub = this.childCtx(ctx);
+    const narrowedV = this.withNarrowScope(ctx, "merge", () => emitNarrowedArm(narrowedSub), probeJoin);
+    const otherSub = this.childCtx(ctx);
+    const otherV = this.withNarrowScope(ctx, "merge", () => this.emitExpr(otherArm, otherSub, expected).code, probeJoin);
+    if (narrowedSub.lines.length === 0 && otherSub.lines.length === 0) {
+      // The probes ARE the emission here: their kills are the join.
+      this.applyJoinedNarrowKills(ctx, probeJoin);
+      return { code: `if (${target}) |${cap}| ${narrowedV} else ${otherV}` };
+    }
+    // R17b-style lowering: re-emit each arm into its own scoped block
+    // feeding the temp (the probe lines are discarded — they were never
+    // pushed to ctx, and probeJoin drops with them; the re-emissions
+    // record the real kills).
+    const join = new Set<string>();
+    const t = expected ?? this.zTypeOfExpr(expr, ctx);
+    const name = this.freshName(ctx, nameHint ?? "value");
+    this.push(ctx, `var ${name}: ${this.table.zigTypeRef(t)} = undefined;`);
+    this.push(ctx, `if (${target}) |${cap}| {`);
+    const ts1 = this.nestedCtx(ctx);
+    const v1 = this.withNarrowScope(ctx, "merge", () => emitNarrowedArm(ts1), join);
+    ts1.lines.push("    ".repeat(ts1.indent) + `${name} = ${v1};`);
+    ctx.lines.push(...ts1.lines);
+    this.push(ctx, `} else {`);
+    const ts2 = this.nestedCtx(ctx);
+    const v2 = this.withNarrowScope(ctx, "merge", () => this.emitExpr(otherArm, ts2, expected).code, join);
+    ts2.lines.push("    ".repeat(ts2.indent) + `${name} = ${v2};`);
+    ctx.lines.push(...ts2.lines);
+    this.push(ctx, `}`);
+    this.applyJoinedNarrowKills(ctx, join);
     return { code: name };
   }
 
@@ -7474,7 +9524,16 @@ export class Emitter {
     const cap = this.freshName(ctx, hint);
     const sub = this.nestedCtx(ctx);
     sub.memberSubst = new Map(ctx.memberSubst);
-    sub.memberSubst.set(normalize(recv), cap);
+    // The rewrite targets exactly this receiver NODE (emitCall re-emits
+    // it under the capture). A receiver without a canonical narrowing key
+    // still needs the rewrite, so it gets a node-scoped key — unique to
+    // the node, never a narrowing fact another occurrence could match.
+    let recvKey = this.narrowKey(recv);
+    if (recvKey === null) {
+      recvKey = `@recv#${this.narrowKeyNextId++}`;
+      this.nodeNarrowKeys.set(recv, recvKey);
+    }
+    sub.memberSubst.set(recvKey, cap);
     const inner = this.emitCall(expr, sub, undefined, nameHint);
     const resT = this.zTypeOfExprClassed(expr, sub);
     if (resT.k === "void") this.fail(expr, `optional-chain call .${callee.name.text} without a mapped value type`);
@@ -7506,11 +9565,27 @@ export class Emitter {
       );
     }
     const body = cb.body.statements;
+    // Every exit is terminal (a constant-true loop, or throws) with no
+    // `return v` anywhere: tsc types the body `never`, but the labeled
+    // value block below would carry a label no `break` uses — a Zig
+    // compile error — and a callback that can never produce its value has
+    // no useful emission anyway.
+    if (!body.some((s) => containsReturn(s))) {
+      this.fail(cb, "a callback none of whose paths returns a value (every path loops forever or throws)");
+    }
     const last = body[body.length - 1];
     const earlyReturns = body.slice(0, -1).some((s) => containsReturn(s));
     if (last && ts.isReturnStatement(last) && last.expression && !earlyReturns) {
-      this.emitBlockStatements(body.slice(0, -1), sub);
-      return this.emitExpr(last.expression, sub, expected).code;
+      // The prefix's guards narrow the trailing return's expression, so both
+      // emit inside ONE flow scope — a scope around the prefix alone would
+      // restore the maps before the expression they guard. The restore still
+      // runs before the caller continues, so the callback's narrowing never
+      // reaches its siblings in the emitted loop body.
+      const trailing = last.expression;
+      return this.withNarrowScope(sub, "merge", () => {
+        this.emitStatementList(body.slice(0, -1), sub);
+        return this.emitExpr(trailing, sub, expected).code;
+      });
     }
     const label = this.freshName(sub, "cb");
     const name = this.freshName(sub, hint);
@@ -7520,9 +9595,15 @@ export class Emitter {
     inner.cmdReturn = null;
     inner.subReturn = null;
     inner.returnType = expected;
-    this.emitBlockStatements(body, inner);
+    // The callback edge-kill stage: an arm that kills a narrow and then
+    // `return`s exits along the lowered `break :label` edge, whose
+    // destination is the continuation AFTER this value block — so its
+    // kills apply here, once the block closes, and the arm's siblings and
+    // the trailing in-callback flow keep the narrows tsc keeps there.
+    const kills = this.stagedEdgeKills(sub, "callback", null, () => this.emitBlockStatements(body, inner));
     sub.lines.push(...inner.lines);
     this.push(sub, `};`);
+    this.applyJoinedNarrowKills(sub, kills);
     return name;
   }
 
@@ -8308,8 +10389,15 @@ export class Emitter {
     const t = this.zTypeOfExprRaw(expr, ctx);
     // A narrowing substitution (null-guard capture or `.?` unwrap) proves
     // the value non-null for every use it rewrites, so the expression's
-    // effective type is the inner one.
-    if (t.k === "optional" && ctx.memberSubst.has(normalize(expr))) return t.inner;
+    // effective type is the inner one. A RENAMING substitution — a union
+    // payload capture whose field is itself optional — holds the payload
+    // as-is and must keep the optional (stillOptionalSubst records those
+    // by their exact replacement).
+    if (t.k === "optional") {
+      const key = this.narrowKey(expr);
+      const rep = key === null ? undefined : ctx.memberSubst.get(key);
+      if (key !== null && rep !== undefined && rep !== ctx.stillOptionalSubst.get(key)) return t.inner;
+    }
     return t;
   }
 
@@ -8472,19 +10560,41 @@ export class Emitter {
       return ctx.thisType ?? { k: "void" };
     }
     if (ts.isConditionalExpression(expr)) {
-      // A null branch makes the ternary's VALUE optional (`hit === undefined
-      // ? null : hit.at` is `?i64`, not `i64`) — dropping it here would type
-      // locals non-optional and break every later null test on them.
-      const trueNull = expr.whenTrue.kind === ts.SyntaxKind.NullKeyword;
-      const falseNull = expr.whenFalse.kind === ts.SyntaxKind.NullKeyword;
-      if (trueNull && falseNull) return { k: "void" };
-      if (trueNull || falseNull) {
-        const t = this.zTypeOfExpr(trueNull ? expr.whenFalse : expr.whenTrue, ctx);
+      // An empty branch — `null` or the global `undefined` — makes the
+      // ternary's VALUE optional (`hit === undefined ? null : hit.at` is
+      // `?i64`, not `i64`; `q === null ? undefined : q` stays `?P`) —
+      // dropping it here would type locals non-optional and break every
+      // later null test on them.
+      const trueEmpty = this.isEmptyLiteral(expr.whenTrue);
+      const falseEmpty = this.isEmptyLiteral(expr.whenFalse);
+      if (trueEmpty && falseEmpty) return { k: "void" };
+      if (trueEmpty || falseEmpty) {
+        const t = this.zTypeOfExpr(trueEmpty ? expr.whenFalse : expr.whenTrue, ctx);
         return t.k === "optional" || t.k === "void" ? t : { k: "optional", inner: t };
       }
+      // The condition's own null test narrows the arm that reuses the
+      // tested value, exactly as tsc types it: `q === null ? {...f} : q`
+      // and `q !== null ? q : {...f}` both VALUE as the non-optional Quote,
+      // never `?Quote` — keeping the raw optional here types an inferred
+      // local `?Quote` and its first non-optional use fails to compile.
+      // The unwrap only holds when the OTHER arm cannot contribute null:
+      // a known-optional other arm keeps the optional (its null flows
+      // through), and the empty-literal arms (`null`/`undefined`, wrapped
+      // or bare, in either position) were handled above.
+      const missTest = this.emptyTestOf(expr.condition);
+      const hitTest = this.emptyTestOf(expr.condition, ts.SyntaxKind.ExclamationEqualsEqualsToken);
+      const narrowedByCond = (arm: ts.Expression, t: ZType, other: ts.Expression): ZType => {
+        const test = arm === expr.whenFalse ? missTest : hitTest;
+        if (test === null || t.k !== "optional") return t;
+        const armKey = this.narrowKey(arm);
+        if (armKey === null || armKey !== this.narrowKey(test.target)) return t;
+        const otherT = this.zTypeOfExpr(other, ctx);
+        return otherT.k === "optional" ? t : t.inner;
+      };
       const t = this.zTypeOfExpr(expr.whenTrue, ctx);
-      if (t.k !== "void") return t;
-      return this.zTypeOfExpr(expr.whenFalse, ctx);
+      if (t.k !== "void") return narrowedByCond(expr.whenTrue, t, expr.whenFalse);
+      const f = this.zTypeOfExpr(expr.whenFalse, ctx);
+      return narrowedByCond(expr.whenFalse, f, expr.whenTrue);
     }
     if (ts.isBinaryExpression(expr)) {
       const op = expr.operatorToken.kind;
@@ -8967,8 +11077,18 @@ function escapeZigString(s: string): string {
   return out;
 }
 
-function normalize(expr: ts.Node): string {
-  return expr.getText().replace(/\s+/g, "");
+/// A block statement sitting directly in a statement list — a plain lexical
+/// block, where control always falls straight through. Everything else a
+/// Block can be (an if/else arm, a loop or callback body, a try/catch
+/// block, a labeled statement's body) is a merge context: control JOINS at
+/// its exit, so narrowing must bracket it there.
+function isPlainLexicalBlock(b: ts.Block): boolean {
+  return (
+    ts.isBlock(b.parent) ||
+    ts.isSourceFile(b.parent) ||
+    ts.isCaseClause(b.parent) ||
+    ts.isDefaultClause(b.parent)
+  );
 }
 
 function unwrapOptional(t: ZType): ZType {
