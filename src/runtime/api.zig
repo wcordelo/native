@@ -1,6 +1,7 @@
 const std = @import("std");
 const trace = @import("trace");
 const canvas = @import("canvas");
+const geometry = @import("geometry");
 const automation = @import("../automation/root.zig");
 const bridge = @import("../bridge/root.zig");
 const extensions = @import("../extensions/root.zig");
@@ -202,6 +203,38 @@ pub const CanvasWidgetContextMenuEvent = struct {
     view_label: []const u8,
     target_id: canvas.ObjectId,
     item_index: usize,
+    /// The resolved request's correlation token. When it matches a
+    /// `canvas_widget_context_menu_shown` snapshot, `UiApp` resolves the
+    /// selection against that snapshot — never the live tree, which may
+    /// have rebuilt (and reordered or re-mapped the items) while the
+    /// asynchronous menu was open. A token without a snapshot (the
+    /// automation verb's direct dispatch, which validates against the
+    /// live tree itself) resolves through the live tree.
+    token: u64 = 0,
+};
+
+/// A widget's app-declared context menu was handed to the native
+/// presenter. `UiApp` answers by snapshotting the shown items' dispatch
+/// payloads keyed by `token`: presentation is asynchronous (GTK
+/// popovers outlive event dispatch), so the selection must resolve
+/// against what the user SAW, not the tree at selection time.
+pub const CanvasWidgetContextMenuShownEvent = struct {
+    window_id: platform.WindowId = 1,
+    view_label: []const u8,
+    target_id: canvas.ObjectId,
+    token: u64,
+    item_count: usize,
+};
+
+/// The presented app-declared context menu closed WITHOUT a selection.
+/// `UiApp` answers by disarming the matching token's snapshot and
+/// releasing the presented build's pinned storage — without this
+/// notice, a dismissed menu's pin would hold that storage until the
+/// next presentation.
+pub const CanvasWidgetContextMenuDismissedEvent = struct {
+    window_id: platform.WindowId = 1,
+    view_label: []const u8,
+    token: u64,
 };
 
 /// A right/ctrl-click landed on a widget with a declared context menu,
@@ -213,6 +246,10 @@ pub const CanvasWidgetContextMenuRequestEvent = struct {
     window_id: platform.WindowId = 1,
     view_label: []const u8,
     target_id: canvas.ObjectId,
+    /// The secondary click's pointer location (view-local canvas points):
+    /// the fallback surface anchors here — like a native menu — not at a
+    /// target-widget edge.
+    point: geometry.PointF = .{},
 };
 
 /// A window the RUNTIME knew as open was closed by the platform — the
@@ -279,6 +316,8 @@ pub const Event = union(enum) {
     canvas_widget_file_drop: CanvasWidgetFileDropEvent,
     canvas_widget_drag: CanvasWidgetDragEvent,
     canvas_widget_context_menu: CanvasWidgetContextMenuEvent,
+    canvas_widget_context_menu_shown: CanvasWidgetContextMenuShownEvent,
+    canvas_widget_context_menu_dismissed: CanvasWidgetContextMenuDismissedEvent,
     canvas_widget_context_menu_request: CanvasWidgetContextMenuRequestEvent,
     canvas_widget_dismiss: CanvasWidgetDismissEvent,
     canvas_widget_context_press: CanvasWidgetContextPressEvent,
@@ -306,6 +345,8 @@ pub const Event = union(enum) {
             .canvas_widget_file_drop => "canvas_widget_file_drop",
             .canvas_widget_drag => "canvas_widget_drag",
             .canvas_widget_context_menu => "canvas_widget_context_menu",
+            .canvas_widget_context_menu_shown => "canvas_widget_context_menu_shown",
+            .canvas_widget_context_menu_dismissed => "canvas_widget_context_menu_dismissed",
             .canvas_widget_context_menu_request => "canvas_widget_context_menu_request",
             .canvas_widget_dismiss => "canvas_widget_dismiss",
             .canvas_widget_context_press => "canvas_widget_context_press",

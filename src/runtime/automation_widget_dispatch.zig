@@ -9,6 +9,7 @@ const runtime_clock = @import("clock.zig");
 const canvas_widget_runtime = @import("canvas_widget_runtime.zig");
 const runtime_canvas_widget_display = @import("canvas_widget_display.zig");
 const runtime_canvas_widget_events = @import("canvas_widget_events.zig");
+const runtime_canvas_widget_context_menu = @import("canvas_widget_context_menu.zig");
 
 const AutomationWidgetAction = automation_commands.AutomationWidgetAction;
 const AutomationWidgetTarget = automation_commands.AutomationWidgetTarget;
@@ -197,8 +198,10 @@ pub fn RuntimeAutomationWidgetDispatch(comptime Runtime: type) type {
         /// replays, and resolves through `dispatchContextMenuAction`
         /// into the widget's `.context_menu` handler. Named errors say
         /// why an invocation cannot happen: no declared menu, an index
-        /// past the declared items, a separator slot, or a disabled
-        /// item — the same items the snapshot lists per widget.
+        /// past the declared items, a separator slot, a disabled item —
+        /// the same items the snapshot lists per widget — or a dismissal
+        /// handler that presented a superseding menu, or closed the
+        /// target's view, mid-verb.
         pub fn dispatchAutomationWidgetContextMenuItem(self: *Runtime, app: runtime_api.App(Runtime), item: automation_commands.AutomationWidgetContextMenuItem) anyerror!void {
             const view_index = try automationWidgetTargetViewIndex(self, item.target);
             const node_index = self.views[view_index].canvasWidgetNodeIndexById(item.target.id) orelse return error.InvalidCommand;
@@ -209,17 +212,75 @@ pub fn RuntimeAutomationWidgetDispatch(comptime Runtime: type) type {
             if (declared.separator) return error.ContextMenuItemSeparator;
             if (!declared.enabled) return error.ContextMenuItemDisabled;
 
-            self.canvas_widget_context_menu_pending = .{
+            // This direct dispatch supersedes any pending presentation:
+            // the replacement request commits first (bookkeeping must
+            // match the state the events describe), then the superseded
+            // app menu's snapshot/pin release through the fallible
+            // dismissed notice.
+            const superseded = self.canvas_widget_context_menu_pending;
+            const token = runtime_canvas_widget_context_menu.RuntimeCanvasWidgetContextMenu(Runtime).nextContextMenuToken(self);
+            var pending: runtime_canvas_widget_context_menu.PendingCanvasWidgetContextMenu = .{
                 .window_id = self.views[view_index].window_id,
-                .token = widget.id,
+                .token = token,
+                .target_id = widget.id,
                 .kind = .app,
             };
+            pending.setViewLabel(self.views[view_index].label);
+            self.canvas_widget_context_menu_pending = pending;
+            // The notice keeps its place in the event order (the old
+            // menu's dismissal before the successor's outcome, like
+            // every superseding path), but its error must not skip the
+            // synthetic selection below: unlike a presented menu, whose
+            // outcome the platform delivers later regardless, this
+            // dispatch is the armed request's ONLY outcome. No error
+            // path may leave a pending token with no presented menu and
+            // no delivered outcome — so capture the notice's error,
+            // dispatch the selection, and re-raise after (the dispatch
+            // ring already recorded it, matching `.propagate` semantics
+            // elsewhere: bookkeeping settles first, the error still
+            // surfaces).
+            const notice = runtime_canvas_widget_context_menu.RuntimeCanvasWidgetContextMenu(Runtime).notifySupersededPending(self, app, superseded);
+            // The notice ran arbitrary app code that may itself have
+            // PRESENTED a menu, superseding this verb's freshly armed
+            // request: the synthetic action below would fail the token
+            // gate and the command would report success without ever
+            // dispatching its item. Refuse by name instead — the
+            // handler's successor menu is on the glass with its own
+            // pending request, so nothing is orphaned.
+            const still_armed = if (self.canvas_widget_context_menu_pending) |current| current.token == token else false;
+            if (!still_armed) {
+                try notice;
+                return error.ContextMenuSuperseded;
+            }
+            // The notice may instead have CLOSED the verb's target view:
+            // the armed request can never resolve (the action dispatch
+            // would clear the token, fail its view lookup, and silently
+            // drop the selection). Disarm it and refuse by name — never
+            // a silent success, never an orphaned token.
+            const view_open = view_check: {
+                for (self.views[0..self.view_count]) |*view| {
+                    if (view.open and view.window_id == pending.window_id and std.mem.eql(u8, view.label, pending.viewLabel())) break :view_check true;
+                }
+                break :view_check false;
+            };
+            if (!view_open) {
+                self.canvas_widget_context_menu_pending = null;
+                try notice;
+                return error.ContextMenuViewClosed;
+            }
+            // The synthetic event names its view from the request's own
+            // bounded copy, never `self.views[view_index]` re-read here:
+            // the notice above ran arbitrary app code that may have
+            // closed views and compacted their indices — a stale index
+            // would dispatch this target against another view, or strand
+            // the pending token behind the action gate's window check.
             try self.dispatchPlatformEvent(app, .{ .context_menu_action = .{
-                .window_id = self.views[view_index].window_id,
-                .view_label = self.views[view_index].label,
-                .token = widget.id,
+                .window_id = pending.window_id,
+                .view_label = pending.viewLabel(),
+                .token = token,
                 .item_id = @intCast(item.item_index + 1),
             } });
+            try notice;
         }
 
         /// Where a pointer verb lands on a widget: the control's aim

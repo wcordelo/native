@@ -191,8 +191,9 @@ test "a declared context menu presents as the anchored fallback surface on prese
     const harness = try core.TestHarness().create(std.testing.allocator, .{ .size = geometry.SizeF.init(400, 300) });
     defer harness.destroy(std.testing.allocator);
     harness.null_platform.gpu_surfaces = true;
-    // A host without a native menu presenter (Linux GTK, Windows Win32
-    // today). Service pointers are captured at init, so re-capture.
+    // A host without a native menu presenter (the mobile toolkit hosts
+    // and embed hosts today). Service pointers are captured at init, so
+    // re-capture.
     harness.null_platform.context_menus = false;
     harness.runtime.options.platform = harness.null_platform.platform();
 
@@ -259,6 +260,65 @@ test "a declared context menu presents as the anchored fallback surface on prese
     try harness.runtime.dispatchAutomationCommand(app, invoke_complete);
     try std.testing.expectEqual(@as(u32, 1), app_state.model.completed);
     try std.testing.expect(app_state.tree.?.context_menu_fallback == null);
+}
+
+test "the fallback surface mounts at the click point, not the wide row's edge" {
+    const harness = try core.TestHarness().create(std.testing.allocator, .{ .size = geometry.SizeF.init(400, 300) });
+    defer harness.destroy(std.testing.allocator);
+    harness.null_platform.gpu_surfaces = true;
+    harness.null_platform.context_menus = false;
+    harness.runtime.options.platform = harness.null_platform.platform();
+
+    const app_state = try std.testing.allocator.create(TaskRowApp);
+    defer std.testing.allocator.destroy(app_state);
+    app_state.* = TaskRowApp.init(std.heap.page_allocator, .{}, taskRowOptions());
+    defer app_state.deinit();
+    const app = app_state.app();
+    try harness.start(app);
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_frame = .{
+        .label = canvas_label,
+        .size = geometry.SizeF.init(400, 300),
+        .scale_factor = 2,
+        .frame_index = 1,
+        .timestamp_ns = 1_000_000,
+        .nonblank = true,
+    } });
+    try std.testing.expect(app_state.installed);
+
+    // Secondary-click the full-width row far from its left edge: the
+    // click point rides the request into the mounted surface's anchor.
+    const layout_before = try harness.runtime.canvasWidgetLayout(1, canvas_label);
+    const row_id = findWidgetIdByText(app_state.tree.?, .list_item, "Task").?;
+    const row_frame = blk: {
+        for (layout_before.nodes) |node| {
+            if (node.widget.id == row_id) break :blk node.frame;
+        }
+        return error.TestUnexpectedResult;
+    };
+    const click = geometry.PointF.init(row_frame.x + 150, row_frame.y + row_frame.height / 2);
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_down,
+        .button = 1,
+        .x = click.x,
+        .y = click.y,
+        .timestamp_ns = 1_000_000_000,
+    } });
+
+    try std.testing.expect(app_state.tree.?.context_menu_fallback != null);
+    const layout = try harness.runtime.canvasWidgetLayout(1, canvas_label);
+    const surface_frame = blk: {
+        for (layout.nodes) |node| {
+            if (node.widget.kind == .dropdown_menu) break :blk node.frame;
+        }
+        return error.TestUnexpectedResult;
+    };
+    // The surface corner sits at the pointer (space permits below and to
+    // the right here), NOT at the row's bottom-left corner.
+    try std.testing.expectEqual(click.x, surface_frame.x);
+    try std.testing.expectEqual(click.y, surface_frame.y);
+    try std.testing.expect(surface_frame.x != row_frame.x);
 }
 
 // ------------------------------------------------- scroll event fixture
@@ -3346,7 +3406,9 @@ test "ui app dispatches native context menu selections as typed messages" {
         .timestamp_ns = 2_000_000,
     } });
     try std.testing.expectEqual(@as(usize, 1), harness.null_platform.context_menu_request_count);
-    try std.testing.expectEqual(@as(u64, row_id), harness.null_platform.context_menu_token);
+    // The request carries a minted per-request token (opaque to the
+    // platform, which only echoes it back on the action event).
+    try std.testing.expect(harness.null_platform.context_menu_token != 0);
     try std.testing.expectEqual(@as(usize, 3), harness.null_platform.contextMenuItems().len);
 
     // Selecting "Delete" (item id 3 = third declared entry) dispatches
@@ -3354,11 +3416,1002 @@ test "ui app dispatches native context menu selections as typed messages" {
     try harness.runtime.dispatchPlatformEvent(app, .{ .context_menu_action = .{
         .window_id = 1,
         .view_label = canvas_label,
-        .token = row_id,
+        .token = harness.null_platform.context_menu_token,
         .item_id = 3,
     } });
     try std.testing.expectEqual(@as(u32, 1), app_state.model.deleted);
     try std.testing.expectEqual(@as(u32, 0), app_state.model.completed);
+}
+
+// --------------------------------------- context-menu rebuild-race fixture
+
+const ReorderModel = struct {
+    reordered: bool = false,
+    completed: u32 = 0,
+    deleted: u32 = 0,
+};
+
+const ReorderMsg = union(enum) {
+    reorder,
+    complete,
+    delete,
+};
+
+const ReorderApp = ui_app_model.UiApp(ReorderModel, ReorderMsg);
+
+fn reorderUpdate(model: *ReorderModel, msg: ReorderMsg) void {
+    switch (msg) {
+        .reorder => model.reordered = true,
+        .complete => model.completed += 1,
+        .delete => model.deleted += 1,
+    }
+}
+
+fn reorderView(ui: *ReorderApp.Ui, model: *const ReorderModel) ReorderApp.Ui.Node {
+    // The conditional-menu shape the rebuild race exists for: an effect
+    // (here a button press standing in for a timer) reorders the row's
+    // declared items while the OS menu is open.
+    const before = [_]ReorderApp.Ui.ContextMenuItem{
+        .{ .label = "Complete", .msg = .complete },
+        .{ .separator = true },
+        .{ .label = "Delete", .msg = .delete },
+    };
+    const after = [_]ReorderApp.Ui.ContextMenuItem{
+        .{ .label = "Delete", .msg = .delete },
+        .{ .separator = true },
+        .{ .label = "Complete", .msg = .complete },
+    };
+    return ui.column(.{ .gap = 8, .padding = 12 }, .{
+        ui.el(.list_item, .{
+            .text = "Ship the release",
+            .context_menu = if (model.reordered) &after else &before,
+        }, .{}),
+        ui.button(.{ .on_press = .reorder }, "Reorder"),
+    });
+}
+
+test "a rebuild while the native menu is open never redirects the visible selection" {
+    const harness = try core.TestHarness().create(std.testing.allocator, .{ .size = geometry.SizeF.init(400, 300) });
+    defer harness.destroy(std.testing.allocator);
+    harness.null_platform.gpu_surfaces = true;
+
+    const app_state = try std.testing.allocator.create(ReorderApp);
+    defer std.testing.allocator.destroy(app_state);
+    app_state.* = ReorderApp.init(std.heap.page_allocator, .{}, .{
+        .name = "ui-app-context-menu-race",
+        .scene = counter_scene,
+        .canvas_label = canvas_label,
+        .update = reorderUpdate,
+        .view = reorderView,
+    });
+    defer app_state.deinit();
+    const app = app_state.app();
+    try harness.start(app);
+
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_frame = .{
+        .label = canvas_label,
+        .size = geometry.SizeF.init(400, 300),
+        .scale_factor = 2,
+        .frame_index = 1,
+        .timestamp_ns = 1_000_000,
+        .nonblank = true,
+    } });
+    try std.testing.expect(app_state.installed);
+
+    // Right-click the row: the platform presents [Complete, —, Delete]
+    // and the pending request is armed with a minted token.
+    const row_id = findIn(app_state.tree.?.root, .list_item, "Ship the release").?;
+    const layout = try harness.runtime.canvasWidgetLayout(1, canvas_label);
+    var row_frame: geometry.RectF = .{};
+    var button_frame: geometry.RectF = .{};
+    for (layout.nodes) |node| {
+        if (node.widget.id == row_id) row_frame = node.frame;
+        if (node.widget.kind == .button) button_frame = node.frame;
+    }
+    try std.testing.expect(!row_frame.isEmpty());
+    try std.testing.expect(!button_frame.isEmpty());
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_down,
+        .button = 1,
+        .x = row_frame.x + 4,
+        .y = row_frame.y + 4,
+        .timestamp_ns = 2_000_000,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), harness.null_platform.context_menu_request_count);
+    const shown_token = harness.null_platform.context_menu_token;
+    const recorded = harness.null_platform.contextMenuItems();
+    try std.testing.expectEqualStrings("Complete", recorded[0].label);
+
+    // The GTK popover is asynchronous: while it is open, a press
+    // rebuilds the tree with the items REVERSED (a timer or effect
+    // reordering conditional items behaves identically).
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_down,
+        .x = button_frame.x + 4,
+        .y = button_frame.y + 4,
+        .timestamp_ns = 3_000_000,
+    } });
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_up,
+        .x = button_frame.x + 4,
+        .y = button_frame.y + 4,
+        .timestamp_ns = 4_000_000,
+    } });
+    try std.testing.expect(app_state.model.reordered);
+
+    // The user picks the FIRST visible item — the menu still shows
+    // "Complete" there. Resolution must come from the presented menu's
+    // snapshot, never the rebuilt live tree (whose index 0 is now
+    // "Delete").
+    try harness.runtime.dispatchPlatformEvent(app, .{ .context_menu_action = .{
+        .window_id = 1,
+        .view_label = canvas_label,
+        .token = shown_token,
+        .item_id = 1,
+    } });
+    try std.testing.expectEqual(@as(u32, 0), app_state.model.deleted);
+    try std.testing.expectEqual(@as(u32, 1), app_state.model.completed);
+
+    // Dismissal after a rebuild stays inert, and the consumed token
+    // cannot resolve again.
+    try harness.runtime.dispatchPlatformEvent(app, .{ .context_menu_action = .{
+        .window_id = 1,
+        .view_label = canvas_label,
+        .token = shown_token,
+        .item_id = 0,
+    } });
+    try harness.runtime.dispatchPlatformEvent(app, .{ .context_menu_action = .{
+        .window_id = 1,
+        .view_label = canvas_label,
+        .token = shown_token,
+        .item_id = 1,
+    } });
+    try std.testing.expectEqual(@as(u32, 1), app_state.model.completed);
+    try std.testing.expectEqual(@as(u32, 0), app_state.model.deleted);
+}
+
+// ------------------------------------- context-menu arena-payload fixture
+
+const ArenaPayloadModel = struct {
+    generation: u32 = 0,
+    sends: u32 = 0,
+    received_storage: [64]u8 = undefined,
+    received_len: usize = 0,
+    /// Address of the dispatched payload's first byte: the pinned-arena
+    /// design promises the ORIGINAL slice, so native selection carries
+    /// the same pointer identity the fallback surface and the
+    /// automation verb dispatch.
+    received_ptr: usize = 0,
+};
+
+const ArenaPayloadMsg = union(enum) {
+    bump,
+    send: []const u8,
+    /// The error-union shape: pinning is shape-blind (the ORIGINAL
+    /// value dispatches), so a payload behind an error union needs no
+    /// special handling — this arm proves it end to end.
+    send_result: error{Overloaded}![]const u8,
+};
+
+const ArenaPayloadApp = ui_app_model.UiApp(ArenaPayloadModel, ArenaPayloadMsg);
+
+fn arenaPayloadUpdate(model: *ArenaPayloadModel, msg: ArenaPayloadMsg) void {
+    switch (msg) {
+        .bump => model.generation += 1,
+        .send => |bytes| recordArenaPayload(model, bytes),
+        .send_result => |result| recordArenaPayload(model, result catch &.{}),
+    }
+}
+
+fn recordArenaPayload(model: *ArenaPayloadModel, bytes: []const u8) void {
+    const len = @min(bytes.len, model.received_storage.len);
+    @memcpy(model.received_storage[0..len], bytes[0..len]);
+    model.received_len = len;
+    model.received_ptr = @intFromPtr(bytes.ptr);
+    model.sends += 1;
+}
+
+fn arenaPayloadView(ui: *ArenaPayloadApp.Ui, model: *const ArenaPayloadModel) ArenaPayloadApp.Ui.Node {
+    // Keep the build arena a single address-stable chunk: the first
+    // allocation of every build is a slab larger than the whole build,
+    // filled with sentinel bytes, so every later allocation lands at
+    // the same offset build after build. Under the pinned-arena design
+    // nothing here is ever overwritten while the menu is open; if the
+    // pin regresses, this determinism makes the failure exact — the
+    // reset arena rewrites the payload's storage with the next
+    // generation's bytes.
+    const slab = ui.arena.alloc(u8, 256 * 1024) catch @panic("arena slab");
+    @memset(slab, '!');
+    // The documented Msg-payload shape: a display string formatted into
+    // the BUILD ARENA and carried by a context-menu item's Msg. Every
+    // build formats a same-length, generation-stamped payload, so after
+    // the arena reset the next build's bytes land exactly where a stale
+    // present-time slice points.
+    const payload = ui.fmt("payload-gen-{d:0>4}", .{model.generation});
+    return ui.column(.{ .gap = 8, .padding = 12 }, .{
+        ui.el(.list_item, .{
+            .text = "Ship the release",
+            .context_menu = &.{
+                .{ .label = "Send", .msg = .{ .send = payload } },
+                .{ .label = "Send result", .msg = .{ .send_result = payload } },
+            },
+        }, .{}),
+        ui.button(.{ .on_press = .bump }, "Rebuild"),
+        ui.el(.text_field, .{ .text = "notes", .width = 200 }, .{}),
+    });
+}
+
+test "context menu selection dispatches the original arena payload across rebuilds (pinned build arena)" {
+    const harness = try core.TestHarness().create(std.testing.allocator, .{ .size = geometry.SizeF.init(400, 300) });
+    defer harness.destroy(std.testing.allocator);
+    harness.null_platform.gpu_surfaces = true;
+
+    // The leak-detecting backing allocator is part of the assertion:
+    // every snapshot copy must be freed — superseded, dismissed, or
+    // still armed at teardown.
+    const app_state = try std.testing.allocator.create(ArenaPayloadApp);
+    defer std.testing.allocator.destroy(app_state);
+    app_state.* = ArenaPayloadApp.init(std.testing.allocator, .{}, .{
+        .name = "ui-app-context-menu-arena",
+        .scene = counter_scene,
+        .canvas_label = canvas_label,
+        .update = arenaPayloadUpdate,
+        .view = arenaPayloadView,
+    });
+    defer app_state.deinit();
+    const app = app_state.app();
+    try harness.start(app);
+
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_frame = .{
+        .label = canvas_label,
+        .size = geometry.SizeF.init(400, 300),
+        .scale_factor = 2,
+        .frame_index = 1,
+        .timestamp_ns = 1_000_000,
+        .nonblank = true,
+    } });
+    try std.testing.expect(app_state.installed);
+
+    const row_id = findIn(app_state.tree.?.root, .list_item, "Ship the release").?;
+    const layout = try harness.runtime.canvasWidgetLayout(1, canvas_label);
+    var row_frame: geometry.RectF = .{};
+    var button_frame: geometry.RectF = .{};
+    for (layout.nodes) |node| {
+        if (node.widget.id == row_id) row_frame = node.frame;
+        if (node.widget.kind == .button) button_frame = node.frame;
+    }
+    try std.testing.expect(!row_frame.isEmpty());
+    try std.testing.expect(!button_frame.isEmpty());
+
+    // Round 1 — the plain const slice. Present the menu (GTK popovers
+    // are asynchronous: it stays on the glass while the app keeps
+    // rebuilding underneath), then rebuild TWICE: view builds
+    // double-buffer two arenas, so the second rebuild resets the arena
+    // the presented tree was built in and overwrites the payload's
+    // storage with the next generation's bytes.
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_down,
+        .button = 1,
+        .x = row_frame.x + 4,
+        .y = row_frame.y + 4,
+        .timestamp_ns = 2_000_000,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), harness.null_platform.context_menu_request_count);
+    const shown_token = harness.null_platform.context_menu_token;
+    try std.testing.expect(shown_token != 0);
+    // The presented build's arena is pinned while the request is
+    // pending, so the eventual dispatch is the ORIGINAL Msg value —
+    // capture its payload address at present time.
+    try std.testing.expect(app_state.context_menu_pin != null);
+    const presented_send = app_state.tree.?.msgForContextMenu(row_id, 0).?;
+    const presented_send_ptr = @intFromPtr(presented_send.send.ptr);
+
+    for (0..2) |press| {
+        const base: u64 = 3_000_000 + @as(u64, @intCast(press)) * 2_000_000;
+        try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+            .window_id = 1,
+            .label = canvas_label,
+            .kind = .pointer_down,
+            .x = button_frame.x + 4,
+            .y = button_frame.y + 4,
+            .timestamp_ns = base,
+        } });
+        try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+            .window_id = 1,
+            .label = canvas_label,
+            .kind = .pointer_up,
+            .x = button_frame.x + 4,
+            .y = button_frame.y + 4,
+            .timestamp_ns = base + 1_000_000,
+        } });
+    }
+    try std.testing.expectEqual(@as(u32, 2), app_state.model.generation);
+
+    // The user picks "Send": the dispatched Msg must carry the bytes
+    // the user SAW at present time, never whatever the reset build
+    // arena holds at selection time.
+    try harness.runtime.dispatchPlatformEvent(app, .{ .context_menu_action = .{
+        .window_id = 1,
+        .view_label = canvas_label,
+        .token = shown_token,
+        .item_id = 1,
+    } });
+    try std.testing.expectEqual(@as(u32, 1), app_state.model.sends);
+    try std.testing.expectEqualStrings("payload-gen-0000", app_state.model.received_storage[0..app_state.model.received_len]);
+    // Pointer identity: the dispatched slice IS the presented slice —
+    // the same value the fallback surface or the automation verb would
+    // have dispatched — and the resolved request released the pin.
+    try std.testing.expectEqual(presented_send_ptr, app_state.model.received_ptr);
+    try std.testing.expect(app_state.context_menu_pin == null);
+
+    // Round 2 — the error-union payload: pinning is shape-blind, so
+    // the same two-rebuild race dispatches the presented generation's
+    // bytes (and address), not the arena's current ones.
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_down,
+        .button = 1,
+        .x = row_frame.x + 4,
+        .y = row_frame.y + 4,
+        .timestamp_ns = 8_000_000,
+    } });
+    try std.testing.expectEqual(@as(usize, 2), harness.null_platform.context_menu_request_count);
+    const result_token = harness.null_platform.context_menu_token;
+    try std.testing.expect(result_token != shown_token);
+    const presented_result = app_state.tree.?.msgForContextMenu(row_id, 1).?;
+    const presented_result_ptr = @intFromPtr((presented_result.send_result catch unreachable).ptr);
+
+    for (0..2) |press| {
+        const base: u64 = 9_000_000 + @as(u64, @intCast(press)) * 2_000_000;
+        try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+            .window_id = 1,
+            .label = canvas_label,
+            .kind = .pointer_down,
+            .x = button_frame.x + 4,
+            .y = button_frame.y + 4,
+            .timestamp_ns = base,
+        } });
+        try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+            .window_id = 1,
+            .label = canvas_label,
+            .kind = .pointer_up,
+            .x = button_frame.x + 4,
+            .y = button_frame.y + 4,
+            .timestamp_ns = base + 1_000_000,
+        } });
+    }
+    try std.testing.expectEqual(@as(u32, 4), app_state.model.generation);
+
+    try harness.runtime.dispatchPlatformEvent(app, .{ .context_menu_action = .{
+        .window_id = 1,
+        .view_label = canvas_label,
+        .token = result_token,
+        .item_id = 2,
+    } });
+    try std.testing.expectEqual(@as(u32, 2), app_state.model.sends);
+    try std.testing.expectEqualStrings("payload-gen-0002", app_state.model.received_storage[0..app_state.model.received_len]);
+    try std.testing.expectEqual(presented_result_ptr, app_state.model.received_ptr);
+    try std.testing.expect(app_state.context_menu_pin == null);
+
+    // Round 3 — supersession and dismissal: a re-presented menu
+    // replaces the previous snapshot and pin, and the runtime's
+    // dismissed notice releases the successor's — an abandoned menu
+    // must not exempt an arena generation from resets forever.
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_down,
+        .button = 1,
+        .x = row_frame.x + 4,
+        .y = row_frame.y + 4,
+        .timestamp_ns = 15_000_000,
+    } });
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_down,
+        .button = 1,
+        .x = row_frame.x + 4,
+        .y = row_frame.y + 4,
+        .timestamp_ns = 16_000_000,
+    } });
+    try std.testing.expectEqual(@as(usize, 4), harness.null_platform.context_menu_request_count);
+    const superseding_token = harness.null_platform.context_menu_token;
+    try std.testing.expect(app_state.context_menu_pin != null);
+    try harness.runtime.dispatchPlatformEvent(app, .{ .context_menu_action = .{
+        .window_id = 1,
+        .view_label = canvas_label,
+        .token = superseding_token,
+        .item_id = 0,
+    } });
+    try std.testing.expectEqual(@as(u32, 2), app_state.model.sends);
+    try std.testing.expect(app_state.context_menu_pin == null);
+}
+
+test "any superseding presentation or dispatch releases the app menu's snapshot and pin" {
+    const harness = try core.TestHarness().create(std.testing.allocator, .{ .size = geometry.SizeF.init(400, 300) });
+    defer harness.destroy(std.testing.allocator);
+    harness.null_platform.gpu_surfaces = true;
+
+    const app_state = try std.testing.allocator.create(ArenaPayloadApp);
+    defer std.testing.allocator.destroy(app_state);
+    app_state.* = ArenaPayloadApp.init(std.testing.allocator, .{}, .{
+        .name = "ui-app-context-menu-supersede",
+        .scene = counter_scene,
+        .canvas_label = canvas_label,
+        .update = arenaPayloadUpdate,
+        .view = arenaPayloadView,
+    });
+    defer app_state.deinit();
+    const app = app_state.app();
+    try harness.start(app);
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_frame = .{
+        .label = canvas_label,
+        .size = geometry.SizeF.init(400, 300),
+        .scale_factor = 2,
+        .frame_index = 1,
+        .timestamp_ns = 1_000_000,
+        .nonblank = true,
+    } });
+    try std.testing.expect(app_state.installed);
+
+    const row_id = findIn(app_state.tree.?.root, .list_item, "Ship the release").?;
+    const layout = try harness.runtime.canvasWidgetLayout(1, canvas_label);
+    var row_frame: geometry.RectF = .{};
+    var field_frame: geometry.RectF = .{};
+    for (layout.nodes) |node| {
+        if (node.widget.id == row_id) row_frame = node.frame;
+        if (node.widget.kind == .text_field) field_frame = node.frame;
+    }
+    try std.testing.expect(!row_frame.isEmpty());
+    try std.testing.expect(!field_frame.isEmpty());
+
+    // Present the row's app menu: snapshot armed, build generation
+    // pinned.
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_down,
+        .button = 1,
+        .x = row_frame.x + 4,
+        .y = row_frame.y + 4,
+        .timestamp_ns = 2_000_000,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), harness.null_platform.context_menu_request_count);
+    try std.testing.expect(app_state.context_menu_pin != null);
+    try std.testing.expect(app_state.context_menu_shown_token != 0);
+
+    // A right-click on the editable field presents the DEFAULT edit
+    // menu — a different pending kind, but it supersedes the app
+    // menu's request all the same, so the snapshot and pin release.
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_down,
+        .button = 1,
+        .x = field_frame.x + 4,
+        .y = field_frame.y + 4,
+        .timestamp_ns = 3_000_000,
+    } });
+    try std.testing.expectEqual(@as(usize, 2), harness.null_platform.context_menu_request_count);
+    try std.testing.expect(app_state.context_menu_pin == null);
+    try std.testing.expectEqual(@as(u64, 0), app_state.context_menu_shown_token);
+
+    // Re-present the app menu, then drive the item through the
+    // automation verb: its direct dispatch supersedes the open
+    // presentation (releasing snapshot and pin) and resolves against
+    // the live tree.
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_down,
+        .button = 1,
+        .x = row_frame.x + 4,
+        .y = row_frame.y + 4,
+        .timestamp_ns = 4_000_000,
+    } });
+    try std.testing.expectEqual(@as(usize, 3), harness.null_platform.context_menu_request_count);
+    try std.testing.expect(app_state.context_menu_pin != null);
+    var command_buffer: [96]u8 = undefined;
+    const command = try std.fmt.bufPrint(&command_buffer, "widget-context-menu {s} {d} 0", .{ canvas_label, row_id });
+    try harness.runtime.dispatchAutomationCommand(app, command);
+    try std.testing.expectEqual(@as(u32, 1), app_state.model.sends);
+    try std.testing.expectEqualStrings("payload-gen-0000", app_state.model.received_storage[0..app_state.model.received_len]);
+    try std.testing.expect(app_state.context_menu_pin == null);
+    try std.testing.expectEqual(@as(u64, 0), app_state.context_menu_shown_token);
+}
+
+test "rebuilds under an open menu stay bounded at two trees" {
+    const harness = try core.TestHarness().create(std.testing.allocator, .{ .size = geometry.SizeF.init(400, 300) });
+    defer harness.destroy(std.testing.allocator);
+    harness.null_platform.gpu_surfaces = true;
+
+    const app_state = try std.testing.allocator.create(ArenaPayloadApp);
+    defer std.testing.allocator.destroy(app_state);
+    app_state.* = ArenaPayloadApp.init(std.testing.allocator, .{}, .{
+        .name = "ui-app-context-menu-bounded",
+        .scene = counter_scene,
+        .canvas_label = canvas_label,
+        .update = arenaPayloadUpdate,
+        .view = arenaPayloadView,
+    });
+    defer app_state.deinit();
+    const app = app_state.app();
+    try harness.start(app);
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_frame = .{
+        .label = canvas_label,
+        .size = geometry.SizeF.init(400, 300),
+        .scale_factor = 2,
+        .frame_index = 1,
+        .timestamp_ns = 1_000_000,
+        .nonblank = true,
+    } });
+
+    const row_id = findIn(app_state.tree.?.root, .list_item, "Ship the release").?;
+    const layout = try harness.runtime.canvasWidgetLayout(1, canvas_label);
+    var row_frame: geometry.RectF = .{};
+    var button_frame: geometry.RectF = .{};
+    for (layout.nodes) |node| {
+        if (node.widget.id == row_id) row_frame = node.frame;
+        if (node.widget.kind == .button) button_frame = node.frame;
+    }
+
+    // Present the menu and hold it open for the whole test.
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_down,
+        .button = 1,
+        .x = row_frame.x + 4,
+        .y = row_frame.y + 4,
+        .timestamp_ns = 2_000_000,
+    } });
+    try std.testing.expect(app_state.context_menu_pin != null);
+
+    const press = struct {
+        fn once(h: *core.TestHarness(), a: core.App, frame: geometry.RectF, base: u64) !void {
+            try h.runtime.dispatchPlatformEvent(a, .{ .gpu_surface_input = .{
+                .window_id = 1,
+                .label = canvas_label,
+                .kind = .pointer_down,
+                .x = frame.x + 4,
+                .y = frame.y + 4,
+                .timestamp_ns = base,
+            } });
+            try h.runtime.dispatchPlatformEvent(a, .{ .gpu_surface_input = .{
+                .window_id = 1,
+                .label = canvas_label,
+                .kind = .pointer_up,
+                .x = frame.x + 4,
+                .y = frame.y + 4,
+                .timestamp_ns = base + 1_000_000,
+            } });
+        }
+    };
+
+    // Warm the partner arena's capacity to its fixed point, then drive
+    // many more rebuilds: while the pin freezes the presented
+    // generation, every rebuild routes through the partner with its
+    // normal reset cadence, so total build storage holds at exactly
+    // two trees — capacity must not grow with the rebuild count.
+    for (0..4) |index| {
+        try press.once(harness, app, button_frame, 3_000_000 + @as(u64, @intCast(index)) * 2_000_000);
+    }
+    const warmed = app_state.arenas[0].queryCapacity() + app_state.arenas[1].queryCapacity();
+    for (0..10) |index| {
+        try press.once(harness, app, button_frame, 20_000_000 + @as(u64, @intCast(index)) * 2_000_000);
+    }
+    try std.testing.expectEqual(@as(u32, 14), app_state.model.generation);
+    try std.testing.expectEqual(warmed, app_state.arenas[0].queryCapacity() + app_state.arenas[1].queryCapacity());
+    try std.testing.expect(app_state.context_menu_pin != null);
+}
+
+// ---------------------------------------- pinned rebuild failure recovery
+
+const PinFailureModel = struct {
+    row_count: usize = 4,
+    sends: u32 = 0,
+    received_storage: [64]u8 = undefined,
+    received_len: usize = 0,
+
+    pub fn rows(model: *const PinFailureModel, arena: std.mem.Allocator) []const usize {
+        const out = arena.alloc(usize, model.row_count) catch return &.{};
+        for (out, 0..) |*slot, index| slot.* = index;
+        return out;
+    }
+};
+
+const PinFailureMsg = union(enum) {
+    set_rows: usize,
+    send: []const u8,
+};
+
+const PinFailureApp = ui_app_model.UiApp(PinFailureModel, PinFailureMsg);
+
+fn pinFailureUpdate(model: *PinFailureModel, msg: PinFailureMsg) void {
+    switch (msg) {
+        .set_rows => |count| model.row_count = count,
+        .send => |bytes| {
+            const len = @min(bytes.len, model.received_storage.len);
+            @memcpy(model.received_storage[0..len], bytes[0..len]);
+            model.received_len = len;
+            model.sends += 1;
+        },
+    }
+}
+
+fn pinFailureKey(index: *const usize) canvas.UiKey {
+    return canvas.uiKey(@as(u64, index.*));
+}
+
+fn pinFailureRow(ui: *PinFailureApp.Ui, index: *const usize) PinFailureApp.Ui.Node {
+    return ui.text(.{}, ui.fmt("Row {d}", .{index.*}));
+}
+
+fn pinFailureView(ui: *PinFailureApp.Ui, model: *const PinFailureModel) PinFailureApp.Ui.Node {
+    const payload = ui.fmt("payload-rows-{d:0>4}", .{model.row_count});
+    return ui.column(.{ .gap = 2, .padding = 12 }, .{
+        ui.el(.list_item, .{
+            .text = "Ship the release",
+            .context_menu = &.{
+                .{ .label = "Send", .msg = .{ .send = payload } },
+                // The poison item: its update pushes the roster far past
+                // the per-view widget budget, so the selection's rebuild
+                // fails.
+                .{ .label = "Grow", .msg = .{ .set_rows = core.max_canvas_widget_nodes_per_view + 40 } },
+            },
+        }, .{}),
+        ui.button(.{ .on_press = PinFailureMsg{ .set_rows = 4 } }, "Shrink"),
+        ui.column(.{ .gap = 2 }, ui.each(model.rows(ui.arena), pinFailureKey, pinFailureRow)),
+    });
+}
+
+test "a failing rebuild routed into the live arena under an open menu drops the tree instead of dangling" {
+    // The failing layout warns through std.log (the teaching diagnostic
+    // under test would otherwise fail the build runner's stderr check).
+    const saved_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = saved_log_level;
+
+    const harness = try core.TestHarness().create(std.testing.allocator, .{ .size = geometry.SizeF.init(400, 2000) });
+    defer harness.destroy(std.testing.allocator);
+    harness.null_platform.gpu_surfaces = true;
+
+    const app_state = try std.testing.allocator.create(PinFailureApp);
+    defer std.testing.allocator.destroy(app_state);
+    app_state.* = PinFailureApp.init(std.heap.page_allocator, .{}, .{
+        .name = "ui-app-pin-rebuild-failure",
+        .scene = counter_scene,
+        .canvas_label = canvas_label,
+        .update = pinFailureUpdate,
+        .view = pinFailureView,
+    });
+    defer app_state.deinit();
+    const app = app_state.app();
+    try harness.start(app);
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_frame = .{
+        .label = canvas_label,
+        .size = geometry.SizeF.init(400, 2000),
+        .scale_factor = 1,
+        .frame_index = 1,
+        .timestamp_ns = 1_000_000,
+        .nonblank = true,
+    } });
+    try std.testing.expect(app_state.installed);
+
+    const row_id = findIn(app_state.tree.?.root, .list_item, "Ship the release").?;
+    const layout = try harness.runtime.canvasWidgetLayout(1, canvas_label);
+    const row_frame = layout.findById(row_id).?.frame;
+
+    // Present the row's menu: the presenting build's arena is pinned.
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_down,
+        .button = 1,
+        .x = row_frame.x + 4,
+        .y = row_frame.y + 4,
+        .timestamp_ns = 2_000_000,
+    } });
+    const shown_token = harness.null_platform.context_menu_token;
+    try std.testing.expect(app_state.context_menu_pin != null);
+
+    // One successful rebuild under the open menu lands in the partner
+    // arena; from here every rebuild reuses that LIVE side (the pinned
+    // side stays frozen).
+    try app_state.dispatch(&harness.runtime, 1, .{ .set_rows = 5 });
+    try std.testing.expect(app_state.tree != null);
+
+    // The over-budget rebuild resets the live arena and fails mid-pass
+    // under the harness's `.propagate` policy: the tree reference must
+    // drop with it — a handler table dangling into reset, partially
+    // rewritten storage must never stay dispatchable.
+    try std.testing.expectError(
+        error.WidgetLayoutListFull,
+        app_state.dispatch(&harness.runtime, 1, .{ .set_rows = core.max_canvas_widget_nodes_per_view + 40 }),
+    );
+    try std.testing.expect(app_state.tree == null);
+
+    // Recovery: the next in-budget rebuild restores the tree.
+    try app_state.dispatch(&harness.runtime, 1, .{ .set_rows = 4 });
+    try std.testing.expect(app_state.tree != null);
+
+    // The pinned presentation rode through the failure untouched: the
+    // user's pick still dispatches the presented generation's payload
+    // from the frozen arena.
+    try std.testing.expect(app_state.context_menu_pin != null);
+    try harness.runtime.dispatchPlatformEvent(app, .{ .context_menu_action = .{
+        .window_id = 1,
+        .view_label = canvas_label,
+        .token = shown_token,
+        .item_id = 1,
+    } });
+    try std.testing.expectEqual(@as(u32, 1), app_state.model.sends);
+    try std.testing.expectEqualStrings("payload-rows-0004", app_state.model.received_storage[0..app_state.model.received_len]);
+    try std.testing.expect(app_state.context_menu_pin == null);
+}
+
+test "dismissing the menu after a failed pinned rebuild restores the dropped tree" {
+    // The failing layout warns through std.log (the teaching diagnostic
+    // under test would otherwise fail the build runner's stderr check).
+    const saved_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = saved_log_level;
+
+    const harness = try core.TestHarness().create(std.testing.allocator, .{ .size = geometry.SizeF.init(400, 2000) });
+    defer harness.destroy(std.testing.allocator);
+    harness.null_platform.gpu_surfaces = true;
+
+    const app_state = try std.testing.allocator.create(PinFailureApp);
+    defer std.testing.allocator.destroy(app_state);
+    app_state.* = PinFailureApp.init(std.heap.page_allocator, .{}, .{
+        .name = "ui-app-pin-dismiss-restore",
+        .scene = counter_scene,
+        .canvas_label = canvas_label,
+        .update = pinFailureUpdate,
+        .view = pinFailureView,
+    });
+    defer app_state.deinit();
+    const app = app_state.app();
+    try harness.start(app);
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_frame = .{
+        .label = canvas_label,
+        .size = geometry.SizeF.init(400, 2000),
+        .scale_factor = 1,
+        .frame_index = 1,
+        .timestamp_ns = 1_000_000,
+        .nonblank = true,
+    } });
+    try std.testing.expect(app_state.installed);
+
+    const row_id = findIn(app_state.tree.?.root, .list_item, "Ship the release").?;
+    const layout = try harness.runtime.canvasWidgetLayout(1, canvas_label);
+    const row_frame = layout.findById(row_id).?.frame;
+
+    // Present the menu, rebuild once under it, then fail the rebuild
+    // routed into the live arena: the tree reference drops.
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_down,
+        .button = 1,
+        .x = row_frame.x + 4,
+        .y = row_frame.y + 4,
+        .timestamp_ns = 2_000_000,
+    } });
+    const shown_token = harness.null_platform.context_menu_token;
+    try app_state.dispatch(&harness.runtime, 1, .{ .set_rows = 5 });
+    try std.testing.expectError(
+        error.WidgetLayoutListFull,
+        app_state.dispatch(&harness.runtime, 1, .{ .set_rows = core.max_canvas_widget_nodes_per_view + 40 }),
+    );
+    try std.testing.expect(app_state.tree == null);
+
+    // The model comes back in budget WITHOUT a Msg (an effect result,
+    // or the failing state was transient) — no rebuild has run yet.
+    app_state.model.row_count = 4;
+
+    // The user dismisses the open menu. Its resolution dispatches no
+    // Msg, so the release itself must restore the dropped tree —
+    // otherwise every handler no-ops (no tree, no Msgs) until an
+    // unrelated resize or effect happens to rebuild.
+    try harness.runtime.dispatchPlatformEvent(app, .{ .context_menu_action = .{
+        .window_id = 1,
+        .view_label = canvas_label,
+        .token = shown_token,
+        .item_id = 0,
+    } });
+    try std.testing.expect(app_state.tree != null);
+    try std.testing.expect(app_state.context_menu_pin == null);
+}
+
+test "a selection whose update breaks the build budget keeps the live tree and input alive" {
+    // The failing layout warns through std.log (the teaching diagnostic
+    // under test would otherwise fail the build runner's stderr check).
+    const saved_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = saved_log_level;
+
+    const harness = try core.TestHarness().create(std.testing.allocator, .{ .size = geometry.SizeF.init(400, 2000) });
+    defer harness.destroy(std.testing.allocator);
+    harness.null_platform.gpu_surfaces = true;
+
+    const app_state = try std.testing.allocator.create(PinFailureApp);
+    defer std.testing.allocator.destroy(app_state);
+    app_state.* = PinFailureApp.init(std.heap.page_allocator, .{}, .{
+        .name = "ui-app-pin-selection-failure",
+        .scene = counter_scene,
+        .canvas_label = canvas_label,
+        .update = pinFailureUpdate,
+        .view = pinFailureView,
+    });
+    defer app_state.deinit();
+    const app = app_state.app();
+    try harness.start(app);
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_frame = .{
+        .label = canvas_label,
+        .size = geometry.SizeF.init(400, 2000),
+        .scale_factor = 1,
+        .frame_index = 1,
+        .timestamp_ns = 1_000_000,
+        .nonblank = true,
+    } });
+    try std.testing.expect(app_state.installed);
+
+    const row_id = findIn(app_state.tree.?.root, .list_item, "Ship the release").?;
+    const layout = try harness.runtime.canvasWidgetLayout(1, canvas_label);
+    const row_frame = layout.findById(row_id).?.frame;
+
+    // Present the menu, then rebuild once under it: the live tree moves
+    // to the partner arena, adjacent to the pinned generation.
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_down,
+        .button = 1,
+        .x = row_frame.x + 4,
+        .y = row_frame.y + 4,
+        .timestamp_ns = 2_000_000,
+    } });
+    const shown_token = harness.null_platform.context_menu_token;
+    try app_state.dispatch(&harness.runtime, 1, .{ .set_rows = 5 });
+
+    // Selecting "Grow" dispatches from the snapshot; its update pushes
+    // the model past the widget budget and the rebuild fails. The pin
+    // released before the dispatch, so the rebuild routed into the
+    // partner arena — the LIVE tree survives the failure and input
+    // keeps working (production's degraded contract; the harness's
+    // `.propagate` policy surfaces the recorded error here).
+    try std.testing.expectError(error.WidgetLayoutListFull, harness.runtime.dispatchPlatformEvent(app, .{ .context_menu_action = .{
+        .window_id = 1,
+        .view_label = canvas_label,
+        .token = shown_token,
+        .item_id = 2,
+    } }));
+    try std.testing.expect(app_state.tree != null);
+    try std.testing.expect(app_state.context_menu_pin == null);
+
+    // The app's own controls recover the model THROUGH the surviving
+    // handler table: a real pointer click on "Shrink" (still routed by
+    // the retained layout of the last successful build) dispatches its
+    // Msg and the next rebuild succeeds.
+    const retained = try harness.runtime.canvasWidgetLayout(1, canvas_label);
+    var button_frame: geometry.RectF = .{};
+    for (retained.nodes) |node| {
+        if (node.widget.kind == .button) button_frame = node.frame;
+    }
+    try std.testing.expect(!button_frame.isEmpty());
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_down,
+        .x = button_frame.x + 4,
+        .y = button_frame.y + 4,
+        .timestamp_ns = 3_000_000,
+    } });
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_up,
+        .x = button_frame.x + 4,
+        .y = button_frame.y + 4,
+        .timestamp_ns = 4_000_000,
+    } });
+    try std.testing.expectEqual(@as(usize, 4), app_state.model.row_count);
+    try std.testing.expect(app_state.tree != null);
+}
+
+test "a menu presented while the tree is dropped still resolves once the model recovers" {
+    // The failing layout warns through std.log (the teaching diagnostic
+    // under test would otherwise fail the build runner's stderr check).
+    const saved_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = saved_log_level;
+
+    const harness = try core.TestHarness().create(std.testing.allocator, .{ .size = geometry.SizeF.init(400, 2000) });
+    defer harness.destroy(std.testing.allocator);
+    harness.null_platform.gpu_surfaces = true;
+
+    const app_state = try std.testing.allocator.create(PinFailureApp);
+    defer std.testing.allocator.destroy(app_state);
+    app_state.* = PinFailureApp.init(std.heap.page_allocator, .{}, .{
+        .name = "ui-app-pin-shown-recovery",
+        .scene = counter_scene,
+        .canvas_label = canvas_label,
+        .update = pinFailureUpdate,
+        .view = pinFailureView,
+    });
+    defer app_state.deinit();
+    const app = app_state.app();
+    try harness.start(app);
+    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_frame = .{
+        .label = canvas_label,
+        .size = geometry.SizeF.init(400, 2000),
+        .scale_factor = 1,
+        .frame_index = 1,
+        .timestamp_ns = 1_000_000,
+        .nonblank = true,
+    } });
+    try std.testing.expect(app_state.installed);
+
+    const row_id = findIn(app_state.tree.?.root, .list_item, "Ship the release").?;
+    const layout = try harness.runtime.canvasWidgetLayout(1, canvas_label);
+    const row_frame = layout.findById(row_id).?.frame;
+    const right_click: zero_platform.Event = .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .pointer_down,
+        .button = 1,
+        .x = row_frame.x + 4,
+        .y = row_frame.y + 4,
+        .timestamp_ns = 2_000_000,
+    } };
+
+    // Menu A is open when a rebuild routed into the live arena fails:
+    // the tree drops while the model stays unbuildable.
+    try harness.runtime.dispatchPlatformEvent(app, right_click);
+    try app_state.dispatch(&harness.runtime, 1, .{ .set_rows = 5 });
+    try std.testing.expectError(
+        error.WidgetLayoutListFull,
+        app_state.dispatch(&harness.runtime, 1, .{ .set_rows = core.max_canvas_widget_nodes_per_view + 40 }),
+    );
+    try std.testing.expect(app_state.tree == null);
+
+    // Superseding A with menu B: A's dismissal releases the snapshot
+    // and its restore attempt fails loudly (the model is still past the
+    // budget under the harness's `.propagate` policy). B commits
+    // runtime-side, but no snapshot could arm for it.
+    try std.testing.expectError(
+        error.WidgetLayoutListFull,
+        harness.runtime.dispatchPlatformEvent(app, right_click),
+    );
+    const b_token = harness.null_platform.context_menu_token;
+    try std.testing.expectEqual(@as(usize, 2), harness.null_platform.context_menu_request_count);
+
+    // The model recovers WITHOUT a rebuild (an effect result fixed it).
+    app_state.model.row_count = 4;
+
+    // Selecting from menu B resolves snapshot-less: the handler
+    // restores the dropped tree before resolving, so the selection
+    // dispatches its Msg instead of falling through a null tree.
+    try harness.runtime.dispatchPlatformEvent(app, .{ .context_menu_action = .{
+        .window_id = 1,
+        .view_label = canvas_label,
+        .token = b_token,
+        .item_id = 1,
+    } });
+    try std.testing.expectEqual(@as(u32, 1), app_state.model.sends);
+    try std.testing.expectEqualStrings("payload-rows-0004", app_state.model.received_storage[0..app_state.model.received_len]);
+    try std.testing.expect(app_state.tree != null);
 }
 
 // ------------------------------------------------- press fall-through fixture

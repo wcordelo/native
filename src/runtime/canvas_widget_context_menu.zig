@@ -40,8 +40,35 @@ pub const default_item_select_all: u32 = 4;
 
 pub const PendingCanvasWidgetContextMenu = struct {
     window_id: platform.WindowId = 1,
+    /// Per-request generation, minted when the request is armed and
+    /// echoed back by the platform on the action event. Menus can be
+    /// superseded while a dismissal is still in flight (GTK tears the
+    /// old popover down one loop turn after the successor presents), so
+    /// the token must name the REQUEST, not the widget: a stale token's
+    /// event must never resolve — or clear — a successor's pending
+    /// request, even when both menus target the same widget.
     token: u64 = 0,
+    /// The widget the menu was presented for (selections dispatch
+    /// against it; the token above no longer doubles as its id).
+    target_id: canvas.ObjectId = 0,
     kind: Kind = .app,
+    /// The presented view's label, copied into the request so a
+    /// superseded menu's dismissal notice can still name its canvas —
+    /// the view may be gone (window closed) by the time the request
+    /// resolves, and per-canvas menu state in a raw app needs the
+    /// correlation.
+    view_label_storage: [platform.max_view_label_bytes]u8 = undefined,
+    view_label_len: usize = 0,
+
+    pub fn viewLabel(self: *const PendingCanvasWidgetContextMenu) []const u8 {
+        return self.view_label_storage[0..self.view_label_len];
+    }
+
+    pub fn setViewLabel(self: *PendingCanvasWidgetContextMenu, label: []const u8) void {
+        const len = @min(label.len, self.view_label_storage.len);
+        @memcpy(self.view_label_storage[0..len], label[0..len]);
+        self.view_label_len = len;
+    }
 
     pub const Kind = enum {
         app,
@@ -106,16 +133,49 @@ pub fn RuntimeCanvasWidgetContextMenu(comptime Runtime: type) type {
                             .separator = item.separator,
                         };
                     }
-                    if (try showMenu(self, index, .{
+                    switch (try showMenu(self, app, index, .{
                         .window_id = input_event.window_id,
-                        .token = widget.id,
+                        .target_id = widget.id,
                         .kind = .app,
-                    }, point, items[0..count])) return;
+                    }, point, items[0..count])) {
+                        .shown => |shown| {
+                            // Presentation is asynchronous on GTK (and the
+                            // snapshot is harmless where the presenter blocks):
+                            // tell the app WHAT is on the glass, keyed by the
+                            // request's token, so the eventual selection
+                            // resolves against the shown items' dispatch
+                            // payloads — never a tree that rebuilt (reordering
+                            // or re-mapping items) while the menu was open.
+                            // The event's fields come from the returned request
+                            // itself, never `self.views[index]` re-read here:
+                            // `showMenu` ran the superseded menu's dismissal
+                            // notice — arbitrary app code that may have closed
+                            // views and compacted their indices.
+                            try self.dispatchEvent(app, .{ .canvas_widget_context_menu_shown = .{
+                                .window_id = shown.window_id,
+                                .view_label = shown.viewLabel(),
+                                .target_id = widget.id,
+                                .token = shown.token,
+                                .item_count = count,
+                            } });
+                            return;
+                        },
+                        // The dismissal notice's app code presented a
+                        // successor that replaced this request (the
+                        // successor already announced itself), or closed
+                        // the presenting view outright: announce NOTHING
+                        // here — and never the anchored fallback, which
+                        // would mount a surface under the successor's
+                        // native menu or on a view that no longer exists.
+                        .superseded, .view_closed => return,
+                        .refused => {},
+                    }
                 }
                 try self.dispatchEvent(app, .{ .canvas_widget_context_menu_request = .{
                     .window_id = input_event.window_id,
                     .view_label = self.views[index].label,
                     .target_id = widget.id,
+                    .point = point,
                 } });
                 return;
             }
@@ -135,9 +195,9 @@ pub fn RuntimeCanvasWidgetContextMenu(comptime Runtime: type) type {
                     items[2] = .{ .id = default_item_paste, .label = "Paste" };
                     items[3] = .{ .separator = true };
                     items[4] = .{ .id = default_item_select_all, .label = "Select All", .enabled = widget.text.len > 0 };
-                    _ = try showMenu(self, index, .{
+                    _ = try showMenu(self, app, index, .{
                         .window_id = input_event.window_id,
-                        .token = target.id,
+                        .target_id = target.id,
                         .kind = .edit_text,
                     }, point, items[0..5]);
                     return;
@@ -148,9 +208,9 @@ pub fn RuntimeCanvasWidgetContextMenu(comptime Runtime: type) type {
                 if (selected_id != 0 and selected_id == target.id) {
                     if (!has_presenter) return;
                     items[0] = .{ .id = default_item_copy, .label = "Copy" };
-                    _ = try showMenu(self, index, .{
+                    _ = try showMenu(self, app, index, .{
                         .window_id = input_event.window_id,
-                        .token = target.id,
+                        .target_id = target.id,
                         .kind = .static_copy,
                     }, point, items[0..1]);
                     return;
@@ -167,11 +227,66 @@ pub fn RuntimeCanvasWidgetContextMenu(comptime Runtime: type) type {
             } });
         }
 
-        /// Returns whether the platform accepted the presentation; a
-        /// refusal is not fatal (app-declared menus fall back to the
-        /// anchored canvas surface, the zero-code defaults degrade to
-        /// their keyboard paths).
-        fn showMenu(self: *Runtime, view_index: usize, pending: PendingCanvasWidgetContextMenu, point: geometry.PointF, items: []const platform.ContextMenuItem) anyerror!bool {
+        /// A NEW presentation or dispatch replaced the pending request.
+        /// An app menu's pending has state beyond the runtime's gate —
+        /// UiApp holds a token-keyed snapshot and a pinned build
+        /// generation for it, and a raw app may track per-canvas menu
+        /// state — and the superseded token can never arrive (the gate
+        /// would swallow it), so tell the app the old menu is gone,
+        /// named by the view it was presented on. This runs for EVERY
+        /// superseding kind: app over app, a default edit/copy menu
+        /// over an app menu, and the automation verb's direct dispatch.
+        /// Call it AFTER committing the replacement pending: the notice
+        /// dispatch is fallible, and the runtime's bookkeeping must
+        /// already match the menu the platform accepted.
+        pub fn notifySupersededPending(self: *Runtime, app: runtime_api.App(Runtime), superseded: ?PendingCanvasWidgetContextMenu) anyerror!void {
+            const pending = superseded orelse return;
+            if (pending.kind != .app) return;
+            try self.dispatchEvent(app, .{ .canvas_widget_context_menu_dismissed = .{
+                .window_id = pending.window_id,
+                .view_label = pending.viewLabel(),
+                .token = pending.token,
+            } });
+        }
+
+        const ShowMenuOutcome = union(enum) {
+            /// The platform accepted and the request is still the
+            /// pending truth: announce it
+            /// (`canvas_widget_context_menu_shown`).
+            shown: PendingCanvasWidgetContextMenu,
+            /// The platform refused — not fatal (app-declared menus
+            /// fall back to the anchored canvas surface, the zero-code
+            /// defaults degrade to their keyboard paths). The old
+            /// pending (and its popover, if any) is still the truth.
+            refused,
+            /// The platform accepted, but the superseded menu's
+            /// dismissal notice synchronously presented a SUCCESSOR
+            /// that replaced this request. The successor is the truth
+            /// and already announced itself: announcing this request
+            /// late would overwrite the successor's snapshot with a
+            /// menu whose token the action gate no longer accepts,
+            /// stranding the successor on live-tree resolution and the
+            /// stale pin unreleased.
+            superseded,
+            /// The platform accepted, but the superseded menu's
+            /// dismissal notice CLOSED the presenting view. The request
+            /// can never resolve (its action would clear the token and
+            /// silently drop on the view lookup — or never arrive at
+            /// all if the window died with it), so it is disarmed here:
+            /// announce nothing, mount nothing.
+            view_closed,
+        };
+
+        /// Present `request` natively. Callers must describe the
+        /// presented menu from the returned `.shown` request, not from
+        /// `self.views[view_index]`: the superseded menu's dismissal
+        /// notice below runs arbitrary app code that may close views
+        /// and compact their indices — or present a successor menu
+        /// (see `ShowMenuOutcome.superseded`).
+        fn showMenu(self: *Runtime, app: runtime_api.App(Runtime), view_index: usize, request: PendingCanvasWidgetContextMenu, point: geometry.PointF, items: []const platform.ContextMenuItem) anyerror!ShowMenuOutcome {
+            var pending = request;
+            pending.token = nextContextMenuToken(self);
+            pending.setViewLabel(self.views[view_index].label);
             self.options.platform.services.showContextMenu(.{
                 .window_id = pending.window_id,
                 .view_label = self.views[view_index].label,
@@ -182,10 +297,25 @@ pub fn RuntimeCanvasWidgetContextMenu(comptime Runtime: type) type {
                 if (err != error.UnsupportedService) {
                     context_menu_log.warn("context menu presentation failed: {s}", .{@errorName(err)});
                 }
-                return false;
+                // Presentation refused: nothing superseded — the old
+                // pending (and its popover, if any) is still the truth.
+                return .refused;
             };
+            // The platform accepted: commit the replacement BEFORE the
+            // fallible superseded-notice dispatch, so the runtime's
+            // expected token always matches the menu on the glass.
+            const superseded = self.canvas_widget_context_menu_pending;
             self.canvas_widget_context_menu_pending = pending;
-            return true;
+            try notifySupersededPending(self, app, superseded);
+            const still_armed = if (self.canvas_widget_context_menu_pending) |current| current.token == pending.token else false;
+            if (!still_armed) return .superseded;
+            // Still armed, but the notice may have closed the view the
+            // menu presented on: disarm the unresolvable request.
+            if (runtimeFindViewIndex(self, pending.window_id, pending.viewLabel()) == null) {
+                self.canvas_widget_context_menu_pending = null;
+                return .view_closed;
+            }
+            return .{ .shown = pending };
         }
 
         /// The platform reported the menu outcome: resolve the pending
@@ -195,25 +325,59 @@ pub fn RuntimeCanvasWidgetContextMenu(comptime Runtime: type) type {
         /// directly through the same paths the keyboard shortcuts use.
         pub fn dispatchContextMenuAction(self: *Runtime, app: runtime_api.App(Runtime), event: platform.ContextMenuActionEvent) anyerror!void {
             const pending = self.canvas_widget_context_menu_pending orelse return;
-            self.canvas_widget_context_menu_pending = null;
+            // Token gate BEFORE the clear: an event carrying a stale
+            // token belongs to a superseded request (its deferred
+            // dismissal outlived a re-click's replacement menu) and is
+            // swallowed — it must never clear, let alone resolve, the
+            // successor's pending request. Windows cannot produce a
+            // stale event (TrackPopupMenu blocks the loop thread and
+            // emits inline from the moved-out request, so a second
+            // request never dispatches mid-menu); macOS cannot either
+            // (each presentation block captures its own token and
+            // popUpMenuPositioningItem's nested tracking loop blocks
+            // the main queue); GTK popovers are asynchronous and CAN.
             if (pending.window_id != event.window_id or pending.token != event.token) return;
-            if (event.item_id == 0) return; // dismissed
+            self.canvas_widget_context_menu_pending = null;
+            if (event.item_id == 0) {
+                // Dismissed without a selection. App menus tell the app:
+                // UiApp disarms the token's presented-items snapshot and
+                // releases the build storage pinned under it.
+                if (pending.kind == .app) {
+                    try self.dispatchEvent(app, .{ .canvas_widget_context_menu_dismissed = .{
+                        .window_id = event.window_id,
+                        .view_label = event.view_label,
+                        .token = pending.token,
+                    } });
+                }
+                return;
+            }
             const index = runtimeFindViewIndex(self, event.window_id, event.view_label) orelse return;
 
             switch (pending.kind) {
                 .app => try self.dispatchEvent(app, .{ .canvas_widget_context_menu = .{
                     .window_id = event.window_id,
                     .view_label = self.views[index].label,
-                    .target_id = pending.token,
+                    .target_id = pending.target_id,
                     .item_index = event.item_id - 1,
+                    // The shown snapshot's key: UiApp resolves the
+                    // selection from what was presented under this token.
+                    .token = pending.token,
                 } }),
-                .edit_text => try applyDefaultEditAction(self, app, index, pending.token, event.item_id),
+                .edit_text => try applyDefaultEditAction(self, app, index, pending.target_id, event.item_id),
                 .static_copy => {
                     if (event.item_id != default_item_copy) return;
                     const text = self.views[index].canvasWidgetCopyText() orelse return;
                     self.writeClipboard(text) catch return;
                 },
             }
+        }
+
+        /// Mint the next per-request correlation token. Never zero, so a
+        /// zero-token event can never match an armed request.
+        pub fn nextContextMenuToken(self: *Runtime) u64 {
+            self.canvas_widget_context_menu_token +%= 1;
+            if (self.canvas_widget_context_menu_token == 0) self.canvas_widget_context_menu_token = 1;
+            return self.canvas_widget_context_menu_token;
         }
 
         fn applyDefaultEditAction(self: *Runtime, app: runtime_api.App(Runtime), view_index: usize, target_id: canvas.ObjectId, item_id: u32) anyerror!void {

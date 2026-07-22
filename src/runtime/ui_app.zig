@@ -875,6 +875,41 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         context_menu_fallback_window_id: platform.WindowId = 1,
         context_menu_fallback_label_storage: [app_manifest.max_view_label_bytes]u8 = undefined,
         context_menu_fallback_label_len: usize = 0,
+        /// The secondary click's pointer location from the request event
+        /// (view-local canvas points): threaded to `Ui.finalize` so the
+        /// synthesized surface anchors at the click, not the target's
+        /// edge.
+        context_menu_fallback_point: geometry.PointF = .{},
+        /// The presented native menu's selection snapshot: the per-item
+        /// dispatch Msgs captured (by value) at present time, keyed by
+        /// the request's token. Native presentation is asynchronous (a
+        /// GTK popover outlives its presenting dispatch), so a rebuild
+        /// while the menu is open — a timer reordering conditional
+        /// items, an effect re-mapping captured messages — must never
+        /// redirect the visible selection: `handleContextMenu` resolves
+        /// a token-matching selection HERE, never through the live
+        /// tree. 0 = no snapshot armed (then the live tree is the shown
+        /// menu: the fallback surface and the automation verb both
+        /// validate against it directly).
+        context_menu_shown_token: u64 = 0,
+        context_menu_shown_count: usize = 0,
+        context_menu_shown_msgs: [platform.max_context_menu_items]?MsgT = undefined,
+        /// The build-arena generation PINNED under the presented menu.
+        /// A snapshot Msg may carry build-arena slices (the documented
+        /// payload shape — `ui.fmt` strings and allocator-form
+        /// bindings), and the open menu outlives the arena pair's
+        /// two-build lifetime, so while the snapshot is armed the arena
+        /// that built the presented tree is exempt from the rebuild
+        /// reset: rebuilds landing on its turn allocate on top instead
+        /// (growth is bounded by the menu's open span; the next reset
+        /// after release reclaims it). The dispatched Msg is therefore
+        /// the ORIGINAL value — same bytes, same pointers as the
+        /// fallback surface and the automation verb dispatch. Released
+        /// on selection, dismissal (the runtime's dismissed notice),
+        /// supersession by the next presentation, and teardown. Markup
+        /// payloads need nothing more: they are path-only — model
+        /// storage or this same build arena, never document literals.
+        context_menu_pin: ?ContextMenuPin = null,
         /// The windowed virtual lists the LAST build declared
         /// (`Ui.virtualList` records): scroll events on these regions
         /// re-derive the view even without an app `on_scroll` binding,
@@ -1359,12 +1394,25 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 }
             }
             var tokens = runtime.tokensWithTextMeasure(self.effectiveTokens());
-            const next_index = self.arena_index ^ 1;
+            const next_index = self.contextMenuRebuildIndex(null, self.arena_index);
             // Widget layout is inset by the runtime's viewport chrome
             // (safe areas + keyboard on mobile, zero on desktop); the
             // canvas itself stays surface-sized so chrome and the clear
             // color still paint edge to edge under notches and bars.
             const bounds = geometry.RectF.fromSize(self.canvas_size).deflate(self.layoutViewportInsets(runtime, window_id));
+            // Under an open menu's pin, consecutive rebuilds route into
+            // the LIVE tree's arena (`contextMenuRebuildIndex` freezes
+            // the pinned side): the pass below resets that arena, so a
+            // failure anywhere before the assignments would leave
+            // `self.tree` dangling into reset, partially rewritten
+            // storage. Drop the reference instead — handlers go quiet
+            // until the next successful rebuild, and a stale-arena Msg
+            // can never dispatch. The pinned snapshot is untouched: the
+            // presented menu still resolves.
+            var live_tree_reset = next_index == self.arena_index;
+            errdefer if (live_tree_reset) {
+                self.tree = null;
+            };
             var built = try self.buildLayoutPass(runtime, window_id, bounds, tokens, next_index);
             // Window-control clearance is a one-retry pass like the
             // virtual-window coverage retry inside the build: only when
@@ -1396,6 +1444,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
 
             self.tree = tree;
             self.arena_index = next_index;
+            live_tree_reset = false;
             // The fallback menu's target vanished from this build (the
             // model dropped the row, or its menu emptied): the open state
             // has nothing to present, so it closes.
@@ -1439,6 +1488,9 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             var layout: canvas.WidgetLayoutTree = undefined;
             var pass: usize = 0;
             while (true) {
+                // `contextMenuRebuildIndex` never routes a rebuild into
+                // the pinned generation, so the reset is unconditional.
+                std.debug.assert(if (self.context_menu_pin) |pin| pin.window_id != null or pin.arena_index != next_index else true);
                 _ = self.arenas[next_index].reset(.retain_capacity);
                 var ui = Ui.init(self.arenas[next_index].allocator());
                 ui.virtual_window_context = @ptrCast(&window_source);
@@ -1446,6 +1498,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 ui.virtual_extent_context = @ptrCast(self);
                 ui.virtual_extent_source = virtualExtentResolve;
                 ui.context_menu_fallback_target = self.contextMenuFallbackTargetForLabel(self.options.canvas_label);
+                if (ui.context_menu_fallback_target != 0) ui.context_menu_fallback_point = self.context_menu_fallback_point;
                 self.armUiFragmentHost(&ui);
                 if (comptime features.runtime_markup) {
                     if (self.markup_view != null and runtime.options.automation != null) {
@@ -1990,6 +2043,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// the model already knows).
         fn closeWindowSlot(self: *Self, runtime: *Runtime, index: usize) void {
             const window_id = self.window_slots[index].window_id;
+            self.releaseContextMenuSnapshotForWindow(window_id);
             const last = self.window_slot_count - 1;
             var removed = self.window_slots[index];
             self.window_slots[index] = self.window_slots[last];
@@ -2005,6 +2059,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         /// Drop a slot whose runtime window is ALREADY gone (the user
         /// closed it): bookkeeping only, no platform call.
         fn forgetWindowSlot(self: *Self, index: usize) ?MsgT {
+            self.releaseContextMenuSnapshotForWindow(self.window_slots[index].window_id);
             const on_close = self.window_slots[index].on_close;
             const last = self.window_slot_count - 1;
             var removed = self.window_slots[index];
@@ -2030,8 +2085,16 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
         fn rebuildWindowSlot(self: *Self, runtime: *Runtime, slot: *WindowSlot) anyerror!void {
             if (self.options.window_view == null) return;
             var tokens = runtime.tokensWithTextMeasure(self.slotEffectiveTokens(slot));
-            const next_index = slot.arena_index ^ 1;
+            const next_index = self.contextMenuRebuildIndex(slot.window_id, slot.arena_index);
             const bounds = geometry.RectF.fromSize(slot.canvas_size).deflate(runtime.viewportInsetsForWindow(slot.window_id));
+            // Same live-arena guard as the main canvas rebuild: under
+            // this window's pin the build routes into the slot's LIVE
+            // arena, so a failing pass must drop `slot.tree` rather
+            // than leave it dangling into the reset storage.
+            var live_tree_reset = next_index == slot.arena_index;
+            errdefer if (live_tree_reset) {
+                slot.tree = null;
+            };
             var built = try self.buildWindowSlotPass(slot, bounds, tokens, next_index);
             // The same one-retry window-control clearance the main
             // rebuild runs (see `rebuild`): a secondary hidden-inset
@@ -2051,6 +2114,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             }
             slot.tree = tree;
             slot.arena_index = next_index;
+            live_tree_reset = false;
             // Same close-on-vanish rule as the main canvas rebuild.
             if (self.contextMenuFallbackTargetForLabel(slot.canvasLabel()) != 0 and tree.context_menu_fallback == null) {
                 self.clearContextMenuFallback();
@@ -2070,9 +2134,13 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             next_index: usize,
         ) anyerror!BuiltLayout {
             const window_view = self.options.window_view.?;
+            // `contextMenuRebuildIndex` never routes a rebuild into the
+            // pinned generation, so the reset is unconditional.
+            std.debug.assert(if (self.context_menu_pin) |pin| pin.window_id != slot.window_id or pin.arena_index != next_index else true);
             _ = slot.arenas[next_index].reset(.retain_capacity);
             var ui = Ui.init(slot.arenas[next_index].allocator());
             ui.context_menu_fallback_target = self.contextMenuFallbackTargetForLabel(slot.canvasLabel());
+            if (ui.context_menu_fallback_target != 0) ui.context_menu_fallback_point = self.context_menu_fallback_point;
             self.armUiFragmentHost(&ui);
             const node = window_view(&ui, &self.model, slot.label());
             const tree = try ui.finalizeWithTokens(node, tokens);
@@ -2842,6 +2910,8 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 .canvas_widget_keyboard => |keyboard_event| try self.handleKeyboard(runtime, keyboard_event),
                 .canvas_widget_scroll => |scroll_event| try self.handleScroll(runtime, scroll_event),
                 .canvas_widget_context_menu => |menu_event| try self.handleContextMenu(runtime, menu_event),
+                .canvas_widget_context_menu_shown => |shown_event| try self.handleContextMenuShown(runtime, shown_event),
+                .canvas_widget_context_menu_dismissed => |dismissed_event| try self.handleContextMenuDismissed(runtime, dismissed_event),
                 .canvas_widget_context_menu_request => |request_event| try self.handleContextMenuRequest(runtime, request_event),
                 .canvas_widget_dismiss => |dismiss_event| try self.handleDismiss(runtime, dismiss_event),
                 .canvas_widget_context_press => |press_event| try self.handleContextPress(runtime, press_event),
@@ -3570,16 +3640,156 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             }
         }
 
-        /// A native context-menu selection: resolve the selected
-        /// item's declared `Msg` through the tree's handler table.
+        /// The runtime handed a widget's declared menu to the native
+        /// presenter: capture the shown items' dispatch Msgs (by value)
+        /// keyed by the request's token, and PIN the build-arena
+        /// generation the presented tree was built from — the payloads'
+        /// slices stay valid, at their original addresses, however many
+        /// rebuilds the open menu outlives (`context_menu_pin`).
+        /// Selection resolves from this snapshot, so the user always
+        /// gets the item they SAW even when the tree rebuilds under the
+        /// open menu. A new presentation supersedes the previous pin.
+        fn handleContextMenuShown(self: *Self, runtime: *Runtime, shown_event: core.CanvasWidgetContextMenuShownEvent) anyerror!void {
+            // A pinned rebuild failure may have dropped the live tree
+            // while the previous menu was open. This shown event
+            // PROMISES a snapshot for the replacement menu, so restore
+            // the tree first — silently arming nothing would leave the
+            // presented menu's selection to fall through a null tree
+            // and dispatch no message.
+            if (self.treeForViewLabel(shown_event.view_label) == null) try self.restoreMissingTree(runtime);
+            const tree = self.treeForViewLabel(shown_event.view_label) orelse return;
+            const count = @min(shown_event.item_count, self.context_menu_shown_msgs.len);
+            for (0..count) |item_index| {
+                self.context_menu_shown_msgs[item_index] = tree.msgForContextMenu(shown_event.target_id, item_index);
+            }
+            self.context_menu_shown_token = shown_event.token;
+            self.context_menu_shown_count = count;
+            self.context_menu_pin = if (std.mem.eql(u8, shown_event.view_label, self.options.canvas_label))
+                .{ .window_id = null, .arena_index = self.arena_index }
+            else if (self.windowSlotByCanvasLabel(shown_event.view_label)) |slot|
+                .{ .window_id = slot.window_id, .arena_index = slot.arena_index }
+            else
+                null;
+        }
+
+        /// The arena index this canvas's next rebuild must use:
+        /// normally the pair alternates, but while the presented menu's
+        /// pin holds one generation of THIS canvas (matched by stable
+        /// window identity, null = the main canvas), every rebuild
+        /// routes through the partner arena instead — consecutive
+        /// builds reset and reuse one side while the pinned side stays
+        /// frozen, exactly the cadence the clearance-retry pass already
+        /// runs within a single rebuild. Memory under an open menu is
+        /// therefore bounded at two trees, however many rebuilds occur.
+        fn contextMenuRebuildIndex(self: *const Self, window_id: ?platform.WindowId, current_index: usize) usize {
+            const natural = current_index ^ 1;
+            const pin = self.context_menu_pin orelse return natural;
+            if (pin.arena_index != natural) return natural;
+            const matches = if (pin.window_id) |pin_window|
+                (window_id orelse return natural) == pin_window
+            else
+                window_id == null;
+            return if (matches) natural ^ 1 else natural;
+        }
+
+        /// Window teardown for the pin's owner: the slot's arenas are
+        /// about to deinit (and another slot swap-moves into its index),
+        /// so a snapshot presented from this window must disarm NOW —
+        /// a stale pin would otherwise keep steering the reused slot's
+        /// rebuild cadence around a generation that no longer exists.
+        fn releaseContextMenuSnapshotForWindow(self: *Self, window_id: platform.WindowId) void {
+            const pin = self.context_menu_pin orelse return;
+            const pin_window = pin.window_id orelse return;
+            if (pin_window == window_id) self.releaseContextMenuSnapshot();
+        }
+
+        /// Disarm the presented-menu snapshot and release the pinned
+        /// build generation. Every way a request ends comes through
+        /// here: selection (after its dispatch), the runtime's
+        /// dismissed notice, an out-of-range selection swallow, and the
+        /// pin-owning window's teardown.
+        fn releaseContextMenuSnapshot(self: *Self) void {
+            self.context_menu_shown_token = 0;
+            self.context_menu_shown_count = 0;
+            self.context_menu_pin = null;
+        }
+
+        /// The presented menu closed without a selection: a stale
+        /// token's notice is ignored (a superseding presentation
+        /// already replaced the snapshot and the pin).
+        fn handleContextMenuDismissed(self: *Self, runtime: *Runtime, dismissed_event: core.CanvasWidgetContextMenuDismissedEvent) anyerror!void {
+            if (dismissed_event.token == 0 or dismissed_event.token != self.context_menu_shown_token) return;
+            self.releaseContextMenuSnapshot();
+            try self.restoreMissingTree(runtime);
+        }
+
+        /// A pinned rebuild failure dropped a live tree (`rebuild`'s
+        /// live-arena guard) while its menu stayed on the glass, and
+        /// the request just resolved WITHOUT a Msg dispatch (dismissal,
+        /// an out-of-range swallow, an unmapped item): restore the tree
+        /// now. No Msg-driven rebuild is coming, and with no handler
+        /// table every pointer, keyboard, and scroll event silently
+        /// no-ops until an unrelated resize, timer, or effect happens
+        /// to rebuild.
+        fn restoreMissingTree(self: *Self, runtime: *Runtime) anyerror!void {
+            if (!self.installed) return;
+            var missing = self.tree == null;
+            for (self.window_slots[0..self.window_slot_count]) |*slot| {
+                if (slot.installed and slot.tree == null) missing = true;
+            }
+            if (missing) try self.rebuildAllViews(runtime);
+        }
+
+        /// A native context-menu selection: resolve the selected item's
+        /// declared `Msg`. A selection carrying the presented snapshot's
+        /// token resolves from the snapshot (what the user saw); only a
+        /// snapshot-less dispatch — the automation verb, which validates
+        /// against the live tree itself — resolves through the tree's
+        /// handler table.
         fn handleContextMenu(self: *Self, runtime: *Runtime, menu_event: core.CanvasWidgetContextMenuEvent) anyerror!void {
-            const tree = self.treeForViewLabel(menu_event.view_label) orelse return;
             // A selection on this menu closes it whatever the source: an
             // automation-invoked selection while the fallback surface is
             // open must not leave the surface mounted.
             if (self.context_menu_fallback_target == menu_event.target_id) {
                 self.clearContextMenuFallback();
             }
+            if (menu_event.token != 0 and menu_event.token == self.context_menu_shown_token) {
+                const count = self.context_menu_shown_count;
+                // The request is consumed on every path out of this
+                // block — resolved, out-of-range, or a failed dispatch.
+                defer self.releaseContextMenuSnapshot();
+                if (menu_event.item_index < count) {
+                    if (self.context_menu_shown_msgs[menu_event.item_index]) |msg| {
+                        // The Msg is stored by value and its pinned-arena
+                        // payload slices are consumed by `update` itself;
+                        // the rebuild that follows reads only the model.
+                        // Release the pin BEFORE the dispatch: nothing
+                        // resets the pinned arena until the rebuild, and
+                        // the rebuild then routes into the partner arena
+                        // naturally — so a Msg whose update pushes the
+                        // model past a build budget fails the rebuild
+                        // WITHOUT resetting the live arena underneath it.
+                        // Input keeps working on the previous tree, and
+                        // the app's controls can recover the model —
+                        // production's degraded-error contract.
+                        self.releaseContextMenuSnapshot();
+                        try self.dispatch(runtime, menu_event.window_id, msg);
+                        return;
+                    }
+                }
+                // Swallowed without a Msg (out of range, or an item the
+                // presented tree never mapped): no dispatch rebuilds, so
+                // restore a live tree a failed pinned rebuild dropped.
+                try self.restoreMissingTree(runtime);
+                return;
+            }
+            // Snapshot-less resolution (the automation verb, or a menu
+            // whose shown event could not arm — its restore attempt
+            // failed while the model was unbuildable): the model may
+            // have recovered since, so restore a dropped tree before
+            // resolving rather than silently dispatching nothing.
+            if (self.treeForViewLabel(menu_event.view_label) == null) try self.restoreMissingTree(runtime);
+            const tree = self.treeForViewLabel(menu_event.view_label) orelse return;
             if (tree.msgForContextMenu(menu_event.target_id, menu_event.item_index)) |msg| {
                 try self.dispatch(runtime, menu_event.window_id, msg);
             }
@@ -3596,6 +3806,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             self.context_menu_fallback_label_len = label_len;
             self.context_menu_fallback_window_id = request_event.window_id;
             self.context_menu_fallback_target = request_event.target_id;
+            self.context_menu_fallback_point = request_event.point;
             try self.rebuildAllViews(runtime);
         }
 
@@ -3690,3 +3901,21 @@ fn effectsQuitApp(context: *anyopaque) bool {
     runtime.quitApp() catch return false;
     return true;
 }
+
+/// The build storage pinned under a presented native context menu:
+/// which canvas's arena pair and which generation (index) of that pair
+/// built the presented tree. The canvas is named by STABLE window
+/// identity (`window_id` null = the main canvas), never by slot index —
+/// removing a window swap-moves another slot into its place, and an
+/// index-keyed pin would start protecting the wrong arena. While set,
+/// rebuilds of that canvas route through the PARTNER arena
+/// (`contextMenuRebuildIndex`), so the pinned generation stays
+/// untouched — the snapshot's Msg payloads keep their original storage
+/// and pointer identity — and memory holds at two trees (the pinned
+/// one plus the partner, reset on its normal cadence) however long the
+/// menu stays open.
+const ContextMenuPin = struct {
+    window_id: ?platform.WindowId,
+    arena_index: usize,
+};
+
