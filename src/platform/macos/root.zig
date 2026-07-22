@@ -516,6 +516,18 @@ pub const MacPlatform = struct {
     app_info: platform_mod.AppInfo,
     surface_value: platform_mod.Surface,
     state: RunState = .{},
+    /// Latched when the runtime's effects teardown abandons an
+    /// in-flight channel `wake_fn` call (see
+    /// `PlatformServices.note_channel_wake_abandoned_fn`): the stale
+    /// call still holds this platform as its context and may execute
+    /// into it at any later time, so `deinit` must skip destruction
+    /// and leak the host, process-lived — and the wrapper struct the
+    /// context actually points at (the wake thunk casts to
+    /// `*MacPlatform` before reaching the host) must outlive the call
+    /// too, which is why runners allocate it through
+    /// `createWithOptions` and retire it through `destroy`, the
+    /// latch-gated free.
+    channel_wake_abandoned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(title: []const u8, size: geometry.SizeF) Error!MacPlatform {
         return initWithEngine(title, size, .system);
@@ -568,7 +580,44 @@ pub const MacPlatform = struct {
         };
     }
 
+    /// Heap-allocate the wrapper (process allocator) and initialize it
+    /// in place. Runners must use this over a stack `initWithOptions`
+    /// value: `platform().services.context` is this wrapper's ADDRESS,
+    /// worker threads dereference it inside the channel wake path, and
+    /// a wake call teardown abandons may do so at any later time —
+    /// after a runner's stack frame would have unwound. Pair with
+    /// `destroy`, the latch-gated free.
+    pub fn createWithOptions(size: geometry.SizeF, web_engine: platform_mod.WebEngine, app_info: platform_mod.AppInfo) Error!*MacPlatform {
+        const self = std.heap.page_allocator.create(MacPlatform) catch return error.CreateFailed;
+        errdefer std.heap.page_allocator.destroy(self);
+        self.* = try initWithOptions(size, web_engine, app_info);
+        return self;
+    }
+
+    /// `deinit` plus the wrapper's own storage, gated by the same
+    /// latch: an abandoned channel wake call dereferences this wrapper
+    /// (its context) BEFORE it reaches the native host, so on abandon
+    /// both are leaked, process-lived — deinit-gating extended to
+    /// lifetime-gating, the honest completion of the abandoned-worker
+    /// idiom. No cross-thread race on the gate: the latch is set
+    /// synchronously on the loop thread during effects teardown, which
+    /// runs before the runner's deferred destroy.
+    pub fn destroy(self: *MacPlatform) void {
+        self.deinit();
+        if (self.channel_wake_abandoned.load(.seq_cst)) return;
+        std.heap.page_allocator.destroy(self);
+    }
+
     pub fn deinit(self: *MacPlatform) void {
+        // An abandoned channel wake call may still enter this host at
+        // any later time (see `channel_wake_abandoned`): destroying it
+        // would turn that stale call into a use-after-free, so the
+        // host is deliberately leaked, process-lived — the
+        // abandoned-worker idiom, applied to the platform itself.
+        if (self.channel_wake_abandoned.load(.seq_cst)) {
+            std.debug.print("macos platform teardown: an abandoned channel wake call may still enter this host; skipping destruction and leaking it (and the wrapper it enters through), process-lived, so the stale call stays safe\n", .{});
+            return;
+        }
         native_sdk_appkit_destroy(self.host);
     }
 
@@ -642,6 +691,7 @@ pub const MacPlatform = struct {
                 .audio_seek_fn = audioSeek,
                 .audio_set_volume_fn = audioSetVolume,
                 .wake_fn = wake,
+                .note_channel_wake_abandoned_fn = noteChannelWakeAbandoned,
                 .request_frame_fn = requestFrame,
                 .request_gpu_surface_frame_fn = requestGpuSurfaceFrame,
                 .note_gpu_surface_input_fn = noteGpuSurfaceInput,
@@ -1365,11 +1415,21 @@ fn audioSetVolume(context: ?*anyopaque, volume: f32) anyerror!void {
     _ = native_sdk_appkit_audio_set_volume(self.host, volume);
 }
 
-/// Thread-safe: dispatches onto the main queue, which emits `.wake` on
-/// the AppKit run loop. One of the two services worker threads may call.
+/// Thread-safe: dispatches onto the main queue (`dispatch_async` — the
+/// enqueue-only shape the wake contract requires), which emits `.wake`
+/// on the AppKit run loop. One of the two services worker threads may
+/// call.
 fn wake(context: ?*anyopaque) anyerror!void {
     const self: *MacPlatform = @ptrCast(@alignCast(context.?));
     native_sdk_appkit_wake(self.host);
+}
+
+/// Teardown abandoned an in-flight channel wake call: latch the flag
+/// `deinit` consults so this host is leaked rather than destroyed (see
+/// `MacPlatform.channel_wake_abandoned`).
+fn noteChannelWakeAbandoned(context: ?*anyopaque) void {
+    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+    self.channel_wake_abandoned.store(true, .seq_cst);
 }
 
 /// Thread-safe like `wake`: dispatches onto the main queue, which emits

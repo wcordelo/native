@@ -67,6 +67,14 @@ const mini_core = struct {
     /// matches members by NAME, so the app's declaration order is free.
     pub const AudioState = enum { spectrum, loaded, completed, position, rejected, failed };
 
+    /// The channel event states, shuffled off the engine order for the
+    /// same by-NAME matching proof.
+    pub const ChannelState = enum { rejected, data, closed };
+
+    /// The image outcome states the mixed-rejection tests observe,
+    /// shuffled off the engine order like the other two.
+    pub const ImageState = enum { rejected, loaded };
+
     pub const Model = struct {
         polling: bool,
         fast: bool,
@@ -91,6 +99,19 @@ const mini_core = struct {
         buffering: bool,
         bands: []const u8,
         audio_events: i64,
+        // Channel event mirrors.
+        chan_state: ChannelState,
+        chan_key: f64,
+        chan_bytes: []const u8,
+        chan_dropped_pending: f64,
+        chan_dropped_total: f64,
+        chan_events: i64,
+        // Image event mirrors.
+        img_state: ImageState,
+        img_events: i64,
+        // Rejection delivery order probe: one mark per rejection Msg
+        // ('S' spawn, 'I' image, 'C' channel), in dispatch order.
+        order: []const u8,
     };
 
     pub const Msg = union(enum) {
@@ -147,6 +168,39 @@ const mini_core = struct {
         drop_paste, // 42: cancel "paste" (silent clip_read drop)
         open_win, // 43: window_show "player" (the tray Open consequence)
         quit_app, // 44: quit_app (the tray Quit consequence)
+        open_chan, // 45: channel_open key 41 -> chan_evt
+        close_chan, // 46: channel_close key 41
+        chan_evt: struct { // 47: the five-field channel event arm (the
+            // emitted shape — payload fields keep their TS names)
+            key: f64,
+            state: ChannelState,
+            bytes: []const u8,
+            droppedPending: f64,
+            droppedTotal: f64,
+        },
+        load_img, // 48: image_load id 7 -> img_evt
+        img_evt: struct { // 49: the five-field image result arm
+            id: f64,
+            state: ImageState,
+            width: f64,
+            height: f64,
+            status: f64,
+        },
+        mix_chan_then_img, // 50: batch [channel_open 41, image_load 7]
+        mix_img_then_chan, // 51: batch [image_load 7, channel_open 41]
+        mix_three, // 52: batch [channel_open 41, image_load 7, spawn "job"]
+        chan_evt2: struct { // 53: a second channel event arm so two
+            // refused opens in one batch stay distinguishable
+            key: f64,
+            state: ChannelState,
+            bytes: []const u8,
+            droppedPending: f64,
+            droppedTotal: f64,
+        },
+        mix_dup_chan_over_img, // 54: batch [channel_open 7 -> chan_evt,
+        // channel_open 7 -> chan_evt2] while image id 7 holds the raw key
+        mix_dup_then_engine, // 55: batch [channel_open 41 -> chan_evt2
+        // (bridge dup), channel_open 7 -> chan_evt (engine cross-family)]
     };
 
     pub const InitResult = struct { model: *const Model, cmd: []const u8 };
@@ -182,6 +236,15 @@ const mini_core = struct {
                 .buffering = false,
                 .bands = "",
                 .audio_events = 0,
+                .chan_state = .closed,
+                .chan_key = -1,
+                .chan_bytes = "",
+                .chan_dropped_pending = -1,
+                .chan_dropped_total = -1,
+                .chan_events = 0,
+                .img_state = .loaded,
+                .img_events = 0,
+                .order = "",
             }),
             .cmd = cmdRequest("status.read", "status", 7, 8, "boot"),
         };
@@ -229,6 +292,7 @@ const mini_core = struct {
                 const out = frameCreate(model.*);
                 out.errs = model.errs + 1;
                 out.last_err = why;
+                if (std.mem.eql(u8, why, "rejected")) out.order = appendOrder(model.order, 'S');
                 return .{ .model = out, .cmd = "" };
             },
             .save_file => return .{ .model = model, .cmd = cmdWriteFile("save", 12, 8, "notes.bin", model.status) },
@@ -326,7 +390,83 @@ const mini_core = struct {
             .drop_paste => return .{ .model = model, .cmd = cmdCancel("paste") },
             .open_win => return .{ .model = model, .cmd = cmdWindowShow("player") },
             .quit_app => return .{ .model = model, .cmd = cmdQuitApp() },
+            .open_chan => return .{ .model = model, .cmd = cmdChannelOpen(41, 47) },
+            .close_chan => return .{ .model = model, .cmd = cmdChannelClose(41) },
+            .chan_evt => |event| {
+                const out = frameCreate(model.*);
+                out.chan_state = event.state;
+                out.chan_key = event.key;
+                out.chan_bytes = event.bytes;
+                out.chan_dropped_pending = event.droppedPending;
+                out.chan_dropped_total = event.droppedTotal;
+                out.chan_events = model.chan_events + 1;
+                if (event.state == .rejected) out.order = appendOrder(model.order, 'C');
+                return .{ .model = out, .cmd = "" };
+            },
+            .load_img => return .{ .model = model, .cmd = cmdImageLoad(7, 49, "img/a.png", "", "", 0) },
+            .img_evt => |event| {
+                const out = frameCreate(model.*);
+                out.img_state = event.state;
+                out.img_events = model.img_events + 1;
+                if (event.state == .rejected) out.order = appendOrder(model.order, 'I');
+                return .{ .model = out, .cmd = "" };
+            },
+            .mix_chan_then_img => {
+                const first = cmdChannelOpen(41, 47);
+                const second = cmdImageLoad(7, 49, "img/a.png", "", "", 0);
+                const out = rt.frameAlloc(u8, first.len + second.len);
+                @memcpy(out[0..first.len], first);
+                @memcpy(out[first.len..], second);
+                return .{ .model = model, .cmd = out };
+            },
+            .mix_img_then_chan => {
+                const first = cmdImageLoad(7, 49, "img/a.png", "", "", 0);
+                const second = cmdChannelOpen(41, 47);
+                const out = rt.frameAlloc(u8, first.len + second.len);
+                @memcpy(out[0..first.len], first);
+                @memcpy(out[first.len..], second);
+                return .{ .model = model, .cmd = out };
+            },
+            .mix_three => {
+                const first = cmdChannelOpen(41, 47);
+                const second = cmdImageLoad(7, 49, "img/a.png", "", "", 0);
+                const third = cmdSpawn("job", 0xFF, 26, 8, 0, &.{"/bin/dup"}, "");
+                const out = rt.frameAlloc(u8, first.len + second.len + third.len);
+                @memcpy(out[0..first.len], first);
+                @memcpy(out[first.len..][0..second.len], second);
+                @memcpy(out[first.len + second.len ..], third);
+                return .{ .model = model, .cmd = out };
+            },
+            .chan_evt2 => |event| {
+                const out = frameCreate(model.*);
+                out.chan_events = model.chan_events + 1;
+                if (event.state == .rejected) out.order = appendOrder(model.order, 'D');
+                return .{ .model = out, .cmd = "" };
+            },
+            .mix_dup_chan_over_img => {
+                const first = cmdChannelOpen(7, 47);
+                const second = cmdChannelOpen(7, 53);
+                const out = rt.frameAlloc(u8, first.len + second.len);
+                @memcpy(out[0..first.len], first);
+                @memcpy(out[first.len..], second);
+                return .{ .model = model, .cmd = out };
+            },
+            .mix_dup_then_engine => {
+                const first = cmdChannelOpen(41, 53);
+                const second = cmdChannelOpen(7, 47);
+                const out = rt.frameAlloc(u8, first.len + second.len);
+                @memcpy(out[0..first.len], first);
+                @memcpy(out[first.len..], second);
+                return .{ .model = model, .cmd = out };
+            },
         }
+    }
+
+    fn appendOrder(prev: []const u8, mark: u8) []const u8 {
+        const out = rt.frameAlloc(u8, prev.len + 1);
+        @memcpy(out[0..prev.len], prev);
+        out[prev.len] = mark;
+        return out;
     }
 
     pub fn subscriptions(model: *const Model) []const u8 {
@@ -343,6 +483,8 @@ const mini_core = struct {
         out[0].last_line = commitBytes(next.last_line);
         out[0].output = commitBytes(next.output);
         out[0].bands = commitBytes(next.bands);
+        out[0].chan_bytes = commitBytes(next.chan_bytes);
+        out[0].order = commitBytes(next.order);
         return &out[0];
     }
 
@@ -539,6 +681,34 @@ const mini_core = struct {
     fn cmdQuitApp() []const u8 {
         const out = rt.frameAlloc(u8, 1);
         out[0] = 0x11;
+        return out;
+    }
+
+    fn cmdImageLoad(id: f64, event_tag: u8, image_path: []const u8, url: []const u8, cache_path: []const u8, expected: f64) []const u8 {
+        const out = rt.frameAlloc(u8, 1 + 8 + 1 + 4 + image_path.len + 4 + url.len + 4 + cache_path.len + 8);
+        out[0] = 0x12;
+        std.mem.writeInt(u64, out[1..][0..8], @bitCast(id), .little);
+        out[9] = event_tag;
+        var off: usize = 10;
+        off = writeLongBytes(out, off, image_path);
+        off = writeLongBytes(out, off, url);
+        off = writeLongBytes(out, off, cache_path);
+        std.mem.writeInt(u64, out[off..][0..8], @bitCast(expected), .little);
+        return out;
+    }
+
+    fn cmdChannelOpen(key: f64, event_tag: u8) []const u8 {
+        const out = rt.frameAlloc(u8, 1 + 8 + 1);
+        out[0] = 0x15;
+        std.mem.writeInt(u64, out[1..][0..8], @bitCast(key), .little);
+        out[9] = event_tag;
+        return out;
+    }
+
+    fn cmdChannelClose(key: f64) []const u8 {
+        const out = rt.frameAlloc(u8, 1 + 8);
+        out[0] = 0x16;
+        std.mem.writeInt(u64, out[1..][0..8], @bitCast(key), .little);
         return out;
     }
 
@@ -1243,9 +1413,12 @@ test "a duplicate spawn key rejects the new spawn through its err arm (the one e
 
     // A running subprocess is never killed implicitly: unlike the named
     // ops, a live spawn key REJECTS the new spawn — cancel it first.
+    // The rejection Msg stages into the engine's pending order and
+    // delivers at the next drain (the one rejection stream).
     Host.dispatch(fx, .dup_job);
     try std.testing.expectEqual(@as(usize, 1), fx.pendingSpawnCount());
     try std.testing.expectEqualStrings("/bin/one", fx.pendingSpawnAt(0).?.argv[0]);
+    Host.drain(fx);
     try std.testing.expectEqual(@as(i64, 1), Host.model().errs);
     try std.testing.expectEqualStrings("rejected", Host.model().last_err);
 
@@ -1446,4 +1619,187 @@ test "window verbs bridge to the effects channel's label-addressed verbs" {
     // Fire-and-forget: neither verb parked a keyed effect or dispatched
     // a result Msg of its own — only init's boot request is pending.
     try std.testing.expectEqual(boot_pending, fx.pendingHostCount());
+}
+
+test "a channel opens, posts route the five-field arm by name, and close retires the key" {
+    const fx = freshChannel();
+    defer fx.deinit();
+    Host.init(fx);
+
+    // channel_open decodes onto fx.openChannel under the raw numeric
+    // key; the native side resolves the thread-safe posting handle —
+    // exactly what an embedder does.
+    Host.dispatch(fx, .open_chan);
+    const handle = fx.channelHandle(41) orelse return error.TestExpectedHandle;
+    try std.testing.expectEqual(effects_mod.ChannelHandle.PostResult.accepted, handle.post("cpu 42%"));
+    Host.drain(fx);
+    try std.testing.expectEqual(@as(i64, 1), Host.model().chan_events);
+    try std.testing.expectEqual(mini_core.ChannelState.data, Host.model().chan_state);
+    try std.testing.expectEqual(@as(f64, 41), Host.model().chan_key);
+    try std.testing.expectEqualStrings("cpu 42%", Host.model().chan_bytes);
+    try std.testing.expectEqual(@as(f64, 0), Host.model().chan_dropped_total);
+
+    // A duplicate LIVE key rejects the new open — the rejection Msg
+    // stages into the engine's pending order and delivers at the next
+    // drain, echoing the refused key; the live channel is untouched.
+    Host.dispatch(fx, .open_chan);
+    Host.drain(fx);
+    try std.testing.expectEqual(@as(i64, 2), Host.model().chan_events);
+    try std.testing.expectEqual(mini_core.ChannelState.rejected, Host.model().chan_state);
+    try std.testing.expectEqual(@as(f64, 41), Host.model().chan_key);
+    try std.testing.expect(fx.channelHandle(41) != null);
+
+    // close: the staged post flushes ahead of the one closed terminal,
+    // which retires the entry and kills the handle.
+    try std.testing.expectEqual(effects_mod.ChannelHandle.PostResult.accepted, handle.post("last reading"));
+    Host.dispatch(fx, .close_chan);
+    Host.drain(fx);
+    try std.testing.expectEqual(@as(i64, 4), Host.model().chan_events);
+    try std.testing.expectEqual(mini_core.ChannelState.closed, Host.model().chan_state);
+    try std.testing.expectEqual(effects_mod.ChannelHandle.PostResult.closed, handle.post("too late"));
+    try std.testing.expect(fx.channelHandle(41) == null);
+
+    // The key is free again: a fresh open lands with no rejection
+    // (the drain delivers nothing new).
+    Host.dispatch(fx, .open_chan);
+    Host.drain(fx);
+    try std.testing.expectEqual(@as(i64, 4), Host.model().chan_events);
+    try std.testing.expect(fx.channelHandle(41) != null);
+}
+
+test "a mixed refused batch dispatches its rejections in command-stream order" {
+    const fx = freshChannel();
+    defer fx.deinit();
+    Host.init(fx);
+
+    // Park a live channel under key 41 and a live load under id 7 —
+    // accepted issues dispatch no rejection Msg, so the probe is empty.
+    Host.dispatch(fx, .open_chan);
+    Host.dispatch(fx, .load_img);
+    try std.testing.expectEqualStrings("", Host.model().order);
+
+    // Both records in one batch are refused (duplicate LIVE key/id).
+    // Cmd.batch's contract: performed in order — the channel rejection
+    // reaches update FIRST because its record came first. Rejections
+    // deliver at the next drain, in the engine's one pending order.
+    Host.dispatch(fx, .mix_chan_then_img);
+    Host.drain(fx);
+    try std.testing.expectEqualStrings("CI", Host.model().order);
+}
+
+test "the reverse mixed refused batch keeps command-stream order (image first)" {
+    const fx = freshChannel();
+    defer fx.deinit();
+    Host.init(fx);
+
+    Host.dispatch(fx, .open_chan);
+    Host.dispatch(fx, .load_img);
+
+    Host.dispatch(fx, .mix_img_then_chan);
+    Host.drain(fx);
+    try std.testing.expectEqualStrings("IC", Host.model().order);
+}
+
+test "an engine-refused open followed by a bridge-refused open delivers in command order" {
+    const fx = freshChannel();
+    defer fx.deinit();
+    Host.init(fx);
+
+    // Image id 7 holds raw engine key 7 (the raw id IS the engine key).
+    Host.dispatch(fx, .load_img);
+    try std.testing.expectEqualStrings("", Host.model().order);
+
+    // Batch [channel_open 7 -> chan_evt ('C'), channel_open 7 ->
+    // chan_evt2 ('D')]. The FIRST open passes the bridge (its table
+    // tracks channel entries, not the cross-family raw key) and the
+    // ENGINE refuses it — occupied by the image family. The SECOND is
+    // refused by the bridge (duplicate in-flight channel key). Cmd.batch
+    // is performed in order, so the rejection Msgs must land 'C' then
+    // 'D' — the first open's refusal first, regardless of which layer
+    // refused it.
+    Host.dispatch(fx, .mix_dup_chan_over_img);
+    Host.drain(fx);
+    try std.testing.expectEqualStrings("CD", Host.model().order);
+
+    // The image occupant was never disturbed.
+    try std.testing.expectEqual(@as(i64, 0), Host.model().img_events);
+}
+
+test "a bridge-refused open followed by an engine-refused open delivers in command order" {
+    const fx = freshChannel();
+    defer fx.deinit();
+    Host.init(fx);
+
+    // Channel 41 live in the bridge table, image id 7 on raw key 7.
+    Host.dispatch(fx, .open_chan);
+    Host.dispatch(fx, .load_img);
+    try std.testing.expectEqualStrings("", Host.model().order);
+
+    // Batch [channel_open 41 -> chan_evt2 ('D'): bridge dup-key refusal,
+    // channel_open 7 -> chan_evt ('C'): engine cross-family refusal].
+    // Command order: 'D' then 'C'.
+    Host.dispatch(fx, .mix_dup_then_engine);
+    Host.drain(fx);
+    try std.testing.expectEqualStrings("DC", Host.model().order);
+
+    // The live channel under 41 survived its dup refusal.
+    try std.testing.expect(fx.channelHandle(41) != null);
+}
+
+test "bridge-staged rejections journal nothing while the engine's journal marked regenerable" {
+    const fx = freshChannel();
+    defer fx.deinit();
+
+    const Capture = struct {
+        var channel_records: usize = 0;
+        var regenerable_channel_records: usize = 0;
+        var last_channel_key: u64 = 0;
+        fn record(context: *anyopaque, record_value: effects_mod.EffectResultRecord) void {
+            _ = context;
+            if (record_value.kind != .channel) return;
+            channel_records += 1;
+            last_channel_key = record_value.key;
+            if (record_value.exit_reason == .rejected) regenerable_channel_records += 1;
+        }
+    };
+    Capture.channel_records = 0;
+    Capture.regenerable_channel_records = 0;
+    var context: u8 = 0;
+    fx.bindJournal(.{ .context = &context, .record_fn = Capture.record });
+
+    Host.init(fx);
+    Host.dispatch(fx, .load_img);
+
+    // The mixed batch again: the first open engine-refused (image id 7
+    // holds raw key 7), the second bridge-refused (duplicate in-flight
+    // channel key). Exactly ONE channel record reaches the journal —
+    // the ENGINE's, marked regenerable (`exit_reason` `.rejected`, the
+    // channel records' provenance convention) so replay skips it and
+    // the re-run open re-derives it. The bridge's rejection is a
+    // caller-staged Msg (`stageLoopMsg`): never journaled, regenerated
+    // by the replayed command walk itself — the journal carries
+    // NEITHER as executor truth.
+    Host.dispatch(fx, .mix_dup_chan_over_img);
+    Host.drain(fx);
+    try std.testing.expectEqualStrings("CD", Host.model().order);
+    try std.testing.expectEqual(@as(usize, 1), Capture.channel_records);
+    try std.testing.expectEqual(@as(usize, 1), Capture.regenerable_channel_records);
+    try std.testing.expectEqual(@as(u64, 7), Capture.last_channel_key);
+}
+
+test "a three-family refused batch pins full stream order across channel, image, and spawn" {
+    const fx = freshChannel();
+    defer fx.deinit();
+    Host.init(fx);
+
+    // One live occupant per family: channel 41, image 7, spawn "job".
+    Host.dispatch(fx, .open_chan);
+    Host.dispatch(fx, .load_img);
+    Host.dispatch(fx, .run_quiet);
+    try std.testing.expectEqualStrings("", Host.model().order);
+
+    // channel_open ++ image_load ++ spawn, all refused: stream order.
+    Host.dispatch(fx, .mix_three);
+    Host.drain(fx);
+    try std.testing.expectEqualStrings("CIS", Host.model().order);
 }

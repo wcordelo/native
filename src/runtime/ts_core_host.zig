@@ -145,7 +145,8 @@
 //!                  duplicate LIVE id rejects the new load (the spawn
 //!                  discipline: one load per id, never replaced
 //!                  implicitly), dispatching state "rejected" at the
-//!                  post-cycle boundary with the refused id echoed; ids
+//!                  next drain, in command-stream order with the
+//!                  engine's own refusals, the refused id echoed; ids
 //!                  the wire cannot carry exactly (0, non-integers,
 //!                  2^53 and past — the SDK contract is BELOW 2^53)
 //!                  reject the same way echoing id 0, and so does a
@@ -171,6 +172,36 @@
 //!                  under the id keeps running and its terminal still
 //!                  registers the pixels — cancel the load first to
 //!                  keep the slot free.
+//!   channel_open-> `fx.openChannel` keyed by the app's own numeric key
+//!                  (the image_load id convention: the raw key IS the
+//!                  engine key, and the bridge holds a key->tag table).
+//!                  The entry is non-retiring the spawn way: every
+//!                  channel event routes the event arm — a five-field
+//!                  record built by field NAME (key/state/bytes/
+//!                  droppedPending/droppedTotal; `state`'s enum members
+//!                  are matched by member name, exactly the
+//!                  data/closed/rejected set) — until the one `closed`
+//!                  (or a refused open's `rejected`) terminal retires
+//!                  it. POSTING is not a TS-tier verb: transpiled cores
+//!                  are single-threaded, so the thread-safe posting
+//!                  handle is native-side API (`Effects.channelHandle`)
+//!                  for embedders and platform-services extensions —
+//!                  the TS tier opens, closes, and receives. A
+//!                  duplicate LIVE key rejects the new open (one
+//!                  channel per key, never replaced implicitly),
+//!                  dispatching state "rejected" at the next drain, in
+//!                  command-stream order with the engine's own
+//!                  refusals, the refused key echoed; keys the wire
+//!                  cannot carry exactly reject the same way echoing
+//!                  key 0, and so does a full bridge table.
+//!   channel_close-> `fx.closeChannel(key)` on the live channel under
+//!                  the key, if any: staged posts flush and the
+//!                  engine's one `.closed` terminal routes the entry's
+//!                  event arm and retires it. A key naming no live
+//!                  channel (or one the wire cannot carry exactly) is
+//!                  a no-op, audio_ctl's idle rule. Channels are keyed
+//!                  numerically, so the string-keyed cancel never
+//!                  touches them — this is their close.
 //!   audio_ctl   -> the engine's control verbs (`fx.pauseAudio`/
 //!                  `resumeAudio`/`stopAudio`/`seekAudio`/
 //!                  `setAudioVolume`), gated by the wire key: a verb
@@ -206,12 +237,12 @@
 //! superseded entry dropped and cancelling its engine call; the
 //! engine's `.cancelled` terminal retires the entry and its Msg is
 //! swallowed before dispatch. The ONE exception is a live `Cmd.spawn`
-//! key: a duplicate REJECTS the new spawn — its err arm dispatches with
-//! "rejected" right after the issuing cycle (the same post-cycle
-//! boundary `now` dispatches use) — because a running subprocess is
-//! never killed implicitly; cancel it first. And spawn's explicit
-//! cancel stays loud (err arm "cancelled"), because killing a process
-//! is an observable event.
+//! key: a duplicate REJECTS the new spawn — its err arm dispatches
+//! with "rejected" on the next drain, at the refusal's command-stream
+//! position (see the rejection-ordering paragraph below) — because a
+//! running subprocess is never killed implicitly; cancel it first. And
+//! spawn's explicit cancel stays loud (err arm "cancelled"), because
+//! killing a process is an observable event.
 //!   Sub timer   -> `fx.startTimer` (repeating) with a fixed slot table
 //!                  reconciled by wire key: a new key arms the first
 //!                  free slot (slot order — deterministic, never hash
@@ -227,7 +258,18 @@
 //! `.effects_wake` and presented-frame drains), exactly like Zig-core
 //! fx results. The bridge adds no scheduler of its own; the one
 //! deliberate exception is `now` (above), which is synchronous the way
-//! `fx.wallMs` is.
+//! `fx.wallMs` is. Bridge-refused rejections (spawn/image/channel)
+//! stage into the ENGINE's loop-side pending order at refusal time
+//! (`Effects.stageLoopMsg`) and dispatch at the next drain — the same
+//! delivery moment as the engine's own refusals, so a `Cmd.batch`
+//! whose records are refused by DIFFERENT layers (the bridge's table
+//! validation, the engine's cross-family key gate) still dispatches
+//! its rejections in COMMAND-STREAM order: one seq-ordered stream is
+//! the ordering authority for every rejection, `Cmd.batch`'s
+//! performed-in-order contract extended to refusals. A second
+//! delivery moment is exactly how families fall out of stream order,
+//! so a new refusing family joins by staging, never by dispatching
+//! from its own boundary.
 //!
 //! Result payload lifetime: the engine's result bytes are drain
 //! scratch, but a routed result's bytes become a Msg payload the core
@@ -422,6 +464,18 @@ pub fn TsCoreHost(comptime core: type) type {
             event_tag: u8 = 0,
         };
 
+        /// One open external-source channel, keyed by the app's own
+        /// numeric key (which IS the engine key, the image
+        /// convention). Non-retiring the spawn way: `data` events flow
+        /// through it across dispatches; the one `closed` (or a
+        /// refused open's `rejected`) terminal retires it. Sized to
+        /// the engine's channel table.
+        const ChannelEntry = struct {
+            used: bool = false,
+            key: u64 = 0,
+            event_tag: u8 = 0,
+        };
+
         var model_root: *const Model = undefined;
         /// The platform caches directory for URL audio sources, set by
         /// the wiring (`TsUiApp`'s `audio_cache_dir`, or `setAudioCacheDir`
@@ -439,6 +493,7 @@ pub fn TsCoreHost(comptime core: type) type {
         var streams: [runtime_effects.max_effects]StreamEntry = @splat(.{});
         var audio_entry: AudioEntry = .{};
         var images: [runtime_effects.max_effects]ImageEntry = @splat(.{});
+        var channels: [runtime_effects.max_effect_channels]ChannelEntry = @splat(.{});
         /// The platform caches directory for URL image sources, the
         /// audio cache dir's twin (`setImageCacheDir` / `TsUiApp`'s
         /// `image_cache_dir`): bridge-side derivation of the
@@ -461,90 +516,25 @@ pub fn TsCoreHost(comptime core: type) type {
         /// after the issuing cycle's frame reset.
         const PendingNow = struct { tag: u8, ms: i64 };
 
-        /// A spawn issue the bridge itself refused (duplicate live wire
-        /// key — the one reject in the keyed-effect discipline),
-        /// dispatched as the spawn's err arm with "rejected" after the
-        /// issuing cycle's frame reset, at the same boundary `now`
-        /// dispatches use.
-        const max_rejects_per_cmd: usize = runtime_effects.max_effects;
-
-        /// An image load the bridge itself refused (duplicate live id,
-        /// an unrepresentable id, a full image table), dispatched as the
-        /// load's event arm with state "rejected" at the same post-cycle
-        /// boundary. `id` echoes the requested ImageId so concurrent
-        /// rejections stay distinguishable — 0 when the wire value is
-        /// not an exactly-carried positive integer, because there is no
-        /// honest integer to echo for one.
-        const ImageReject = struct { tag: u8, id: u64 };
-
-        /// One cycle's staging for bridge-refused image loads. Unlike
-        /// the spawn-reject buffer, the count here is the APP's to
-        /// choose — a `Cmd.batch` of N loads against a full table must
-        /// yield N rejected results, never a crash — so the stage never
-        /// caps at the table size: the inline buffer covers everyday
-        /// command values without touching an allocator, and the first
-        /// overflow spills once into an engine-allocator block sized by
-        /// the wire's own arithmetic bound. Staging exists because the
-        /// command walk cannot dispatch (the wire bytes are frame-arena
-        /// resident, and a nested cycle's frame reset would free them
-        /// mid-walk): rejects are captured during the walk and
-        /// delivered after the issuing cycle's frame reset, at the same
-        /// boundary `now` dispatches use — stack and heap storage both
-        /// survive the nested delivery cycles that boundary runs.
-        const ImageRejectStage = struct {
-            /// Every image_load record occupies at least this many wire
-            /// bytes ([op][id f64][event_tag], three empty long-bytes
-            /// fields, [expected f64]), so a command value of L bytes
-            /// carries at most L / 30 of them — the spill bound needs
-            /// no second record parser to stay in sync with.
-            const min_image_load_record_bytes: usize = 1 + 8 + 1 + 3 * 4 + 8;
-
-            inline_buf: [max_rejects_per_cmd]ImageReject = undefined,
-            spill: []ImageReject = &.{},
-            count: usize = 0,
-            /// The arithmetic ceiling on this cycle's image_load record
-            /// count (and therefore on its rejects).
-            bound: usize,
-            allocator: std.mem.Allocator,
-
-            fn open(fx: *Fx, cmd_len: usize) ImageRejectStage {
-                return .{
-                    .bound = cmd_len / min_image_load_record_bytes,
-                    .allocator = fx.allocator,
-                };
-            }
-
-            fn push(self: *ImageRejectStage, tag: u8, id: u64) void {
-                if (self.count < self.inline_buf.len) {
-                    self.inline_buf[self.count] = .{ .tag = tag, .id = id };
-                    self.count += 1;
-                    return;
-                }
-                if (self.spill.len == 0) {
-                    // First overflow: size by the wire bound once and
-                    // move the inline prefix over — one allocation for
-                    // the whole cycle, and only on cycles that earn it.
-                    self.spill = self.allocator.alloc(ImageReject, self.bound) catch
-                        @panic("ts core host: out of memory staging rejected image loads");
-                    @memcpy(self.spill[0..self.count], &self.inline_buf);
-                }
-                // The wire arithmetic sized the spill: rejects <= loads
-                // <= bound, so the store below can never run past it.
-                std.debug.assert(self.count < self.spill.len);
-                self.spill[self.count] = .{ .tag = tag, .id = id };
-                self.count += 1;
-            }
-
-            fn staged(self: *const ImageRejectStage) []const ImageReject {
-                if (self.spill.len > 0) return self.spill[0..self.count];
-                return self.inline_buf[0..self.count];
-            }
-
-            fn close(self: *ImageRejectStage) void {
-                if (self.spill.len > 0) self.allocator.free(self.spill);
-                self.spill = &.{};
-            }
-        };
+        // Bridge-refused dispatches (a spawn under a live wire key, an
+        // image load or channel open under a duplicate live id/key, an
+        // unrepresentable one, or a full bridge table) do NOT dispatch
+        // from the bridge's own boundary: each refusal builds its
+        // record's err/event arm Msg ("rejected", echoing the
+        // requested ImageId / channel key where the family has one —
+        // 0 when the wire value is not an exactly-carried positive
+        // integer, since there is no honest integer to echo) and
+        // stages it into the ENGINE's loop-side pending order at
+        // refusal time (`Effects.stageLoopMsg`). One seq-ordered
+        // stream is the ordering authority for every rejection, so a
+        // batch mixing bridge-refused and engine-refused records
+        // dispatches all of them in command-stream order at the next
+        // drain — see the result-ordering contract in the module doc.
+        // The staged Msgs are self-contained (static reason bytes and
+        // scalar echoes, never frame-arena slices) and regenerate
+        // deterministically under replay: the walk re-runs against the
+        // same table state, so record and replay stage identical
+        // sequences — `stageLoopMsg`'s two caller contracts.
 
         /// Install the core: reset the kernel and the bridge tables
         /// (deterministic re-init — the seam session replay relies on),
@@ -575,6 +565,7 @@ pub fn TsCoreHost(comptime core: type) type {
             streams = @splat(.{});
             audio_entry = .{};
             images = @splat(.{});
+            channels = @splat(.{});
             clip_write_counter = 0;
             audio_cache_dir_len = 0;
             image_cache_dir_len = 0;
@@ -704,35 +695,21 @@ pub fn TsCoreHost(comptime core: type) type {
             }
         }
 
-        /// The tail of every cycle: walk the command bytes, reconcile
+        /// The tail of every cycle: walk the command bytes (staging any
+        /// bridge-refused rejections into the engine's pending order as
+        /// it goes — see the rejection note above `init`), reconcile
         /// subscriptions against the NEW committed model, reset the
-        /// frame arena, then run the cycle's `now` dispatches and
-        /// bridge-refused spawn rejections (each a full cycle of its
-        /// own, on the fresh frame — nows first, rejections after, in
-        /// record order; deterministic under record and replay alike).
+        /// frame arena, then run the cycle's `now` dispatches (each a
+        /// full cycle of its own, on the fresh frame, in record order;
+        /// deterministic under record and replay alike).
         fn finishCycle(fx: *Fx, cmd: []const u8, depth: usize) void {
             var nows: [max_nows_per_cmd]PendingNow = undefined;
             var now_count: usize = 0;
-            var rejects: [max_rejects_per_cmd]u8 = undefined;
-            var reject_count: usize = 0;
-            var image_rejects = ImageRejectStage.open(fx, cmd.len);
-            defer image_rejects.close();
-            runCmd(fx, cmd, &nows, &now_count, &rejects, &reject_count, &image_rejects);
+            runCmd(fx, cmd, &nows, &now_count);
             reconcileTimers(fx);
             core.rt.frameReset();
             for (nows[0..now_count]) |pending| {
                 dispatchDepth(fx, msgFromTagNumber(pending.tag, @floatFromInt(pending.ms)), depth + 1);
-            }
-            for (rejects[0..reject_count]) |err_tag| {
-                dispatchDepth(fx, msgFromTagBytes(err_tag, "rejected"), depth + 1);
-            }
-            // Bridge-refused image loads (duplicate live id, an
-            // unrepresentable id, a full image table): the event arm's
-            // "rejected" state echoing the refused id, regenerated
-            // deterministically under replay like the spawn rejections
-            // above.
-            for (image_rejects.staged()) |reject| {
-                dispatchDepth(fx, msgFromTagImage(reject.tag, .{ .id = reject.id, .outcome = .rejected }), depth + 1);
             }
         }
 
@@ -745,9 +722,6 @@ pub fn TsCoreHost(comptime core: type) type {
             cmd: []const u8,
             nows: *[max_nows_per_cmd]PendingNow,
             now_count: *usize,
-            rejects: *[max_rejects_per_cmd]u8,
-            reject_count: *usize,
-            image_rejects: *ImageRejectStage,
         ) void {
             var at: usize = 0;
             while (at < cmd.len) {
@@ -904,7 +878,7 @@ pub fn TsCoreHost(comptime core: type) type {
                         var argv: [runtime_effects.max_effect_argv][]const u8 = undefined;
                         for (0..argc) |i| argv[i] = takeLongBytes(cmd, &at);
                         const stdin = takeLongBytes(cmd, &at);
-                        issueSpawn(fx, .{ .key = key, .line_tag = line_tag, .exit_tag = exit_tag, .err_tag = err_tag }, mode == 1, argv[0..argc], stdin, rejects, reject_count);
+                        issueSpawn(fx, .{ .key = key, .line_tag = line_tag, .exit_tag = exit_tag, .err_tag = err_tag }, mode == 1, argv[0..argc], stdin);
                     },
                     // audio_play [op][key_len][key][event_tag]
                     //            [path_len u32 LE][path][url_len u32 LE][url]
@@ -966,7 +940,7 @@ pub fn TsCoreHost(comptime core: type) type {
                         const cache_path = takeLongBytes(cmd, &at);
                         const expected_bits = takeBytes(cmd, &at, 8);
                         const expected: f64 = @bitCast(std.mem.readInt(u64, expected_bits[0..8], .little));
-                        issueImageLoad(fx, id_value, event_tag, image_path, url, cache_path, expected, image_rejects);
+                        issueImageLoad(fx, id_value, event_tag, image_path, url, cache_path, expected);
                     },
                     // image_cancel [op][id f64 LE]
                     0x13 => {
@@ -979,6 +953,19 @@ pub fn TsCoreHost(comptime core: type) type {
                         const id_bits = takeBytes(cmd, &at, 8);
                         const id_value: f64 = @bitCast(std.mem.readInt(u64, id_bits[0..8], .little));
                         runImageUnregister(fx, id_value);
+                    },
+                    // channel_open [op][key f64 LE][event_tag]
+                    0x15 => {
+                        const key_bits = takeBytes(cmd, &at, 8);
+                        const key_value: f64 = @bitCast(std.mem.readInt(u64, key_bits[0..8], .little));
+                        const event_tag = takeByte(cmd, &at);
+                        issueChannelOpen(fx, key_value, event_tag);
+                    },
+                    // channel_close [op][key f64 LE]
+                    0x16 => {
+                        const key_bits = takeBytes(cmd, &at, 8);
+                        const key_value: f64 = @bitCast(std.mem.readInt(u64, key_bits[0..8], .little));
+                        runChannelClose(fx, key_value);
                     },
                     else => @panic("ts core host: unknown command wire record - the core and this runtime disagree on cmd_format_version"),
                 }
@@ -1112,15 +1099,9 @@ pub fn TsCoreHost(comptime core: type) type {
             collect: bool,
             argv: []const []const u8,
             stdin: []const u8,
-            rejects: *[max_rejects_per_cmd]u8,
-            reject_count: *usize,
         ) void {
             if (head.key.len > 0 and findStream(head.key) != null) {
-                if (reject_count.* >= max_rejects_per_cmd) {
-                    @panic("ts core host: one command value carries more rejected named ops than the effect table holds");
-                }
-                rejects[reject_count.*] = head.err_tag;
-                reject_count.* += 1;
+                fx.stageLoopMsg(msgFromTagStaticBytes(head.err_tag, "rejected"));
                 return;
             }
             const index = freeStreamIndex() orelse
@@ -1245,8 +1226,9 @@ pub fn TsCoreHost(comptime core: type) type {
         /// Issue one image load. The keyed-effect discipline here is
         /// the SPAWN exception, by the same reasoning: one load per id
         /// at a time, never replaced implicitly — a duplicate LIVE id
-        /// rejects the new load (event arm, state "rejected", at the
-        /// post-cycle boundary), and so do an id the f64 wire cannot
+        /// rejects the new load (event arm, state "rejected", staged
+        /// into the engine's pending order and delivered at the next
+        /// drain), and so do an id the f64 wire cannot
         /// honestly carry into the u64 registry (0, negatives,
         /// fractions, 2^53 and past) and a 17th in-flight load (the table
         /// mirrors the engine's max_effects slots, whose own exhaustion
@@ -1261,7 +1243,6 @@ pub fn TsCoreHost(comptime core: type) type {
             url: []const u8,
             cache_path: []const u8,
             expected: f64,
-            image_rejects: *ImageRejectStage,
         ) void {
             // Strictly BELOW 2^53 (the SDK contract): at 2^53 the f64
             // grid steps by 2, so 2^53 is the first value that aliases
@@ -1272,12 +1253,12 @@ pub fn TsCoreHost(comptime core: type) type {
                 id_value >= 1 and id_value < 9007199254740992.0 and
                 @floor(id_value) == id_value;
             if (!representable) {
-                image_rejects.push(event_tag, 0);
+                fx.stageLoopMsg(msgFromTagImage(event_tag, .{ .id = 0, .outcome = .rejected }));
                 return;
             }
             const id: u64 = @intFromFloat(id_value);
             if (findImage(id) != null) {
-                image_rejects.push(event_tag, id);
+                fx.stageLoopMsg(msgFromTagImage(event_tag, .{ .id = id, .outcome = .rejected }));
                 return;
             }
             const index = freeImageIndex() orelse {
@@ -1289,7 +1270,7 @@ pub fn TsCoreHost(comptime core: type) type {
                 // vocabulary: exactly one rejected result through the
                 // event arm, never a crash — however many loads one
                 // batch stages against it.
-                image_rejects.push(event_tag, id);
+                fx.stageLoopMsg(msgFromTagImage(event_tag, .{ .id = id, .outcome = .rejected }));
                 return;
             };
             const entry = &images[index];
@@ -1388,6 +1369,98 @@ pub fn TsCoreHost(comptime core: type) type {
             const entry = &images[index];
             entry.used = false;
             return msgFromTagImage(entry.event_tag, result);
+        }
+
+        /// Open one external-source channel. The keyed-effect
+        /// discipline here is the spawn/image exception, by the same
+        /// reasoning: one channel per key at a time, never replaced
+        /// implicitly — a duplicate LIVE key rejects the new open
+        /// (event arm, state "rejected", staged into the engine's
+        /// pending order and delivered at the next drain),
+        /// and so do a key the f64 wire cannot honestly carry into the
+        /// u64 engine (0, negatives, fractions, 2^53 and past — the
+        /// image id gate) and a bridge table already holding
+        /// `max_effect_channels` live channels. Everything else the
+        /// engine refuses dynamically (a key occupied by another
+        /// family, the engine's own table) comes back through the
+        /// entry's event arm as its `.rejected` terminal — never
+        /// silent. Posting is native-side API: embedders resolve
+        /// `Effects.channelHandle(key)` and feed from their own
+        /// threads; this bridge only opens, closes, and routes.
+        fn issueChannelOpen(
+            fx: *Fx,
+            key_value: f64,
+            event_tag: u8,
+        ) void {
+            const representable = std.math.isFinite(key_value) and
+                key_value >= 1 and key_value < 9007199254740992.0 and
+                @floor(key_value) == key_value;
+            if (!representable) {
+                fx.stageLoopMsg(msgFromTagChannel(event_tag, .{ .key = 0, .kind = .rejected }));
+                return;
+            }
+            const key: u64 = @intFromFloat(key_value);
+            if (findChannel(key) != null) {
+                fx.stageLoopMsg(msgFromTagChannel(event_tag, .{ .key = key, .kind = .rejected }));
+                return;
+            }
+            const index = freeChannelIndex() orelse {
+                fx.stageLoopMsg(msgFromTagChannel(event_tag, .{ .key = key, .kind = .rejected }));
+                return;
+            };
+            const entry = &channels[index];
+            entry.used = true;
+            entry.key = key;
+            entry.event_tag = event_tag;
+            _ = fx.openChannel(.{
+                .key = key,
+                .on_event = channelEventMsg,
+            });
+        }
+
+        fn findChannel(key: u64) ?usize {
+            for (&channels, 0..) |*entry, index| {
+                if (entry.used and entry.key == key) return index;
+            }
+            return null;
+        }
+
+        fn freeChannelIndex() ?usize {
+            for (&channels, 0..) |*entry, index| {
+                if (!entry.used) return index;
+            }
+            return null;
+        }
+
+        /// The channel_close record: close the live channel under the
+        /// key, if any — the engine flushes staged posts, delivers the
+        /// one `.closed` terminal through `channelEventMsg` (which
+        /// retires the entry), and frees the key. A key naming no live
+        /// entry — or one the wire cannot carry exactly, which no
+        /// channel could ever open under — is a no-op, audio_ctl's
+        /// idle rule. The raw key IS the engine key (the image
+        /// convention; every bridge key base sits above 2^53, so this
+        /// can never reach another table's slot).
+        fn runChannelClose(fx: *Fx, key_value: f64) void {
+            const representable = std.math.isFinite(key_value) and
+                key_value >= 1 and key_value < 9007199254740992.0 and
+                @floor(key_value) == key_value;
+            if (!representable) return;
+            const key: u64 = @intFromFloat(key_value);
+            if (findChannel(key) == null) return;
+            fx.closeChannel(key);
+        }
+
+        /// `ChannelMsgFn` for external-source channels: every event
+        /// routes the entry's event arm; the `closed` and `rejected`
+        /// terminals retire the entry (freeing the key for a fresh
+        /// open), `data` events keep it live — the spawn stream shape.
+        fn channelEventMsg(event: runtime_effects.EffectChannelEvent) Msg {
+            const index = findChannel(event.key) orelse
+                @panic("ts core host: a channel event arrived with no open bridge entry");
+            const entry = &channels[index];
+            if (event.kind != .data) entry.used = false;
+            return msgFromTagChannel(entry.event_tag, event);
         }
 
         /// The wire `cancel` record: first match wins across the four
@@ -1696,6 +1769,25 @@ pub fn TsCoreHost(comptime core: type) type {
             @panic("ts core host: a routed result names a Msg tag outside the union");
         }
 
+        /// `msgFromTagBytes` for STATIC payloads (the staged rejection
+        /// Msgs' "rejected"): no frame-arena copy, because a staged
+        /// Msg outlives the issuing cycle's frame reset — it is held
+        /// in the engine's pending order until the next drain, so its
+        /// payload must be self-contained (`stageLoopMsg`'s contract).
+        /// The commit walkers keep non-frame pointers as-is, and a
+        /// static string's lifetime is the program's.
+        fn msgFromTagStaticBytes(tag: u8, comptime bytes: []const u8) Msg {
+            inline for (msg_arms, 0..) |arm, index| {
+                if (tag == index) {
+                    if (comptime arm.type == []const u8) {
+                        return @unionInit(Msg, arm.name, bytes);
+                    }
+                    @panic("ts core host: a routed result targets Msg arm '" ++ arm.name ++ "', whose payload is not bytes");
+                }
+            }
+            @panic("ts core host: a routed result names a Msg tag outside the union");
+        }
+
         /// Build the payload-less Msg arm at index `tag` (write_file's
         /// ok route — success carries nothing).
         fn msgFromTagVoid(tag: u8) Msg {
@@ -1889,6 +1981,85 @@ pub fn TsCoreHost(comptime core: type) type {
                 }
             }
             @panic("ts core host: an image result names a Msg tag outside the union");
+        }
+
+        /// The five-field channel event record, matched by field name —
+        /// `imageArmShape`'s twin: `key` (number), `state` (any enum;
+        /// members matched by name at delivery), `bytes` (bytes),
+        /// `droppedPending`/`droppedTotal` (numbers).
+        fn channelArmShape(comptime T: type) bool {
+            const info = @typeInfo(T);
+            if (info != .@"struct") return false;
+            const fields = info.@"struct".fields;
+            if (fields.len != 5) return false;
+            var ok = true;
+            for (fields) |f| {
+                if (std.mem.eql(u8, f.name, "state")) {
+                    if (@typeInfo(f.type) != .@"enum") ok = false;
+                } else if (std.mem.eql(u8, f.name, "bytes")) {
+                    if (f.type != []const u8) ok = false;
+                } else if (std.mem.eql(u8, f.name, "key") or std.mem.eql(u8, f.name, "droppedPending") or std.mem.eql(u8, f.name, "droppedTotal")) {
+                    if (f.type != i64 and f.type != f64) ok = false;
+                } else {
+                    ok = false;
+                }
+            }
+            return ok;
+        }
+
+        /// The arm's `state` member for an engine channel event kind,
+        /// matched by member NAME — `imageStateValue`'s twin.
+        fn channelStateValue(comptime E: type, kind: runtime_effects.EffectChannelEventKind) E {
+            const name = @tagName(kind);
+            inline for (@typeInfo(E).@"enum".fields) |f| {
+                if (std.mem.eql(u8, f.name, name)) return @enumFromInt(f.value);
+            }
+            @panic("ts core host: a channel event kind has no member in the event arm's state union - the transpiler's own shape check should have stopped this build");
+        }
+
+        /// Build the five-field channel event arm at index `tag` from
+        /// an engine event, by field name. The bytes copy into the
+        /// core's frame arena like every routed payload (the engine's
+        /// slice is drain scratch); `key` is the channel key echoed
+        /// verbatim (always below 2^53 — the bridge refused anything
+        /// wider — so both number classes carry it exactly), and the
+        /// drop counters widen the way the subset's number model
+        /// classes them.
+        fn msgFromTagChannel(tag: u8, event: runtime_effects.EffectChannelEvent) Msg {
+            inline for (msg_arms, 0..) |arm, index| {
+                if (tag == index) {
+                    if (comptime channelArmShape(arm.type)) {
+                        const fields = @typeInfo(arm.type).@"struct".fields;
+                        var payload: arm.type = undefined;
+                        inline for (fields) |f| {
+                            if (comptime std.mem.eql(u8, f.name, "state")) {
+                                @field(payload, f.name) = channelStateValue(f.type, event.kind);
+                            } else if (comptime std.mem.eql(u8, f.name, "key")) {
+                                @field(payload, f.name) = if (comptime f.type == f64) @floatFromInt(event.key) else @intCast(event.key);
+                            } else if (comptime std.mem.eql(u8, f.name, "droppedPending")) {
+                                @field(payload, f.name) = if (comptime f.type == f64) @floatFromInt(event.dropped_pending) else @intCast(event.dropped_pending);
+                            } else if (comptime std.mem.eql(u8, f.name, "droppedTotal")) {
+                                @field(payload, f.name) = if (comptime f.type == f64) @floatFromInt(event.dropped_total) else @intCast(event.dropped_total);
+                            } else if (event.bytes.len == 0) {
+                                // Payload-free events (rejected/closed
+                                // terminals, and the staged rejection
+                                // Msgs that must be self-contained
+                                // across the frame reset) carry the
+                                // static empty slice, never a
+                                // zero-length frame pointer.
+                                @field(payload, f.name) = "";
+                            } else {
+                                const copy = core.rt.frameAlloc(u8, event.bytes.len);
+                                @memcpy(copy, event.bytes);
+                                @field(payload, f.name) = copy;
+                            }
+                        }
+                        return @unionInit(Msg, arm.name, payload);
+                    }
+                    @panic("ts core host: a channel event targets Msg arm '" ++ arm.name ++ "', which is not the five-field channel event record");
+                }
+            }
+            @panic("ts core host: a channel event names a Msg tag outside the union");
         }
 
         /// Build the Msg arm at index `tag` carrying one number (`now`

@@ -550,7 +550,7 @@ pub fn build(b: *std.Build) void {
         .{ .path = "src/runtime/media_surface_tests.zig", .pattern = "producer: media.MediaSurfaceProducer" },
     });
     addFileContainsCheckStep(b, file_contains_checker, test_step, "test-session-replay-image-codec", "Verify the replay runner installs the host image codec headlessly (the desktop arms cannot link in unit tests; the null-fallback arm is covered in session_tests.zig)", &.{
-        .{ .path = "src/app_runner/root.zig", .pattern = "native_sdk.platform.installHeadlessImageCodec(build_options.platform, &null_platform, &replay_platform.services);" },
+        .{ .path = "src/app_runner/root.zig", .pattern = "native_sdk.platform.installHeadlessImageCodec(build_options.platform, null_platform, &replay_platform.services);" },
         .{ .path = "src/platform/macos/root.zig", .pattern = "pub fn installHeadlessImageCodec(services: *platform_mod.PlatformServices) void {\n    services.decode_image_fn = decodeImage;\n}" },
         .{ .path = "src/platform/linux/root.zig", .pattern = "pub fn installHeadlessImageCodec(services: *platform_mod.PlatformServices) void {\n    services.decode_image_fn = decodeImage;\n}" },
         .{ .path = "src/platform/windows/root.zig", .pattern = "pub fn installHeadlessImageCodec(services: *platform_mod.PlatformServices) void {\n    services.decode_image_fn = decodeImage;\n}" },
@@ -1268,6 +1268,7 @@ pub fn build(b: *std.Build) void {
     addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-system-monitor", "Run system monitor example tests", "examples/system-monitor", .managed);
     addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-system-monitor-ts", "Run system-monitor-ts example tests", "examples/system-monitor-ts", .managed);
     addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-effects-probe", "Run effects probe example tests", "examples/effects-probe", .managed);
+    addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-channel-monitor", "Run channel monitor example tests", "examples/channel-monitor", .managed);
     addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-menu-bar", "Run menu-bar lifecycle example tests", "examples/menu-bar", .managed);
     addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-feed", "Run feed example tests", "examples/feed", .managed);
     addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-canvas-preview", "Run canvas preview example tests", "examples/canvas-preview", .managed);
